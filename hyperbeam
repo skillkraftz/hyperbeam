@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""hyperbeam: scan ~/projects, open one tmux session per project, pick with fzf."""
+import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, time, tomllib
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+CFG = tomllib.loads((HERE / "config.toml").read_text())
+ROOT = Path(os.path.expanduser(CFG.get("projects_dir", "~/projects")))
+MANIFESTS = HERE / "projects"
+ACCOUNTS = {a.lower() for a in CFG["accounts"]}
+FIRST_PORT = 3100
+SKIP = {"node_modules", ".venv", "venv", "target", "dist", "build", "out", "__pycache__",
+        ".next", ".cache", ".tox", "vendor", ".git"}
+SELF = shlex.quote(str(HERE / "hyperbeam"))
+
+
+def run(*a):
+    r = subprocess.run(a, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def tmux(*a, check=True):
+    return subprocess.run(["tmux", *a], capture_output=True, text=True, check=check)
+
+
+# ---------- scan ----------
+def owner_of(url):
+    if not url:
+        return "no remote"
+    m = re.search(r"[:/]([^/:]+)/[^/]+?(?:\.git)?/?$", url)
+    if not m:
+        return "other"
+    return "mine" if m.group(1).lower() in ACCOUNTS else "other"
+
+
+def scan():
+    repos = []
+    for dp, dns, fns in os.walk(ROOT):
+        if ".git" in dns or ".git" in fns:
+            repos.append(Path(dp))
+        dns[:] = sorted(d for d in dns if d not in SKIP)
+    rows = []
+    for p in repos:
+        url = run("git", "-C", str(p), "remote", "get-url", "origin")
+        rows.append(dict(path=p, git=True, remote=url, owner=owner_of(url),
+                         dirty=bool(run("git", "-C", str(p), "status", "--porcelain"))))
+    for d in sorted(ROOT.iterdir()):
+        if d.is_dir() and not d.name.startswith(".") \
+                and not any(r["path"] == d or d in r["path"].parents for r in rows):
+            rows.append(dict(path=d, git=False, remote="", owner="no git", dirty=False))
+    for r in rows:
+        rel = r["path"].relative_to(ROOT)
+        r["name"] = str(rel).replace("/", "_")
+        r["manifest"] = (MANIFESTS / f"{r['name']}.toml").exists()
+    return sorted(rows, key=lambda r: r["name"].lower())
+
+
+def cmd_scan(_):
+    rows = scan()
+    hdr = ["name", "path", "owner", "uncommitted", "manifest"]
+    data = [[r["name"], "~/" + str(r["path"].relative_to(Path.home())), r["owner"],
+             "y" if r["dirty"] else "n", "y" if r["manifest"] else "n"] for r in rows]
+    w = [max(len(x[i]) for x in data + [hdr]) for i in range(len(hdr))]
+    for line in [hdr] + data:
+        print("  ".join(c.ljust(w[i]) for i, c in enumerate(line)).rstrip())
+
+
+# ---------- manifests ----------
+def load_manifests():
+    out = {}
+    for f in sorted(MANIFESTS.glob("*.toml")):
+        out[f.stem] = tomllib.loads(f.read_text())
+    return out
+
+
+def listening():
+    return {int(m) for m in re.findall(r":(\d+)\s", run("ss", "-ltnH"))}
+
+
+def next_port():
+    used = listening()
+    for m in load_manifests().values():
+        used.add(m.get("port", 0))
+        used.update(s["ready_port"] for s in m.get("service", []) if "ready_port" in s)
+    p = FIRST_PORT
+    while p in used:
+        p += 1
+    return p
+
+
+def detect_services(path, port):
+    """Guess services from the project files. Returns (list of dicts, list of notes)."""
+    svcs, notes = [], []
+    pj = path / "package.json"
+    if pj.exists():
+        try:
+            scripts = json.loads(pj.read_text()).get("scripts", {})
+        except ValueError:
+            scripts = {}
+        pm = "pnpm" if (path / "pnpm-lock.yaml").exists() else "yarn" if (path / "yarn.lock").exists() else "npm run"
+        if "supabase:start" in scripts:
+            svcs.append(dict(name="supabase", cmd=f"{pm} supabase:start", ready_port=54322))
+            notes.append("supabase db port 54322 is the supabase default; check supabase/config.toml")
+        key = "dev" if "dev" in scripts else "start" if "start" in scripts else None
+        if key:
+            cmd = f"{pm} {key}"
+            if "vite" in scripts[key]:
+                cmd += (" -- " if pm == "npm run" else " ") + "--port $HB_PORT --strictPort"
+            else:
+                notes.append("dev server reads PORT from the session env (Next.js does)")
+            svcs.append(dict(name=key, cmd=cmd, ready_port=port))
+    for f in sorted(path.glob("docker-compose*.y*ml")) + sorted(path.glob("compose.y*ml")):
+        if re.search(r"playwright|test", f.name):
+            notes.append(f"skipped {f.name} (test compose file)")
+            continue
+        svcs.append(dict(name="compose", cmd=f"docker compose -f {f.name} up", ready_delay=5))
+    if (path / "Procfile").exists():
+        for line in (path / "Procfile").read_text().splitlines():
+            if ":" in line and not line.lstrip().startswith("#"):
+                n, c = line.split(":", 1)
+                svcs.append(dict(name=n.strip(), cmd=c.strip(), ready_delay=2))
+    return svcs, notes
+
+
+def manifest_text(name, path, port, svcs, notes=()):
+    home = str(Path.home())
+    p = str(path)
+    p = "~" + p[len(home):] if p.startswith(home) else p
+    out = [f"# hyperbeam manifest for {name}"]
+    out += [f"# note: {n}" for n in notes]
+    out += [f"path = {json.dumps(p)}", f"port = {port}", ""]
+    if not svcs:
+        out += ["# no services detected; add [[service]] blocks if it has any", ""]
+    for s in svcs:
+        out.append("[[service]]")
+        for k, v in s.items():
+            out.append(f"{k} = {json.dumps(v)}")
+        out.append("")
+    return "\n".join(out)
+
+
+# ---------- open ----------
+def port_open(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def wait_ready(sess, win, svc):
+    if "ready_delay" in svc:
+        time.sleep(svc["ready_delay"])
+    port = svc.get("ready_port")
+    if port is None:
+        return "started" if "ready_delay" not in svc else f"waited {svc['ready_delay']}s"
+    deadline = time.time() + svc.get("ready_timeout", 120)
+    while time.time() < deadline:
+        if port_open(port):
+            return f"port {port} open"
+        pane = tmux("capture-pane", "-p", "-t", f"{sess}:{win}", check=False).stdout
+        if re.search(r"\[hyperbeam\] exited: \d+", pane):
+            return f"port {port} open" if port_open(port) else f"WARNING exited before port {port} opened"
+        time.sleep(0.5)
+    return f"WARNING timeout waiting for port {port}"
+
+
+def sanitize(name):
+    return re.sub(r"[.:]", "_", name)
+
+
+def attach(sess):
+    if os.environ.get("TMUX"):
+        os.execvp("tmux", ["tmux", "switch-client", "-t", sess])
+    os.execvp("tmux", ["tmux", "attach", "-t", sess])
+
+
+def cmd_open(args):
+    name = args.name
+    sess = sanitize(name)
+    if tmux("has-session", "-t", f"={sess}", check=False).returncode == 0:
+        print(f"session {sess} already exists")
+        if not args.detach:
+            attach(sess)
+        return 0
+    man = load_manifests().get(name)
+    if man is None:
+        proj = next((r for r in scan() if r["name"] == name), None)
+        if not proj:
+            sys.exit(f"hyperbeam: no project named {name!r} (see `hyperbeam scan`)")
+        port = next_port()
+        svcs, notes = detect_services(proj["path"], port)
+        text = manifest_text(name, proj["path"], port, svcs, notes)
+        MANIFESTS.mkdir(exist_ok=True)
+        mf = MANIFESTS / f"{name}.toml"
+        mf.write_text(text)
+        print(f"--- draft manifest {mf} ---\n{text}\n---")
+        try:
+            ans = "y" if args.yes else input("Use this manifest? [y/N] ")
+        except EOFError:
+            ans = "n"
+        if ans.strip().lower() not in ("y", "yes"):
+            mf.unlink()
+            print("draft discarded")
+            return 1
+        man = tomllib.loads(text)
+    path = Path(os.path.expanduser(man["path"]))
+    if not path.is_dir():
+        sys.exit(f"hyperbeam: {path} does not exist")
+    port = str(man["port"])
+    tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path),
+         "-e", f"PORT={port}", "-e", f"HB_PORT={port}")
+    tmux("send-keys", "-t", f"{sess}:claude", "-l", "claude")
+    tmux("send-keys", "-t", f"{sess}:claude", "Enter")
+    tmux("new-window", "-t", f"{sess}:", "-n", "shell", "-c", str(path))
+    tmux("send-keys", "-t", f"{sess}:shell", "-l", f"clear; {SELF} _warn {shlex.quote(str(path))}")
+    tmux("send-keys", "-t", f"{sess}:shell", "Enter")
+    for svc in man.get("service", []):
+        win = svc["name"]
+        tmux("new-window", "-t", f"{sess}:", "-n", win, "-c", str(path))
+        line = f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"'
+        tmux("send-keys", "-t", f"{sess}:{win}", "-l", line)
+        tmux("send-keys", "-t", f"{sess}:{win}", "Enter")
+        print(f"started {win}: {svc['cmd']}", flush=True)
+        print(f"  {win}: {wait_ready(sess, win, svc)}", flush=True)
+    tmux("select-window", "-t", f"{sess}:claude")
+    print(f"session {sess} ready (PORT={port})")
+    if not args.detach:
+        attach(sess)
+    return 0
+
+
+def cmd_warn(args):
+    p = Path(args.path)
+    warns = []
+    if not run("git", "-C", str(p), "rev-parse", "--git-dir"):
+        warns.append("no git repository")
+    else:
+        if not run("git", "-C", str(p), "remote"):
+            warns.append("no git remote (nothing is backed up)")
+        if run("git", "-C", str(p), "status", "--porcelain"):
+            warns.append("uncommitted changes")
+    if not (p / "CLAUDE.md").exists():
+        warns.append("no CLAUDE.md")
+    for w in warns:
+        print(f"\033[33mhyperbeam: warning: {w}\033[0m")
+    if not warns:
+        print("hyperbeam: no warnings")
+    print(f"PORT={os.environ.get('PORT', '-')}  dir={p}")
+
+
+# ---------- pick ----------
+def cmd_pick(_):
+    fzf = shutil.which("fzf")
+    if not fzf:
+        sys.exit("hyperbeam: fzf is not installed (sudo apt install fzf)")
+    rows = scan()
+    lines = "\n".join(f"{r['name']:<32} {r['owner']}" for r in rows)
+    r = subprocess.run([fzf, "--reverse", "--prompt", "hyperbeam> "], input=lines, stdout=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 1
+    return cmd_open(argparse.Namespace(name=r.stdout.split()[0], yes=False, detach=False))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="hyperbeam", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("scan", help="list projects").set_defaults(f=cmd_scan)
+    o = sub.add_parser("open", help="open (or attach to) a project's tmux session")
+    o.add_argument("name")
+    o.add_argument("-y", "--yes", action="store_true", help="accept a drafted manifest without asking")
+    o.add_argument("-d", "--detach", action="store_true", help="create the session but do not attach")
+    o.set_defaults(f=cmd_open)
+    sub.add_parser("pick", help="fzf picker, then open").set_defaults(f=cmd_pick)
+    w = sub.add_parser("_warn")
+    w.add_argument("path")
+    w.set_defaults(f=cmd_warn)
+    a = ap.parse_args()
+    sys.exit(a.f(a) or 0)
+
+
+if __name__ == "__main__":
+    main()
