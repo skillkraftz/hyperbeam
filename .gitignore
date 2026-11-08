@@ -1,0 +1,19 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+*secret*
+id_*
+credentials*
+
+# local junk
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+*.log
+*.swp
+.DS_Store
