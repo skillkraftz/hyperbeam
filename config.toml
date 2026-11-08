@@ -1,0 +1,4 @@
+# GitHub accounts that count as "mine" in `hyperbeam scan`.
+# Taken from the `Host github-*` aliases in ~/.ssh/config and the remotes under ~/projects.
+accounts = ["skillkraftz", "trifactoria", "algoviewz"]
+projects_dir = "~/projects"

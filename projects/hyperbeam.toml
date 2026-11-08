@@ -1,0 +1,5 @@
+# hyperbeam manifest for hyperbeam
+path = "~/projects/hyperbeam"
+port = 3100
+
+# no services: hyperbeam is a script, nothing to keep running
