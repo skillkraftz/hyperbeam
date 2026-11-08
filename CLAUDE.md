@@ -27,6 +27,11 @@ without PATH. `config.toml` holds the GitHub accounts that count as "mine".
 - `hyperbeam scan`: table of every git repo under ~/projects (any depth, skipping node_modules, .venv, target, dist, build...) plus top-level folders without git.
 - `hyperbeam open NAME [-d]`: start the project's session if needed and attach in this terminal (`-d`: don't attach).
 - `hyperbeam stop NAME`: the Stop action without the menu.
+- `hyperbeam list`: numbered running project sessions, most recent first, with port, up/down, the Tailscale URL (and the local URL at the
+  laptop). A number switches (inside tmux) or attaches (outside); q quits (single keypress up to 9 sessions). Also the status view. The
+  session you are in is marked `(here)`. Only sessions with a manifest are listed.
+- `hyperbeam phone`: for SSH from the phone. Prints the same URL list, then attaches/switches to the most recently used running session
+  (not the current one). If nothing runs it says so and points at `list` and the menu.
 
 ## The menu
 Textual app in the storywheel style (tabs, option list, one-line buttons that never take focus, modal confirm). Everything is a visible
@@ -44,7 +49,7 @@ Arrows move the selection, left/right change tab, Enter or a click on a row open
   the project and writes projects/<name>.toml, and replies with what should change in the project (it doesn't edit the project).
 - **Refresh (r)**, **Quit (q)**. Action results stay on screen until you press Refresh.
 
-`open` creates session `<name>` with `-e PORT=<port> -e HB_PORT=<port>` and windows: `claude`, `shell` (prints warnings: no git, no remote,
+`open` creates session `<name>` with `PORT`, `HB_PORT`, `HOST=0.0.0.0` and the manifest's `[env]` in its environment, and windows: `claude`, `shell` (prints warnings: no git, no remote,
 uncommitted changes, no CLAUDE.md), then one window per service. A service starts only after the previous one is ready. The window output is the log.
 
 ## Manifest format
@@ -65,11 +70,25 @@ name = "dev"
 cmd = "pnpm dev"           # ready_port defaults to port = 3101
 ready_delay = 5            # optional: sleep N seconds first (alone, it replaces the port check)
 ready_timeout = 60         # optional: give up waiting after N seconds (default 120)
+
+[env]                      # optional: extra session env, overrides the defaults (HOST=0.0.0.0)
+SOME_VAR = "value"
 ```
 A service that exits before its port opens is reported as a warning and the next one still starts.
 
 Docker rule: app dev servers run on the host in a tmux window; backing services (databases, Supabase, Caddy...) run through docker compose;
 containerize the app itself only if the project specifically needs it.
+
+## Reachable over Tailscale
+The phone reaches dev servers directly: `http://<this machine's MagicDNS name>:<port>` (from `tailscale status --json`, currently
+`xps-1.tail9babd7.ts.net`; the short name `xps` belongs to an old offline node, so don't use it). No tunnels. A server must bind all
+interfaces, so each manifest makes that so, never the project:
+- Next.js (`next dev`, 15 and 16): binds 0.0.0.0 by default and reads `PORT`. Nothing to do.
+- Vite (verified, 8.3.6): binds localhost unless `--host`; ignores `HOST`; its host check answers 403 for the MagicDNS name unless
+  `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=.ts.net` is set. Use `--host $HOST --port $HB_PORT` in `cmd` and that variable in `[env]`.
+- docker compose services publish ports on 0.0.0.0 by default (so a Supabase db is reachable from the LAN/tailnet with its dev password).
+- Last used = tmux `#{session_last_attached}` (empty until first attach, updated by attach and switch-client), falling back to `#{session_created}`.
+- ufw is configured off (`ENABLED=no` in /etc/ufw/ufw.conf); the live ruleset needs root to read.
 
 ## Testing
 `HB_MANIFESTS=<dir>` points at another manifests directory. Test with an isolated tmux server (`TMUX_TMPDIR=$(mktemp -d /tmp/hbt.XXXX)`) and

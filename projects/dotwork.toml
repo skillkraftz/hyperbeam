@@ -1,0 +1,14 @@
+# hyperbeam manifest for dotwork
+# Vite listens on localhost only unless --host is given (HOST is not read), and its host check
+# rejects the Tailscale name unless it is allowed. Verified with Vite 8.3.6: --host 0.0.0.0 alone
+# gives 403 on the MagicDNS name; the env below makes it work.
+path = "~/projects/dotwork"
+port = 3103
+
+[env]
+__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS = ".ts.net"
+
+[[service]]
+name = "dev"
+cmd = "npm run dev -- --host $HOST --port $HB_PORT --strictPort"
+ready_port = 3103

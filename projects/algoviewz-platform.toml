@@ -1,0 +1,17 @@
+# hyperbeam manifest for algoviewz-platform
+# Next 16 `next dev` binds 0.0.0.0 (reachable over Tailscale as is). Docker publishes the supabase db port on all interfaces too.
+# note: supabase db port 54322 is the supabase default; check supabase/config.toml
+# note: dev server reads PORT from the session env (Next.js does)
+# note: skipped docker-compose.playwright.yml (test compose file)
+path = "~/projects/algoviewz-platform"
+port = 3102
+
+[[service]]
+name = "supabase"
+cmd = "pnpm supabase:start"
+ready_port = 54322
+
+[[service]]
+name = "dev"
+cmd = "pnpm dev"
+ready_port = 3102
