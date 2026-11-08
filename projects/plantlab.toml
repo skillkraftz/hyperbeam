@@ -1,10 +1,9 @@
 # hyperbeam manifest for plantlab
-# Next.js reads PORT from the session env. The agent (agent:service) and cameras are left out on purpose.
+# Next.js reads PORT from the session env; ready_port defaults to the project port. The agent (agent:service) and cameras are left out on purpose.
 path = "~/projects/plantlab"
 port = 3101
 
 [[service]]
 name = "dev"
 cmd = "pnpm dev"
-ready_port = 3101
 ready_timeout = 60

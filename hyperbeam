@@ -1,14 +1,29 @@
-#!/usr/bin/env python3
-"""hyperbeam: scan ~/projects, open one tmux session per project, pick with fzf."""
-import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, time, tomllib
+#!/usr/bin/env -S /home/andy/.local/bin/uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["textual>=1.0"]
+# ///
+"""hyperbeam: a control panel for ~/projects. No arguments opens the menu.
+
+CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME
+"""
+import argparse, json, os, re, shlex, socket, subprocess, sys, time, tomllib
 from pathlib import Path
+
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, OptionList, Static, Tab, Tabs
+from textual.widgets.option_list import Option
 
 HERE = Path(os.path.realpath(__file__)).parent
 CFG = tomllib.loads((HERE / "config.toml").read_text())
 ROOT = Path(os.path.expanduser(CFG.get("projects_dir", "~/projects")))
-MANIFESTS = HERE / "projects"
+MANIFESTS = Path(os.environ.get("HB_MANIFESTS", HERE / "projects"))   # (override is for tests)
 ACCOUNTS = {a.lower() for a in CFG["accounts"]}
-FIRST_PORT = 3100
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "hyperbeam"
 SKIP = {"node_modules", ".venv", "venv", "target", "dist", "build", "out", "__pycache__",
         ".next", ".cache", ".tox", "vendor", ".git"}
 SELF = shlex.quote(str(HERE / "hyperbeam"))
@@ -21,6 +36,16 @@ def run(*a):
 
 def tmux(*a, check=True):
     return subprocess.run(["tmux", *a], capture_output=True, text=True, check=check)
+
+
+def sanitize(name):
+    return re.sub(r"[.:]", "_", name)
+
+
+def home_rel(p):
+    s = str(p)
+    h = str(Path.home())
+    return "~" + s[len(h):] if s.startswith(h) else s
 
 
 # ---------- scan ----------
@@ -49,97 +74,57 @@ def scan():
                 and not any(r["path"] == d or d in r["path"].parents for r in rows):
             rows.append(dict(path=d, git=False, remote="", owner="no git", dirty=False))
     for r in rows:
-        rel = r["path"].relative_to(ROOT)
-        r["name"] = str(rel).replace("/", "_")
-        r["manifest"] = (MANIFESTS / f"{r['name']}.toml").exists()
+        r["name"] = str(r["path"].relative_to(ROOT)).replace("/", "_")
     return sorted(rows, key=lambda r: r["name"].lower())
 
 
-def cmd_scan(_):
-    rows = scan()
-    hdr = ["name", "path", "owner", "uncommitted", "manifest"]
-    data = [[r["name"], "~/" + str(r["path"].relative_to(Path.home())), r["owner"],
-             "y" if r["dirty"] else "n", "y" if r["manifest"] else "n"] for r in rows]
-    w = [max(len(x[i]) for x in data + [hdr]) for i in range(len(hdr))]
-    for line in [hdr] + data:
-        print("  ".join(c.ljust(w[i]) for i, c in enumerate(line)).rstrip())
-
-
-# ---------- manifests ----------
 def load_manifests():
     out = {}
     for f in sorted(MANIFESTS.glob("*.toml")):
-        out[f.stem] = tomllib.loads(f.read_text())
+        try:
+            out[f.stem] = tomllib.loads(f.read_text())
+        except tomllib.TOMLDecodeError:
+            pass
     return out
 
 
-def listening():
-    return {int(m) for m in re.findall(r":(\d+)\s", run("ss", "-ltnH"))}
+def running_sessions():
+    return set(tmux("list-sessions", "-F", "#{session_name}", check=False).stdout.split())
 
 
-def next_port():
-    used = listening()
-    for m in load_manifests().values():
-        used.add(m.get("port", 0))
-        used.update(s["ready_port"] for s in m.get("service", []) if "ready_port" in s)
-    p = FIRST_PORT
-    while p in used:
-        p += 1
-    return p
+# ---------- state (last opened) ----------
+def load_state():
+    try:
+        return json.loads((STATE_DIR / "state.json").read_text())
+    except (OSError, ValueError):
+        return {"opened": {}}
 
 
-def detect_services(path, port):
-    """Guess services from the project files. Returns (list of dicts, list of notes)."""
-    svcs, notes = [], []
-    pj = path / "package.json"
-    if pj.exists():
-        try:
-            scripts = json.loads(pj.read_text()).get("scripts", {})
-        except ValueError:
-            scripts = {}
-        pm = "pnpm" if (path / "pnpm-lock.yaml").exists() else "yarn" if (path / "yarn.lock").exists() else "npm run"
-        if "supabase:start" in scripts:
-            svcs.append(dict(name="supabase", cmd=f"{pm} supabase:start", ready_port=54322))
-            notes.append("supabase db port 54322 is the supabase default; check supabase/config.toml")
-        key = "dev" if "dev" in scripts else "start" if "start" in scripts else None
-        if key:
-            cmd = f"{pm} {key}"
-            if "vite" in scripts[key]:
-                cmd += (" -- " if pm == "npm run" else " ") + "--port $HB_PORT --strictPort"
-            else:
-                notes.append("dev server reads PORT from the session env (Next.js does)")
-            svcs.append(dict(name=key, cmd=cmd, ready_port=port))
-    for f in sorted(path.glob("docker-compose*.y*ml")) + sorted(path.glob("compose.y*ml")):
-        if re.search(r"playwright|test", f.name):
-            notes.append(f"skipped {f.name} (test compose file)")
-            continue
-        svcs.append(dict(name="compose", cmd=f"docker compose -f {f.name} up", ready_delay=5))
-    if (path / "Procfile").exists():
-        for line in (path / "Procfile").read_text().splitlines():
-            if ":" in line and not line.lstrip().startswith("#"):
-                n, c = line.split(":", 1)
-                svcs.append(dict(name=n.strip(), cmd=c.strip(), ready_delay=2))
-    return svcs, notes
+def touch_opened(name):
+    st = load_state()
+    st.setdefault("opened", {})[name] = time.time()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / "state.json").write_text(json.dumps(st))
 
 
-def manifest_text(name, path, port, svcs, notes=()):
-    home = str(Path.home())
-    p = str(path)
-    p = "~" + p[len(home):] if p.startswith(home) else p
-    out = [f"# hyperbeam manifest for {name}"]
-    out += [f"# note: {n}" for n in notes]
-    out += [f"path = {json.dumps(p)}", f"port = {port}", ""]
-    if not svcs:
-        out += ["# no services detected; add [[service]] blocks if it has any", ""]
-    for s in svcs:
-        out.append("[[service]]")
-        for k, v in s.items():
-            out.append(f"{k} = {json.dumps(v)}")
-        out.append("")
-    return "\n".join(out)
+def build_projects():
+    mans, run_set, opened = load_manifests(), running_sessions(), load_state().get("opened", {})
+    rows = scan()
+    for r in rows:
+        m = mans.get(r["name"])
+        r["manifest"] = m is not None
+        r["port"] = m.get("port") if m else None
+        r["running"] = sanitize(r["name"]) in run_set
+        r["opened"] = opened.get(r["name"], 0)
+    return rows
 
 
-# ---------- open ----------
+def ago(ts):
+    s = int(time.time() - ts)
+    return "now" if s < 60 else f"{s // 60}m" if s < 3600 else f"{s // 3600}h" if s < 86400 else f"{s // 86400}d"
+
+
+# ---------- session start / stop ----------
 def port_open(port):
     try:
         socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
@@ -148,65 +133,44 @@ def port_open(port):
         return False
 
 
-def wait_ready(sess, win, svc):
+def listeners(port):
+    return run("ss", "-ltnpH", f"sport = :{port}")
+
+
+def wait_ready(sess, win, svc, port):
+    """Wait for a service. ready_port defaults to the project port; `ready_port = false` skips the check;
+    with only ready_delay it just sleeps."""
     if "ready_delay" in svc:
         time.sleep(svc["ready_delay"])
-    port = svc.get("ready_port")
-    if port is None:
+    rp = svc.get("ready_port")
+    if rp is None and "ready_delay" not in svc:
+        rp = port
+    if rp is None or rp is False:
         return "started" if "ready_delay" not in svc else f"waited {svc['ready_delay']}s"
     deadline = time.time() + svc.get("ready_timeout", 120)
     while time.time() < deadline:
-        if port_open(port):
-            return f"port {port} open"
+        if port_open(rp):
+            return f"port {rp} open"
         pane = tmux("capture-pane", "-p", "-t", f"{sess}:{win}", check=False).stdout
         if re.search(r"\[hyperbeam\] exited: \d+", pane):
-            return f"port {port} open" if port_open(port) else f"WARNING exited before port {port} opened"
+            return f"port {rp} open" if port_open(rp) else f"WARNING exited before port {rp} opened"
         time.sleep(0.5)
-    return f"WARNING timeout waiting for port {port}"
+    return f"WARNING timeout waiting for port {rp}"
 
 
-def sanitize(name):
-    return re.sub(r"[.:]", "_", name)
+def manifest_path(man):
+    return Path(os.path.expanduser(man["path"]))
 
 
-def attach(sess):
-    if os.environ.get("TMUX"):
-        os.execvp("tmux", ["tmux", "switch-client", "-t", sess])
-    os.execvp("tmux", ["tmux", "attach", "-t", sess])
+def session_exists(sess):
+    return tmux("has-session", "-t", f"={sess}", check=False).returncode == 0
 
 
-def cmd_open(args):
-    name = args.name
+def start_session(name, man, say=print):
     sess = sanitize(name)
-    if tmux("has-session", "-t", f"={sess}", check=False).returncode == 0:
-        print(f"session {sess} already exists")
-        if not args.detach:
-            attach(sess)
-        return 0
-    man = load_manifests().get(name)
-    if man is None:
-        proj = next((r for r in scan() if r["name"] == name), None)
-        if not proj:
-            sys.exit(f"hyperbeam: no project named {name!r} (see `hyperbeam scan`)")
-        port = next_port()
-        svcs, notes = detect_services(proj["path"], port)
-        text = manifest_text(name, proj["path"], port, svcs, notes)
-        MANIFESTS.mkdir(exist_ok=True)
-        mf = MANIFESTS / f"{name}.toml"
-        mf.write_text(text)
-        print(f"--- draft manifest {mf} ---\n{text}\n---")
-        try:
-            ans = "y" if args.yes else input("Use this manifest? [y/N] ")
-        except EOFError:
-            ans = "n"
-        if ans.strip().lower() not in ("y", "yes"):
-            mf.unlink()
-            print("draft discarded")
-            return 1
-        man = tomllib.loads(text)
-    path = Path(os.path.expanduser(man["path"]))
+    path = manifest_path(man)
     if not path.is_dir():
-        sys.exit(f"hyperbeam: {path} does not exist")
+        raise RuntimeError(f"{path} does not exist")
     port = str(man["port"])
     tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path),
          "-e", f"PORT={port}", "-e", f"HB_PORT={port}")
@@ -218,16 +182,122 @@ def cmd_open(args):
     for svc in man.get("service", []):
         win = svc["name"]
         tmux("new-window", "-t", f"{sess}:", "-n", win, "-c", str(path))
-        line = f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"'
-        tmux("send-keys", "-t", f"{sess}:{win}", "-l", line)
+        tmux("send-keys", "-t", f"{sess}:{win}", "-l", f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
         tmux("send-keys", "-t", f"{sess}:{win}", "Enter")
-        print(f"started {win}: {svc['cmd']}", flush=True)
-        print(f"  {win}: {wait_ready(sess, win, svc)}", flush=True)
+        say(f"{name}: started {win}, waiting...")
+        say(f"{name}: {win}: {wait_ready(sess, win, svc, man['port'])}")
     tmux("select-window", "-t", f"{sess}:claude")
-    print(f"session {sess} ready (PORT={port})")
+    say(f"{name}: session ready (PORT={port})")
+
+
+def own_session():
+    """Name of the tmux session this process runs in, or ''."""
+    return run("tmux", "display-message", "-p", "#{session_name}") if os.environ.get("TMUX") else ""
+
+
+def project_ports(man):
+    ports = {man["port"]}
+    ports.update(s["ready_port"] for s in man.get("service", [])
+                 if isinstance(s.get("ready_port"), int) and not isinstance(s.get("ready_port"), bool))
+    return sorted(ports)
+
+
+def stop_project(name, man, say=print):
+    """Run `stop` commands in reverse order, kill the session, confirm the ports are closed."""
+    sess = sanitize(name)
+    if own_session() == sess:
+        raise RuntimeError(f"this menu is running inside {sess}; run Stop from another terminal")
+    path = manifest_path(man)
+    env = dict(os.environ, PORT=str(man["port"]), HB_PORT=str(man["port"]))
+    for svc in reversed(man.get("service", [])):
+        if "stop" in svc:
+            say(f"{name}: stop {svc['name']}: {svc['stop']}")
+            try:
+                r = subprocess.run(svc["stop"], shell=True, cwd=path, env=env, capture_output=True, text=True, timeout=120)
+                if r.returncode:
+                    say(f"{name}: WARNING stop {svc['name']} exited {r.returncode}: {(r.stderr or r.stdout).strip()[-200:]}")
+            except subprocess.TimeoutExpired:
+                say(f"{name}: WARNING stop {svc['name']} timed out")
+    if session_exists(sess):
+        tmux("kill-session", "-t", f"={sess}", check=False)
+        say(f"{name}: session killed")
+    deadline = time.time() + 6
+    ports = project_ports(man)
+    while time.time() < deadline and any(listeners(p) for p in ports):
+        time.sleep(0.5)
+    left = [(p, listeners(p)) for p in ports if listeners(p)]
+    if left:
+        for p, info in left:
+            say(f"{name}: WARNING port {p} still listening: {info.split(chr(10))[0][:120]}")
+        return False
+    say(f"{name}: stopped; ports {', '.join(map(str, ports))} are free")
+    return True
+
+
+# ---------- showing a session ----------
+def is_remote():
+    return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY")) \
+        or not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+
+
+def clean_env():
+    env = dict(os.environ)
+    env.pop("TMUX", None)
+    return env
+
+
+def spawn_kitty(title, *cmd, cwd=None):
+    subprocess.Popen(["kitty", "--title", title, *(["--directory", str(cwd)] if cwd else []), *cmd],
+                     env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def attach_here(sess):
+    """Switch or attach in the current terminal (used over SSH and by the CLI)."""
+    if os.environ.get("TMUX"):
+        return subprocess.run(["tmux", "switch-client", "-t", sess]).returncode
+    return subprocess.run(["tmux", "attach", "-t", sess]).returncode
+
+
+def clients_attached(sess):
+    return len(tmux("list-clients", "-t", f"={sess}", check=False).stdout.split())
+
+
+def onboarding_prompt(p):
+    text = (HERE / "ONBOARDING.md").read_text()
+    return (f"{text}\n\n---\nProject name: {p['name']}\nProject path: {p['path']}\n"
+            f"Manifest to write: {HERE}/projects/{p['name']}.toml\n")
+
+
+# ---------- CLI ----------
+def cmd_scan(_):
+    mans = load_manifests()
+    rows = scan()
+    hdr = ["name", "path", "owner", "uncommitted", "manifest"]
+    data = [[r["name"], home_rel(r["path"]), r["owner"], "y" if r["dirty"] else "n",
+             "y" if r["name"] in mans else "n"] for r in rows]
+    w = [max(len(x[i]) for x in data + [hdr]) for i in range(len(hdr))]
+    for line in [hdr] + data:
+        print("  ".join(c.ljust(w[i]) for i, c in enumerate(line)).rstrip())
+
+
+def cmd_open(args):
+    man = load_manifests().get(args.name)
+    if man is None:
+        sys.exit(f"hyperbeam: {args.name} has no manifest (use Onboard in the menu)")
+    sess = sanitize(args.name)
+    if not session_exists(sess):
+        start_session(args.name, man)
+    touch_opened(args.name)
     if not args.detach:
-        attach(sess)
-    return 0
+        sys.exit(attach_here(sess))
+
+
+def cmd_stop(args):
+    man = load_manifests().get(args.name)
+    if man is None:
+        sys.exit(f"hyperbeam: {args.name} has no manifest")
+    sys.exit(0 if stop_project(args.name, man) else 1)
 
 
 def cmd_warn(args):
@@ -249,34 +319,303 @@ def cmd_warn(args):
     print(f"PORT={os.environ.get('PORT', '-')}  dir={p}")
 
 
-# ---------- pick ----------
-def cmd_pick(_):
-    fzf = shutil.which("fzf")
-    if not fzf:
-        sys.exit("hyperbeam: fzf is not installed (sudo apt install fzf)")
-    rows = scan()
-    lines = "\n".join(f"{r['name']:<32} {r['owner']}" for r in rows)
-    r = subprocess.run([fzf, "--reverse", "--prompt", "hyperbeam> "], input=lines, stdout=subprocess.PIPE, text=True)
-    if r.returncode != 0 or not r.stdout.strip():
-        return 1
-    return cmd_open(argparse.Namespace(name=r.stdout.split()[0], yes=False, detach=False))
+# ---------- the menu ----------
+TABS = [("running", "Running"), ("recent", "Recent"), ("mine", "Mine"), ("others", "Others"),
+        ("unconfigured", "Not configured")]
+
+
+class Confirm(ModalScreen):
+    BINDINGS = [Binding("y,enter", "answer(True)", "Yes"), Binding("n,escape", "answer(False)", "No")]
+    DEFAULT_CSS = """
+    Confirm { align: center middle; }
+    Confirm > Vertical { width: 64; height: auto; border: round $accent; background: $surface; padding: 1 2; }
+    Confirm Horizontal { height: 1; margin-top: 1; }
+    Confirm Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 10; }
+    """
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(self.text, markup=False)
+            with Horizontal():
+                yield Button("Yes (y)", id="yes")
+                yield Button("No (n)", id="no")
+
+    def on_button_pressed(self, event):
+        event.stop()
+        self.dismiss(event.button.id == "yes")
+
+    def action_answer(self, value: bool):
+        self.dismiss(value)
+
+
+class Menu(App):
+    TITLE = "hyperbeam"
+    ENABLE_COMMAND_PALETTE = False
+    CSS = """
+    #title { height: 1; padding: 0 1; text-style: bold; color: $accent; }
+    Tabs { height: 2; }
+    #list { height: 1fr; border: round $primary; }
+    #detail { height: 3; padding: 0 1; color: $text-muted; }
+    #notice { height: 3; padding: 0 1; }
+    #buttons { height: 1; margin-top: 1; }
+    #buttons Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 12; }
+    #hint { height: 1; padding: 0 1; color: $text-muted; }
+    """
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"),
+                Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit"),
+                Binding("left", "tab(-1)", "prev tab", show=False), Binding("right", "tab(1)", "next tab", show=False)]
+
+    def __init__(self):
+        super().__init__()
+        self.projects, self.tab, self.busy = [], "running", set()
+        self.first_done = False
+        self.keep_notice = False        # True after an action: the refresh then leaves its result message on screen
+
+    def compose(self) -> ComposeResult:
+        yield Static("hyperbeam", id="title")
+        yield Tabs(*[Tab(label, id=f"t-{key}") for key, label in TABS], id="tabs")
+        yield OptionList(id="list")
+        yield Static("", id="detail", markup=False)
+        yield Static("Loading projects...", id="notice", markup=False)
+        with Horizontal(id="buttons"):
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("onboard", "Onboard (b)"),
+                               ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
+                button = Button(label, id=f"b-{bid}")
+                button.can_focus = False
+                yield button
+        yield Static("up/down: select   left/right: tab   Enter or click a row: open", id="hint")
+
+    def on_mount(self):
+        self.query_one("#list", OptionList).focus()
+        self.action_refresh()
+        self.set_interval(3, self.poll_running)
+
+    # --- data ---
+    def action_refresh(self):
+        self.reload(keep=False)
+
+    def reload(self, keep):
+        self.keep_notice = keep
+        if not keep:
+            self.say("Scanning projects...")
+        self.run_worker(self._load, thread=True, exclusive=True, group="load")
+
+    def _load(self):
+        rows = build_projects()
+        self.call_from_thread(self.apply, rows)
+
+    def apply(self, rows):
+        self.projects = rows
+        if not self.first_done:
+            self.first_done = True
+            for key in ("running", "recent", "mine"):
+                self.tab = key
+                if self.visible():
+                    break
+            self.query_one("#tabs", Tabs).active = f"t-{self.tab}"
+        self.render_list()
+        if not self.keep_notice:
+            self.say(f"{len(rows)} projects, {sum(1 for r in rows if r['running'])} running")
+
+    def poll_running(self):
+        run_set = running_sessions()
+        changed = False
+        for p in self.projects:
+            now = sanitize(p["name"]) in run_set
+            changed |= now != p["running"]
+            p["running"] = now
+        if changed:
+            self.render_list()
+
+    def visible(self):
+        P, t = self.projects, self.tab
+        if t == "running":
+            return [p for p in P if p["running"]]
+        if t == "recent":
+            return sorted([p for p in P if p["opened"]], key=lambda p: -p["opened"])
+        if t == "mine":
+            return [p for p in P if p["owner"] == "mine"]
+        if t == "others":
+            return [p for p in P if p["owner"] != "mine"]
+        return [p for p in P if not p["manifest"]]
+
+    def render_list(self):
+        ol = self.query_one("#list", OptionList)
+        keep = self.current()
+        ol.clear_options()
+        rows = self.visible()
+        for p in rows:
+            t = Text()
+            t.append("● " if p["running"] else "  ", style="green")
+            t.append(f"{p['name']:<26}")
+            t.append(f"{p['owner']:<10}", style="dim")
+            t.append(f"{p['port'] or '-':>5} ", style="cyan" if p["manifest"] else "dim")
+            t.append("* " if p["dirty"] else "  ", style="yellow")
+            t.append("configured" if p["manifest"] else "not configured", style="dim")
+            if self.tab == "recent":
+                t.append(f"  {ago(p['opened'])}", style="dim")
+            ol.add_option(Option(t, id=p["name"]))
+        if rows:
+            names = [p["name"] for p in rows]
+            ol.highlighted = names.index(keep["name"]) if keep and keep["name"] in names else 0
+            self.call_after_refresh(ol.scroll_to_highlight)
+        else:
+            ol.add_option(Option(Text("  (nothing here)", style="dim italic"), disabled=True))
+        counts = {"running": sum(p["running"] for p in self.projects), "recent": sum(1 for p in self.projects if p["opened"]),
+                  "mine": sum(p["owner"] == "mine" for p in self.projects),
+                  "others": sum(p["owner"] != "mine" for p in self.projects),
+                  "unconfigured": sum(not p["manifest"] for p in self.projects)}
+        for key, label in TABS:
+            self.query_one(f"#t-{key}", Tab).label = f"{label} ({counts[key]})"
+        self.show_detail()
+
+    def current(self):
+        ol = self.query_one("#list", OptionList)
+        if ol.highlighted is None or ol.highlighted >= ol.option_count:
+            return None
+        name = ol.get_option_at_index(ol.highlighted).id
+        return next((p for p in self.projects if p["name"] == name), None)
+
+    def show_detail(self):
+        p = self.current()
+        if not p:
+            self.query_one("#detail", Static).update("")
+            return
+        man = load_manifests().get(p["name"])
+        svcs = ", ".join(s["name"] for s in man.get("service", [])) if man else ""
+        warn = [w for w, bad in [("no git", not p["git"]), ("no remote", p["git"] and not p["remote"]),
+                                 ("uncommitted", p["dirty"]), ("no CLAUDE.md", not (p["path"] / "CLAUDE.md").exists())] if bad]
+        self.query_one("#detail", Static).update(
+            f"{home_rel(p['path'])}   {p['remote'] or ''}\n"
+            f"services: {svcs or '-'}   port: {p['port'] or '-'}\nwarnings: {', '.join(warn) or 'none'}")
+
+    def say(self, msg):
+        self.query_one("#notice", Static).update(msg)
+
+    def say_from_thread(self, msg):
+        self.call_from_thread(self.say, msg)
+
+    # --- events ---
+    def on_tabs_tab_activated(self, event):
+        if event.tab is not None:
+            self.tab = event.tab.id[2:]
+            self.render_list()
+
+    def on_option_list_option_highlighted(self, event):
+        self.show_detail()
+
+    def on_option_list_option_selected(self, event):
+        self.action_open()
+
+    def on_button_pressed(self, event):
+        if event.button.id and event.button.id.startswith("b-"):
+            getattr(self, "action_" + event.button.id[2:])()
+
+    def action_tab(self, step: int):
+        tabs = self.query_one("#tabs", Tabs)
+        tabs.action_next_tab() if step > 0 else tabs.action_previous_tab()
+
+    # --- actions ---
+    def action_open(self):
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        if not p["manifest"]:
+            return self.say(f"{p['name']} is not configured. Press Onboard (b) to set it up with Claude.")
+        if p["name"] in self.busy:
+            return self.say(f"{p['name']} is busy.")
+        self.busy.add(p["name"])
+        self.run_worker(lambda: self._open(p), thread=True)
+
+    def _open(self, p):
+        name, sess = p["name"], sanitize(p["name"])
+        try:
+            man = load_manifests()[name]
+            if not session_exists(sess):
+                start_session(name, man, self.say_from_thread)
+            touch_opened(name)
+            if is_remote():
+                self.call_from_thread(self.attach_here_suspended, sess)
+            else:
+                already = clients_attached(sess)
+                spawn_kitty(f"hyperbeam: {name}", "tmux", "attach", "-t", sess)
+                self.say_from_thread(f"{name}: opened in a new kitty window"
+                                     + (" (it was already open in another window; GNOME/Wayland can't focus it)" if already else ""))
+        except Exception as e:
+            self.say_from_thread(f"{name}: ERROR {e}")
+        finally:
+            self.busy.discard(name)
+            self.call_from_thread(self.reload, True)
+
+    def attach_here_suspended(self, sess):
+        if os.environ.get("TMUX"):
+            attach_here(sess)
+            self.say(f"Switched to {sess}.")
+            return
+        with self.suspend():
+            attach_here(sess)
+
+    def action_stop(self):
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        if not p["manifest"]:
+            return self.say(f"{p['name']} has no manifest, nothing to stop.")
+        ports = ", ".join(map(str, project_ports(load_manifests()[p["name"]])))
+
+        def after(yes):
+            if yes and p["name"] not in self.busy:
+                self.busy.add(p["name"])
+                self.run_worker(lambda: self._stop(p), thread=True)
+        self.push_screen(Confirm(f"Stop {p['name']}?\n\nRuns its stop commands in reverse order, kills the tmux session, "
+                                 f"and checks that port(s) {ports} are free."), after)
+
+    def _stop(self, p):
+        try:
+            stop_project(p["name"], load_manifests()[p["name"]], self.say_from_thread)
+        except Exception as e:
+            self.say_from_thread(f"{p['name']}: ERROR {e}")
+        finally:
+            self.busy.discard(p["name"])
+            self.call_from_thread(self.reload, True)
+
+    def action_onboard(self):
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        prompt = onboarding_prompt(p)
+        if is_remote():
+            with self.suspend():
+                subprocess.run(["claude", prompt], cwd=HERE)
+            self.action_refresh()
+        else:
+            spawn_kitty(f"onboard: {p['name']}", "claude", prompt, cwd=HERE)
+            self.say(f"Onboarding {p['name']}: Claude is open in a new kitty window in {home_rel(HERE)}. Press Refresh when it is done.")
 
 
 def main():
     ap = argparse.ArgumentParser(prog="hyperbeam", description=__doc__)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("scan", help="list projects").set_defaults(f=cmd_scan)
-    o = sub.add_parser("open", help="open (or attach to) a project's tmux session")
+    o = sub.add_parser("open", help="start a project's session and attach in this terminal")
     o.add_argument("name")
-    o.add_argument("-y", "--yes", action="store_true", help="accept a drafted manifest without asking")
-    o.add_argument("-d", "--detach", action="store_true", help="create the session but do not attach")
+    o.add_argument("-d", "--detach", action="store_true", help="start the session but do not attach")
     o.set_defaults(f=cmd_open)
-    sub.add_parser("pick", help="fzf picker, then open").set_defaults(f=cmd_pick)
+    s = sub.add_parser("stop", help="run stop commands, kill the session, check the ports")
+    s.add_argument("name")
+    s.set_defaults(f=cmd_stop)
     w = sub.add_parser("_warn")
     w.add_argument("path")
     w.set_defaults(f=cmd_warn)
     a = ap.parse_args()
-    sys.exit(a.f(a) or 0)
+    if a.cmd is None:
+        Menu().run()
+    else:
+        sys.exit(a.f(a) or 0)
 
 
 if __name__ == "__main__":
