@@ -10,7 +10,7 @@ Works locally and from Termux over Tailscale.
 - Manifests in the style of Tim's juggler, kept outside the project repos.
 - Each project gets a fixed port, set through tmux session env vars. No direnv.
 - A kk-style status command comes later.
-- ~/.config/tmux/tmux.conf already exists. hyperbeam adds small changes to it later and never replaces it.
+- ~/.config/tmux/tmux.conf already exists. hyperbeam never replaces it: it holds one added line, `source-file -q ~/.config/tmux/hyperbeam.conf`; everything else is in hyperbeam.conf (this repo), symlinked there (`ln -sfn ~/projects/hyperbeam/hyperbeam.conf ~/.config/tmux/hyperbeam.conf`).
 
 ## Rules
 - Prototype for personal use: keep it simple.
@@ -23,9 +23,9 @@ Works locally and from Termux over Tailscale.
 (`ln -sfn ~/projects/hyperbeam/hyperbeam ~/.local/bin/hyperbeam`). The shebang hard-codes /home/andy/.local/bin/uv so a GNOME hotkey works
 without PATH. `config.toml` holds the GitHub accounts that count as "mine".
 
-- `hyperbeam`: the menu. GNOME hotkey command: `kitty /home/andy/.local/bin/hyperbeam`.
+- `hyperbeam`: attaches to the tmux session `hyperbeam` (creating it if needed), in which the menu runs; switches the client instead if already inside tmux. GNOME hotkey command: `kitty /home/andy/.local/bin/hyperbeam`. The project called `hyperbeam` gets the tmux session `hyperbeam-project` so the names don't collide.
 - `hyperbeam scan`: table of every git repo under ~/projects (any depth, skipping node_modules, .venv, target, dist, build...) plus top-level folders without git.
-- `hyperbeam open NAME [-d]`: start the project's session if needed and attach in this terminal (`-d`: don't attach).
+- `hyperbeam open NAME [-d]`: start the project's session if needed (no manifest: investigate prompt, see Open) and attach in this terminal (`-d`: don't attach).
 - `hyperbeam stop NAME`: the Stop action without the menu.
 - `hyperbeam list`: numbered running project sessions, most recent first, with port, up/down, the Tailscale URL (and the local URL at the
   laptop). A number switches (inside tmux) or attaches (outside); q quits (single keypress up to 9 sessions). Also the status view. The
@@ -39,18 +39,33 @@ button, with its key in the label. Tabs: Running, Recent (last opened, kept in ~
 (not mine: other owner, no remote, no git), Not configured (no manifest). It opens on the first non-empty of Running/Recent/Mine.
 Arrows move the selection, left/right change tab, Enter or a click on a row opens it.
 
-- **Open (o):** starts the tmux session if it isn't running (services in order), then shows it: at the laptop in a new kitty window running
-  `tmux attach`; over SSH (SSH_CONNECTION set, or no display) it switches/attaches in the current terminal instead.
-  kitty can't focus an existing window on GNOME/Wayland (tested: `kitty @ focus-window` returns ok but the window stays unfocused), so a
-  second Open gives a second window attached to the same session.
+- **Open (o):** open-or-onboard. Starts the tmux session if it isn't running, then switches the client that looks at the menu to it
+  (no new kitty windows: the menu is in tmux, so every session is reached from the same client and the stack keys can go back).
+  If there is no manifest, or a service exits or misses its ready check, the session still opens, but its `claude` window starts
+  `claude "<prompt>" --add-dir ~/projects/hyperbeam` with the investigate prompt instead of plain `claude` (it runs in the project dir,
+  inside the project's session). With a manifest and no failure Claude starts plain, after the services are ready.
+  The prompt is ONBOARDING.md plus project name, manifest path or "none", the tmux session, why, and the last 50 lines of each failing
+  service's window; it is saved to ~/.local/state/hyperbeam/prompts/.
 - **Stop (s):** asks first. Runs each service's `stop` command in reverse order, kills the session, then checks the project's ports are
-  closed and warns if something is still listening. Refuses to stop the session the menu itself runs in.
-- **Onboard (b):** opens kitty in ~/projects/hyperbeam running `claude` with ONBOARDING.md plus the project name and path. Claude reads
-  the project and writes projects/<name>.toml, and replies with what should change in the project (it doesn't edit the project).
-- **Refresh (r)**, **Quit (q)**. Action results stay on screen until you press Refresh.
+  closed and warns if something is still listening. Without a manifest it only kills the session. Refuses to stop the session the menu itself runs in.
+- **Onboard (b):** forces the same investigate path: a new session if none runs, else a new `investigate` window in the running session.
+  ONBOARDING.md tells Claude to read the project, install dependencies, start and test it (Docker rule), propose the manifest and
+  WAIT for approval before writing projects/<name>.toml, list project changes, not commit.
+- **Refresh (r)**, **Quit (q)**: Quit detaches the client; the menu keeps running in its session. Action results stay on screen until you press Refresh.
 
-`open` creates session `<name>` with `PORT`, `HB_PORT`, `HOST=0.0.0.0` and the manifest's `[env]` in its environment, and windows: `claude`, `shell` (prints warnings: no git, no remote,
-uncommitted changes, no CLAUDE.md), then one window per service. A service starts only after the previous one is ready. The window output is the log.
+`open` creates session `<name>` with `PORT`, `HB_PORT`, `HOST=0.0.0.0` and the manifest's `[env]` in its environment (no manifest: only HOST), and windows: `claude`, `shell` (prints warnings: no git, no remote,
+uncommitted changes, no CLAUDE.md), then one window per service. A service starts only after the previous one is ready, and Claude starts in the `claude` window after the last one. The window output is the log.
+
+## Stack, copy, mouse (hyperbeam.conf, no prefix)
+- Sessions hyperbeam creates carry the tmux option `@hb`. The **stack** is the `hyperbeam` session, then those sessions by creation time.
+  `M-]` next, `M-[` previous, in the current client only (each client has its own position). Not in the stack: your other sessions; from one of those, `M-]` goes to the menu.
+- `M-y` copies the current pane's whole scrollback, trailing blank lines trimmed. Local client: wl-copy, message "copied N lines".
+  Remote client: saved to ~/.local/state/hyperbeam/outbox/<session>-<time>.txt and the path is shown (phone delivery comes later).
+- Mouse is on. Dragging a selection copies it to the tmux buffer, and at the laptop to the Wayland clipboard too. Shift+drag is kitty's own selection.
+- The keys are shown in the menu's button bar and in the status-right of every hyperbeam session (set per session at creation, so other sessions keep the old bar). If you change a key, change `HINT` in the script.
+- Local or remote is decided per client, not per server: `#{client_pid}` -> that process's environment has SSH_CONNECTION/SSH_TTY, or an ancestor is sshd*, mosh-server or tailscaled. `#{client_tty}` tells nothing (both are ptys).
+- wl-copy runs from the tmux server, so it needs the server's WAYLAND_DISPLAY; if the server was started over SSH it hasn't one, so the script falls back to the socket in $XDG_RUNTIME_DIR.
+- Window positioning: GNOME/Wayland gives clients no way to place windows. A kitty started with `-o linux_display_server=x11` is an Xwayland window and can be moved with XMoveWindow (tested: lands on the far-left monitor, X focus unchanged). Not used by hyperbeam.
 
 ## Manifest format
 `projects/<name>.toml` in this repo (not in the project). Written by Claude through Onboard (there is no heuristic drafting). Ports start at 3100 and never repeat across manifests.
@@ -91,8 +106,10 @@ interfaces, so each manifest makes that so, never the project:
 - ufw is configured off (`ENABLED=no` in /etc/ufw/ufw.conf); the live ruleset needs root to read.
 
 ## Testing
-`HB_MANIFESTS=<dir>` points at another manifests directory. Test with an isolated tmux server (`TMUX_TMPDIR=$(mktemp -d /tmp/hbt.XXXX)`) and
-`XDG_STATE_HOME`, never against the live sessions. A Textual pilot script can import the file with `importlib` (`SourceFileLoader`) and click the widgets.
+`HB_MANIFESTS=<dir>` points at another manifests directory. Test with an isolated tmux server (`TMUX_TMPDIR=$(mktemp -d /tmp/hbt.XXXX)`: the socket path must be short) and
+`XDG_STATE_HOME`, never against the live sessions. Start the server with `tmux -f <conf that sources tmux.conf and hyperbeam.conf> start-server`.
+A fake remote client: a private sshd (`sshd -f` with its own host key, authorized_keys, 127.0.0.1:<port>, run as yourself) and `ssh -tt ... tmux attach`.
+Drive clients through a pty, not by `tmux send-keys` (that bypasses the client). Never `pkill -f` a pattern that appears in your own command line. A Textual pilot script can import the file with `importlib` (`SourceFileLoader`) and click the widgets.
 
 ## Gotchas
 - pnpm 12 installs dependencies by itself on `pnpm dev`. Opening a project whose node_modules is missing therefore modifies it.
