@@ -1,0 +1,8 @@
+# CLI PDF generator (no server). The single service is an optional preview server: it serves the repo so the
+# committed previews/ and build/<book>/ output can be viewed from the phone over Tailscale.
+path = "~/projects/journal-system"
+port = 3104
+
+[[service]]
+name = "previews"
+cmd = ".venv/bin/python -m http.server $HB_PORT --bind $HOST --directory ."
