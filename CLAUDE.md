@@ -17,6 +17,8 @@ Works locally and from Termux over Tailscale.
 - Verify, don't assume. Check the machine before writing down a fact about it.
 - Never print or commit secrets (.env files, keys, tokens). Say only that such a file exists.
 - Ignored files are listed in PRIVATE.md.
+- **Steno files:** `steno-YYYY-MM-DD.txt` files whose first line starts with `stenographr` can appear in any project folder. They are the user's personal dictation notes, never project files. Never commit them, never `git add` them (no `git add -A`/`.` while one isn't ignored), and don't read them for project purposes. `steno` normally adds `steno-*.txt` to the repo's .gitignore (and ~/.config/git/ignore has it too, so untracked ones usually don't show in `git status`).
+- Manifests (`projects/<name>.toml`) are committed straight to hyperbeam's main and pushed: no branch, no PR. Everything else goes through a branch and a PR.
 
 ## Commands
 `hyperbeam` is one Python script, a uv script with its dependency (textual) declared inline, symlinked to `~/.local/bin/hyperbeam`
@@ -81,6 +83,11 @@ attaches (tested at 150 and 58 columns: at phone width the right pane gets ~9 co
 - wl-copy runs from the tmux server, so it needs the server's WAYLAND_DISPLAY; if the server was started over SSH it hasn't one, so the script falls back to the socket in $XDG_RUNTIME_DIR.
 - Window positioning: GNOME/Wayland gives clients no way to place windows. A kitty started with `-o linux_display_server=x11` is an Xwayland window and can be moved with XMoveWindow (tested: lands on the far-left monitor, X focus unchanged). Not used by hyperbeam.
 
+## Beam in: layouts and the start check
+- **Layouts** are saved to ~/.local/state/hyperbeam/layouts/<project>.json: per window its name and tmux `#{window_layout}`, per pane its cwd and role (`claude`, `shell`, `service:<name>`, `other`), the active window and pane, a time and `clean`. Saved: on Stop (with `clean: true`), when a client detaches or its terminal goes away or it switches session (tmux hooks `client-detached[90]` and `client-session-changed[90]` in hyperbeam.conf run `hyperbeam _save`, which saves every hyperbeam session because the hook has no session name left to give), every 5 minutes while the menu runs, and once when a session starts. `select-layout` with a saved string works on a different window size (tmux rescales when a client attaches) but is silently ignored if the pane count differs, so panes are created first.
+- **Open** on a project that isn't running but has a saved layout asks "Restore last layout?" (a modal in the menu, y/n in the terminal for `hyperbeam open`; no terminal means no). Yes recreates windows, panes, cwds, layouts and active pane; services restart from the manifest in order; Claude panes run `claude --continue` (the most recent conversation in that directory; verified it takes an initial prompt too; falls back to a fresh `claude` if there is none), only the first per directory; other panes get a shell. No gives the default layout.
+- **Start check** (`start_check`, built on `git_problems`, which the wrap-up check will reuse; `hyperbeam _check PATH [--fetch]` prints it): uncommitted changes, unpushed commits (or commits on no remote), stashes, detached HEAD, merge/rebase/cherry-pick/revert in progress, behind the upstream (after a `git fetch` with a 6 s limit, no prompts, ssh ConnectTimeout 3, failure ignored), and "not stopped cleanly" (a saved layout with `clean: false` and no running session: crash, reboot, killed session). steno files are left out of the counts; one git could commit (tracked, or untracked and not ignored) is reported as its own warning. The results print above `kk` in the shell pane. If anything was found (and the project has a manifest and it isn't Onboard) it asks "Start Claude to sort it out?": yes starts Claude with RECOVER.md plus the findings (with `--continue` if the layout was restored). RECOVER.md: diagnose read-only, propose, wait for approval, never commit steno files. No Claude unless the user says yes.
+
 ## Manifest format
 `projects/<name>.toml` in this repo (not in the project). Written by Claude through Onboard (there is no heuristic drafting). `port` is optional: a project with nothing to serve has none, and then no PORT/HB_PORT is set. Ports start at 3100 and never repeat across manifests.
 
@@ -123,6 +130,7 @@ interfaces, so each manifest makes that so, never the project:
 - ufw is configured off (`ENABLED=no` in /etc/ufw/ufw.conf); the live ruleset needs root to read.
 
 ## Testing
+**Visual tests (opening or closing real windows, e.g. `open_mode = "window"`) go only on the far-left monitor near 0/0 (eDP-1, a screen the user does not use), and must not take focus.** Never open a window anywhere else. GNOME/Wayland can't place windows, so use an Xwayland kitty (`HB_KITTY_ARGS="-o linux_display_server=x11 --class hbwin"`) and move it with XMoveWindow; check X focus before and after; close it right away. If that can't be done cleanly, test on an isolated tmux server with a pty client instead. Use a throwaway config (`HB_CONFIG`) and make sure it says `open_mode = "switch"` unless that test needs `"window"`: a leftover `"window"` made a test open four real kitty windows.
 `HB_MANIFESTS=<dir>` points at another manifests directory. Test with an isolated tmux server (`TMUX_TMPDIR=$(mktemp -d /tmp/hbt.XXXX)`: the socket path must be short) and
 `XDG_STATE_HOME`, never against the live sessions. Start the server with `tmux -f <conf that sources tmux.conf and hyperbeam.conf> start-server`.
 A fake remote client: a private sshd (`sshd -f` with its own host key, authorized_keys, 127.0.0.1:<port>, run as yourself) and `ssh -tt ... tmux attach`.

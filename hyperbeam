@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, time, tomllib
+import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, threading, time, tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -253,33 +253,243 @@ def pane_tail(target, n=50):
     return "\n".join(out[-n:])
 
 
-def investigate_prompt(name, path, sess, reason, failures):
-    """ONBOARDING.md plus the facts about this project and what went wrong. Written to a file; returns its path."""
-    mp = MANIFESTS / f"{name}.toml"
-    ctx = [f"Project name: {name}", f"Project path: {path}",
-           f"Manifest: {mp if mp.exists() else 'none'}" + ("" if mp.exists() else f" (write it to {mp} once the user approves)"),
-           f"tmux session: {sess} (you are in its `claude` window; start services in new windows of this session)",
-           f"Why you were started: {reason}"]
-    for f in failures:
-        ctx.append(f"\nService `{f['name']}` failed: {f['result']}\nLast lines of its window:\n```\n{f['tail'] or '(empty)'}\n```")
+def write_prompt(sess, text):
     d = STATE_DIR / "prompts"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{sess}-{time.strftime('%Y%m%d-%H%M%S')}.md"
-    f.write_text((HERE / "ONBOARDING.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
+    f.write_text(text)
     f.chmod(0o600)
     return f
 
 
-def claude_cmd(prompt_file=None):
-    """Plain `claude`, or claude started with the investigate prompt (prompt first: --add-dir takes a list)."""
-    if prompt_file is None:
-        return "claude"
-    return f'claude "$(cat {shlex.quote(str(prompt_file))})" --add-dir {shlex.quote(str(HERE))}'
+def investigate_prompt(name, path, sess, reason, failures, findings=()):
+    """ONBOARDING.md plus the facts about this project and what went wrong. Written to a file; returns its path."""
+    mp = MANIFESTS / f"{name}.toml"
+    ctx = [f"Project name: {name}", f"Project path: {path}",
+           f"Manifest: {mp if mp.exists() else 'none'}" + ("" if mp.exists() else f" (write it to {mp} once the user approves)"),
+           f"tmux session: {sess} (you are in its Claude pane; start services in new windows of this session)",
+           f"Why you were started: {reason}"]
+    for f in failures:
+        ctx.append(f"\nService `{f['name']}` failed: {f['result']}\nLast lines of its window:\n```\n{f['tail'] or '(empty)'}\n```")
+    if findings:
+        ctx.append("\nStart check findings:\n" + "\n".join(f"- {x}" for x in findings))
+    return write_prompt(sess, (HERE / "ONBOARDING.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
+
+
+def recover_prompt(name, path, sess, findings):
+    ctx = [f"Project name: {name}", f"Project path: {path}", f"tmux session: {sess}", "", "Start check findings:"] + [f"- {x}" for x in findings]
+    return write_prompt(sess, (HERE / "RECOVER.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
+
+
+def claude_cmd(prompt_file=None, cont=False, add_dir=False):
+    """Plain `claude`, or claude with an initial prompt read from a file. cont: `claude --continue` (the most recent conversation in this
+    directory; it takes a prompt too), falling back to a fresh claude if there is none. The prompt comes first: --add-dir takes a list."""
+    p = f' "$(cat {shlex.quote(str(prompt_file))})"' if prompt_file else ""
+    tail = f" --add-dir {shlex.quote(str(HERE))}" if add_dir else ""
+    fresh = f"claude{p}{tail}"
+    return f"claude --continue{p}{tail} || {fresh}" if cont else fresh
 
 
 def send_line(target, text):
     tmux("send-keys", "-t", target, "-l", text)
     tmux("send-keys", "-t", target, "Enter")
+
+
+# ---------- layouts (saved under ~/.local/state/hyperbeam/layouts/<project>.json) ----------
+SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+
+
+def layout_file(name):
+    return STATE_DIR / "layouts" / f"{name}.json"
+
+
+def load_layout(name):
+    try:
+        d = json.loads(layout_file(name).read_text())
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(d.get("windows"), list) and d["windows"] and all(w.get("panes") and w.get("layout") for w in d["windows"])
+    return d if ok else None
+
+
+def session_project(sess):
+    """Project name of a session (its HB_PROJECT), else the session name."""
+    v = tmux("show-environment", "-t", f"={sess}", "HB_PROJECT", check=False).stdout.strip()
+    return v.split("=", 1)[1] if v.startswith("HB_PROJECT=") else sess
+
+
+def pane_role(cmd, win, first_in_window, services):
+    if first_in_window and win in services:
+        return f"service:{win}"
+    return "claude" if cmd == "claude" else "shell" if cmd in SHELLS else "other"
+
+
+def snapshot(sess, man):
+    """Windows (name, layout, active) and panes (cwd, role, active) of a session."""
+    services = {x["name"] for x in (man or {}).get("service", [])}
+    wins = {}
+    for line in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_index}\t#{window_name}\t#{window_layout}\t#{window_active}",
+                     check=False).stdout.splitlines():
+        i, name, layout, active = line.split("\t")
+        wins[i] = dict(name=name, layout=layout, active=active == "1", panes=[])
+    for line in tmux("list-panes", "-s", "-t", f"={sess}", "-F",
+                     "#{window_index}\t#{pane_index}\t#{pane_current_path}\t#{pane_active}\t#{pane_current_command}",
+                     check=False).stdout.splitlines():
+        wi, pi, cwd, active, cmd = line.split("\t")
+        w = wins.get(wi)
+        if w is not None:
+            w["panes"].append(dict(cwd=cwd, role=pane_role(cmd, w["name"], not w["panes"], services), active=active == "1"))
+    return [w for _, w in sorted(wins.items(), key=lambda kv: int(kv[0])) if w["panes"]]
+
+
+def save_layout(name, clean=False):
+    """Write the session's layout. clean=True is Stop: it records 'stopped cleanly'."""
+    sess = sanitize(name)
+    if sess == MENU or not session_exists(sess):
+        return False
+    wins = snapshot(sess, load_manifests().get(name))
+    if not wins:
+        return False
+    d = layout_file(name)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    tmp = d.with_suffix(".tmp")
+    tmp.write_text(json.dumps(dict(version=1, saved=time.time(), clean=clean, session=sess, windows=wins), indent=1))
+    tmp.replace(d)
+    return True
+
+
+def save_all():
+    """Save every hyperbeam project session (the menu's 5-minute timer and the tmux detach hook call this)."""
+    fmt = "#{session_name}\t#{@hb}"
+    n = 0
+    for line in tmux("list-sessions", "-F", fmt, check=False).stdout.splitlines():
+        sess, tag = (line.split("\t") + [""])[:2]
+        if tag == "1" and sess != MENU:
+            n += save_layout(session_project(sess))
+    return n
+
+
+def ago_text(ts):
+    a = ago(ts)
+    return "just now" if a == "now" else f"{a} ago"
+
+
+def describe_layout(lay):
+    panes = sum(len(w["panes"]) for w in lay["windows"])
+    return f"{len(lay['windows'])} windows, {panes} panes, saved {ago_text(lay['saved'])}"
+
+
+# ---------- start check: git state and signs of a bad shutdown (the wrap-up check will reuse git_problems) ----------
+STENO_RE = re.compile(r"^steno-\d{4}-\d{2}-\d{2}\.txt$")
+
+
+def is_steno(path, rel):
+    """Dictation notes from `steno`: steno-YYYY-MM-DD.txt whose first line starts with `stenographr`."""
+    if not STENO_RE.match(Path(rel).name):
+        return False
+    try:
+        with open(Path(path) / rel, errors="replace") as f:
+            return f.readline().startswith("stenographr")
+    except OSError:
+        return True      # tracked but deleted, or unreadable: the name is enough
+
+
+def git_out(path, *a):
+    return subprocess.run(["git", "-C", str(path), *a], capture_output=True, text=True).stdout.strip()
+
+
+def git_fetch(path):
+    """Quiet, short, never prompts; failure (offline, no remote) is ignored."""
+    if not git_out(path, "remote"):
+        return
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=3")
+    try:
+        subprocess.run(["git", "-C", str(path), "fetch", "--quiet"], env=env, capture_output=True, timeout=6)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def git_problems(path, fetch=False):
+    """Things worth sorting out in a repo, as short sentences. steno-*.txt files are left out of the counts; one that git
+    could commit (not ignored: untracked, or tracked) is reported as a warning instead. No repo: []."""
+    path = Path(path)
+    if not git_out(path, "rev-parse", "--git-dir"):
+        return []
+    if fetch:
+        git_fetch(path)
+    out, steno = [], []
+    dirty = 0
+    for line in git_out(path, "status", "--porcelain=v1", "-uall").splitlines():
+        rel = line[3:].split(" -> ")[-1].strip('"')
+        if is_steno(path, rel):
+            steno.append(rel)
+        else:
+            dirty += 1
+    steno += [f for f in git_out(path, "ls-files").splitlines() if STENO_RE.match(Path(f).name) and is_steno(path, f) and f not in steno]
+    if dirty:
+        out.append(f"{dirty} uncommitted change{'s' if dirty != 1 else ''}")
+    branch = git_out(path, "symbolic-ref", "-q", "--short", "HEAD")
+    if not branch:
+        out.append(f"detached HEAD at {git_out(path, 'rev-parse', '--short', 'HEAD')}")
+    for marker, what in (("MERGE_HEAD", "merge"), ("rebase-merge", "rebase"), ("rebase-apply", "rebase"),
+                         ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert")):
+        if Path(git_out(path, "rev-parse", "--path-format=absolute", "--git-path", marker)).exists():
+            out.append(f"{what} in progress")
+    up = git_out(path, "rev-parse", "--abbrev-ref", "@{u}") if branch else ""
+    if up:
+        ahead, behind = (git_out(path, "rev-list", "--left-right", "--count", "HEAD...@{u}") or "0 0").split()
+        if int(ahead):
+            out.append(f"{ahead} unpushed commit{'s' if ahead != '1' else ''} on {branch}")
+        if int(behind):
+            out.append(f"behind {up} by {behind} commit{'s' if behind != '1' else ''}")
+    elif git_out(path, "remote"):
+        n = git_out(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
+        if n and n != "0":
+            out.append(f"{n} commit{'s' if n != '1' else ''} not on any remote" + (f" ({branch} has no upstream)" if branch else ""))
+    n = len(git_out(path, "stash", "list").splitlines())
+    if n:
+        out.append(f"{n} stash{'es' if n != 1 else ''}")
+    if steno:
+        out.append("steno file(s) not ignored by git: " + ", ".join(sorted(set(steno))) + " (personal notes: never commit; add `steno-*.txt` to .gitignore)")
+    return out
+
+
+def start_check(name, path, fetch=True):
+    """Problems to report on Open: git state plus 'not stopped cleanly' (a saved layout with no clean-stop record and no running session)."""
+    out = []
+    lay = load_layout(name)
+    if lay and not lay.get("clean") and not session_exists(sanitize(name)):
+        out.append(f"not stopped cleanly (layout saved {ago_text(lay['saved'])}, no clean stop recorded: crash, reboot or killed session)")
+    return out + git_problems(path, fetch)
+
+
+def ask_tty(text):
+    """Ask y/n in the terminal (CLI over SSH). No terminal: no."""
+    if not sys.stdin.isatty():
+        return False
+    print(text)
+    return input("y/n: ").strip().lower().startswith("y")
+
+
+def open_project(name, path, man, ask, say, onboard=False):
+    """Everything Open does before showing the session: the session if it isn't running (asking about the saved layout and,
+    if the start check found something, about Claude), or the investigate window on Onboard."""
+    sess = sanitize(name)
+    if sess == MENU:
+        return ensure_menu()
+    if session_exists(sess):
+        if onboard:
+            investigate_window(name, path, "Onboard requested; the session was already running")
+        return
+    lay = load_layout(name)
+    restore = lay if lay and ask(f"Restore last layout of {name}?\n\n{describe_layout(lay)}") else None
+    say(f"{name}: checking git state...")
+    findings = start_check(name, path)
+    recover = False
+    if findings and man and not onboard:
+        recover = ask("Start Claude to sort it out?\n\n" + "\n".join(f"- {f}" for f in findings))
+    start_session(name, man, say, path=path, reason="Onboard requested" if onboard else None,
+                  restore=restore, findings=findings, recover=recover)
 
 
 def new_pane(args, cmd=None):
@@ -303,10 +513,44 @@ def ensure_menu():
     tag_session(MENU)
 
 
-def start_session(name, man, say=print, path=None, reason=None):
-    """Create the project's session. Without a manifest (man is None), or if a service fails, or if `reason` is given
-    (Onboard), Claude starts with the investigate prompt instead of plain `claude`.
-    Window `work`: Claude on the left, a shell on the right (it runs the warnings, then `kk`); then one window per service."""
+def default_layout(sess, path, envargs):
+    """New session with window `work`: Claude on the left (60%), a shell on the right (40%). Returns [(pane id, role, cwd)]."""
+    claude = new_pane(["new-session", "-d", "-s", sess, "-n", "work", "-x", "200", "-y", "50", "-c", str(path), *envargs])
+    shell = new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(path)])
+    tmux("select-pane", "-t", claude)
+    return [(claude, "claude", str(path)), (shell, "shell", str(path))]
+
+
+def restore_layout(sess, path, lay, envargs):
+    """Recreate the saved windows and panes (cwds, layouts, active window and pane). Returns [(pane id, role, cwd)]."""
+    plan, active_pane, active_win = [], [], None
+    for i, w in enumerate(lay["windows"]):
+        cwds = [p["cwd"] if Path(p["cwd"]).is_dir() else str(path) for p in w["panes"]]
+        if i == 0:
+            first = new_pane(["new-session", "-d", "-s", sess, "-n", w["name"], "-x", "200", "-y", "50", "-c", cwds[0], *envargs])
+        else:
+            first = new_pane(["new-window", "-d", "-t", f"{sess}:", "-n", w["name"], "-c", cwds[0]])
+        ids = [first]
+        for c in cwds[1:]:
+            ids.append(new_pane(["split-window", "-t", ids[-1], "-c", c]))
+        if len(ids) > 1:
+            tmux("select-layout", "-t", first, w["layout"])
+        plan += [(pid, p["role"], c) for pid, p, c in zip(ids, w["panes"], cwds)]
+        act = next((pid for pid, p in zip(ids, w["panes"]) if p.get("active")), first)
+        tmux("select-pane", "-t", act)
+        if w.get("active"):
+            active_win = first
+    if active_win:
+        tmux("select-window", "-t", active_win)
+    return plan
+
+
+def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False):
+    """Create the project's session: the default layout, or `restore` (a saved layout).
+    Default: window `work` (Claude left, a shell right), then one window per service. Services start in manifest order, each after the
+    previous one is ready. Then the first shell pane prints the start-check findings and real warnings and runs `kk`, and Claude starts:
+    with the investigate prompt (no manifest, a failing service, Onboard) or the recover prompt (`recover`: the user said yes to the start
+    check's offer) instead of plain `claude`. Restored Claude panes run `claude --continue`."""
     sess = sanitize(name)
     if sess == MENU:
         return ensure_menu()
@@ -316,35 +560,64 @@ def start_session(name, man, say=print, path=None, reason=None):
     env = session_env(man, name)
     clean_server_env()
     envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
-    claude = new_pane(["new-session", "-d", "-s", sess, "-n", "work", "-x", "200", "-y", "50", "-c", str(path), *envargs])
-    shell = new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(path)])
-    tmux("select-pane", "-t", claude)
+    plan = None
+    if restore:
+        try:
+            plan = restore_layout(sess, path, restore, envargs)
+            say(f"{name}: restored layout ({describe_layout(restore)})")
+        except subprocess.CalledProcessError as e:
+            tmux("kill-session", "-t", f"={sess}", check=False)
+            say(f"{name}: could not restore the layout ({(e.stderr or '').strip()}); using the default one")
+    if plan is None:
+        plan = default_layout(sess, path, envargs)
     tag_session(sess)
+    claude_panes = [p for p in plan if p[1] == "claude"] or plan[:1]
+    first_claude = claude_panes[0][0]
+    shell = next((p[0] for p in plan if p[1] == "shell"), None) or next((p[0] for p in plan if p[1] == "other"), None)
     services = man.get("service", []) if man else []
     if services:
-        send_line(claude, "echo '[hyperbeam] starting services; Claude starts when they are done'")
+        send_line(first_claude, "echo '[hyperbeam] starting services; Claude starts when they are done'")
     failures = []
     for svc in services:
         win = svc["name"]
-        tmux("new-window", "-d", "-t", f"{sess}:", "-n", win, "-c", str(path))
-        send_line(f"{sess}:{win}", f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
+        target = next((p[0] for p in plan if p[1] == f"service:{win}"), None)
+        if target is None:
+            target = new_pane(["new-window", "-d", "-t", f"{sess}:", "-n", win, "-c", str(path)])
+        send_line(target, f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
         say(f"{name}: started {win}, waiting...")
         result = wait_ready(sess, win, svc, man.get("port"))
         say(f"{name}: {win}: {result}")
         if result.startswith("WARNING"):
-            failures.append(dict(name=win, result=result, tail=pane_tail(f"{sess}:{win}")))
-    send_line(shell, f"clear; {SELF} _warn {shlex.quote(str(path))}; {SELF} info {shlex.quote(name)}")
+            failures.append(dict(name=win, result=result, tail=pane_tail(target)))
+    if shell:
+        ff = ""
+        if findings:
+            d = STATE_DIR / "startcheck"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{sess}.txt").write_text("\n".join(findings) + "\n")
+            ff = f" --findings {shlex.quote(str(d / (sess + '.txt')))}"
+        send_line(shell, f"clear; {SELF} _warn {shlex.quote(str(path))}{ff}; {SELF} info {shlex.quote(name)}")
     if man is None:
         reason = reason or "no manifest"
     elif failures:
         reason = reason or "a service failed to start"
+    cont = bool(restore) and plan is not None and any(p[1] == "claude" for p in plan)
     if reason:
-        cmd = claude_cmd(investigate_prompt(name, path, sess, reason, failures))
+        cmd = claude_cmd(investigate_prompt(name, path, sess, reason, failures, findings), cont=cont, add_dir=True)
         say(f"{name}: {reason}; Claude starts with the investigate prompt")
+    elif recover:
+        cmd = claude_cmd(recover_prompt(name, path, sess, findings), cont=cont)
+        say(f"{name}: Claude starts with the recover prompt")
     else:
-        cmd = claude_cmd()
-    send_line(claude, cmd)
-    tmux("select-window", "-t", f"{sess}:work")
+        cmd = claude_cmd(cont=cont)
+    send_line(first_claude, cmd)
+    seen = {next(c for pid, _, c in plan if pid == first_claude)}
+    for pid, role, cwd in claude_panes[1:]:          # more Claude panes: continue only if the directory differs (one conversation per directory)
+        send_line(pid, claude_cmd(cont=cwd not in seen))
+        seen.add(cwd)
+    if not restore:
+        tmux("select-window", "-t", f"{sess}:work")
+    save_layout(name)
     say(f"{name}: session ready" + (f" (PORT={man['port']})" if man and man.get("port") else ""))
 
 
@@ -353,7 +626,7 @@ def investigate_window(name, path, reason):
     sess = sanitize(name)
     f = investigate_prompt(name, path, sess, reason, [])
     tmux("new-window", "-t", f"{sess}:", "-n", "investigate", "-c", str(path))
-    send_line(f"{sess}:investigate", claude_cmd(f))
+    send_line(f"{sess}:investigate", claude_cmd(f, add_dir=True))
 
 
 def own_session():
@@ -387,6 +660,7 @@ def stop_project(name, man, say=print):
             except subprocess.TimeoutExpired:
                 say(f"{name}: WARNING stop {svc['name']} timed out")
     if session_exists(sess):
+        save_layout(name, clean=True)
         tmux("kill-session", "-t", f"={sess}", check=False)
         say(f"{name}: session killed")
     deadline = time.time() + 6
@@ -900,12 +1174,12 @@ def cmd_scan(_):
 
 def cmd_open(args):
     sess = sanitize(args.name)
-    if not session_exists(sess):
-        row = next((r for r in scan() if r["name"] == args.name), None)
-        man = load_manifests().get(args.name)
-        if row is None and man is None:
-            sys.exit(f"hyperbeam: no project called {args.name} (try `hyperbeam scan`)")
-        start_session(args.name, man, path=row["path"] if row else None)
+    row = next((r for r in scan() if r["name"] == args.name), None)
+    man = load_manifests().get(args.name)
+    if row is None and man is None and sess != MENU:
+        sys.exit(f"hyperbeam: no project called {args.name} (try `hyperbeam scan`)")
+    path = manifest_path(man) if man else (row["path"] if row else HERE)
+    open_project(args.name, path, man, ask_tty, print)
     touch_opened(args.name)
     if not args.detach:
         sys.exit(attach_here(sess))
@@ -929,10 +1203,13 @@ def cmd_warn(args):
     else:
         if not run("git", "-C", str(p), "remote"):
             warns.append("no git remote (nothing is backed up)")
-        if run("git", "-C", str(p), "status", "--porcelain"):
-            warns.append("uncommitted changes")
     if not (p / "CLAUDE.md").exists():
         warns.append("no CLAUDE.md")
+    if args.findings:
+        try:
+            warns = Path(args.findings).read_text().splitlines() + warns
+        except OSError:
+            pass
     for w in warns:
         print(f"\033[33mhyperbeam: warning: {w}\033[0m")
 
@@ -1013,6 +1290,7 @@ class Menu(App):
         self.query_one("#list", OptionList).focus()
         self.action_refresh()
         self.set_interval(3, self.poll_running)
+        self.set_interval(300, self.save_layouts)
 
     # --- data ---
     def action_refresh(self):
@@ -1181,16 +1459,19 @@ class Menu(App):
         self.busy.add(p["name"])
         self.run_worker(lambda: self._open(p), thread=True)
 
+    def ask(self, text):
+        """Ask y/n in a modal; called from a worker thread, blocks until answered."""
+        done, box = threading.Event(), []
+        self.call_from_thread(self.push_screen, Confirm(text), lambda v: (box.append(bool(v)), done.set()))
+        done.wait()
+        return box[0]
+
     def _open(self, p, onboard=False):
-        """Open: start the session if needed (no manifest or a failing start lands in Claude with the investigate prompt),
-        then switch this client to it. Onboard forces the investigate prompt."""
+        """Open: start the session if needed (asking about the saved layout and the start check; no manifest or a failing start lands in
+        Claude with the investigate prompt), then show it. Onboard forces the investigate prompt."""
         name, sess = p["name"], sanitize(p["name"])
         try:
-            man = load_manifests().get(name)
-            if not session_exists(sess):
-                start_session(name, man, self.say_from_thread, path=p["path"], reason="Onboard requested" if onboard else None)
-            elif onboard:
-                investigate_window(name, p["path"], "Onboard requested; the session was already running")
+            open_project(name, p["path"], load_manifests().get(name), self.ask, self.say_from_thread, onboard)
             touch_opened(name)
             how = show_session(sess)
             self.say_from_thread(f"{name}: {how} ({HINT})")
@@ -1199,6 +1480,9 @@ class Menu(App):
         finally:
             self.busy.discard(name)
             self.call_from_thread(self.reload, True)
+
+    def save_layouts(self):
+        self.run_worker(save_all, thread=True, group="save")
 
     def action_stop(self):
         p = self.current()
@@ -1288,7 +1572,13 @@ def main():
     cl.set_defaults(f=cmd_clip)
     w = sub.add_parser("_warn")
     w.add_argument("path")
+    w.add_argument("--findings")
     w.set_defaults(f=cmd_warn)
+    ck = sub.add_parser("_check", help="print the start check's findings for a directory")
+    ck.add_argument("path")
+    ck.add_argument("--fetch", action="store_true")
+    ck.set_defaults(f=lambda a: print("\n".join(git_problems(a.path, a.fetch)) or "(nothing found)"))
+    sub.add_parser("_save").set_defaults(f=lambda _: save_all() and None)
     argv = sys.argv[1:]
     if Path(sys.argv[0]).name == "kk":      # ~/.local/bin/kk is a symlink to this script
         argv = ["info", *argv]
