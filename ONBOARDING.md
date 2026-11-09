@@ -6,7 +6,10 @@ The facts (project name, manifest, session, what failed with the last lines of t
 Read CLAUDE.md in ~/projects/hyperbeam first: it defines the manifest format, the Docker rule and the Tailscale notes.
 
 Rules: never print the contents of .env files, keys or tokens (say only that such a file exists and which variable names it needs).
-Do not commit anything, in the project or in hyperbeam.
+Do not commit anything in the project. The one exception is the manifest in hyperbeam, after the user approves it (step 3).
+**Steno files:** `steno-YYYY-MM-DD.txt` files whose first line starts with `stenographr` are the user's personal dictation notes, not project files.
+Never read them for the project, never `git add` them, never commit them. If one is not covered by .gitignore, list "add `steno-*.txt` to .gitignore"
+among the project changes you recommend.
 
 ## 1. Read the project
 How it is set up and started (package.json scripts, Makefile, README, pyproject, Procfile...), its test command, backing services
@@ -30,8 +33,11 @@ so you know which ports are taken.
 ## 3. Propose the manifest, then wait
 Show the user the full `projects/<name>.toml` you propose (format in CLAUDE.md: `port` only if something serves, ordered services, `ready_port`, `stop` for every backing
 service, `[env]` if needed; no URLs: `kk` discovers links itself, `[links]` is only for extras it cannot find) with one line per service saying what you checked. **Then stop and wait for the user to approve.**
-Only after approval write it to the manifest path given below in ~/projects/hyperbeam (this directory is added to your session).
-If a manifest already exists, change only what is wrong.
+Only after approval write it to the manifest path given below in ~/projects/hyperbeam (this directory is added to your session), and
+**commit it straight to hyperbeam's main and push**, no branch and no PR: `git add projects/<name>.toml` (only that file), commit with a message such as
+"Add <name> manifest", `git push origin main`. If ~/projects/hyperbeam is not on main or has other uncommitted work, do not switch branches: write the file,
+tell the user, and ask how to proceed.
+If a manifest already exists, change only what is wrong and commit it the same way.
 
 ## 4. Reply with
 1. What you wrote (or propose) and why.
