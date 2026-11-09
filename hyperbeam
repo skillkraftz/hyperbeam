@@ -8,8 +8,9 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, json, os, re, shlex, socket, subprocess, sys, time, tomllib
+import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, time, tomllib
 from pathlib import Path
+from urllib.parse import urlparse
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -19,6 +20,22 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
+
+def strip_uv_env():
+    """`uv run --script` puts its own environment in ours (VIRTUAL_ENV, UV*, a venv bin dir first in PATH). Everything hyperbeam
+    starts (the tmux server, so every project session) must get the normal login environment, so remove it here."""
+    venv = os.environ.get("VIRTUAL_ENV", "")
+    for k in [k for k in os.environ if k in ("VIRTUAL_ENV", "UV") or k.startswith("UV_")]:
+        del os.environ[k]
+    os.environ["PATH"] = clean_path(os.environ.get("PATH", ""), venv)
+
+
+def clean_path(path, venv=""):
+    keep = [d for d in path.split(":") if d and d != f"{venv}/bin" and "/.cache/uv/environments-" not in d]
+    return ":".join(dict.fromkeys(keep))      # also drops duplicate entries
+
+
+strip_uv_env()
 HERE = Path(os.path.realpath(__file__)).parent
 CFG = tomllib.loads((HERE / "config.toml").read_text())
 ROOT = Path(os.path.expanduser(CFG.get("projects_dir", "~/projects")))
@@ -163,9 +180,15 @@ def wait_ready(sess, win, svc, port):
     return f"WARNING timeout waiting for port {rp}"
 
 
-def session_env(man):
-    """Environment of a project's session: PORT, HB_PORT, HOST=0.0.0.0, then the manifest's [env] table."""
-    env = {"PORT": str(man["port"]), "HB_PORT": str(man["port"]), "HOST": "0.0.0.0"}
+def session_env(man, name=None):
+    """Environment of a project's session: HB_PROJECT, PORT and HB_PORT (only if the project has a port), HOST=0.0.0.0, then the
+    manifest's [env] table. `man` may be None (no manifest)."""
+    man = man or {}
+    env = {"HOST": "0.0.0.0"}
+    if name:
+        env["HB_PROJECT"] = name
+    if man.get("port"):
+        env["PORT"] = env["HB_PORT"] = str(man["port"])
     env.update({k: str(v) for k, v in man.get("env", {}).items()})
     return env
 
@@ -176,6 +199,18 @@ def manifest_path(man):
 
 def session_exists(sess):
     return tmux("has-session", "-t", f"={sess}", check=False).returncode == 0
+
+
+def clean_server_env():
+    """A tmux server that hyperbeam (run through uv) started before this fix has uv's environment in its global environment,
+    and every new session inherits it. Remove it there too."""
+    for k in ("VIRTUAL_ENV", "UV", "UV_RUN_RECURSION_DEPTH"):
+        tmux("set-environment", "-g", "-u", k, check=False)
+    cur = tmux("show-environment", "-g", "PATH", check=False).stdout.strip()
+    if cur.startswith("PATH="):
+        new = clean_path(cur[5:])
+        if new != cur[5:]:
+            tmux("set-environment", "-g", "PATH", new, check=False)
 
 
 def tag_session(sess):
@@ -227,7 +262,8 @@ def start_session(name, man, say=print, path=None, reason=None):
     path = manifest_path(man) if man else Path(path)
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
-    env = session_env(man) if man else {"HOST": "0.0.0.0"}
+    env = session_env(man, name)
+    clean_server_env()
     envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
     tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path), *envargs)
     tag_session(sess)
@@ -242,7 +278,7 @@ def start_session(name, man, say=print, path=None, reason=None):
         tmux("new-window", "-t", f"{sess}:", "-n", win, "-c", str(path))
         send_line(f"{sess}:{win}", f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
         say(f"{name}: started {win}, waiting...")
-        result = wait_ready(sess, win, svc, man["port"])
+        result = wait_ready(sess, win, svc, man.get("port"))
         say(f"{name}: {win}: {result}")
         if result.startswith("WARNING"):
             failures.append(dict(name=win, result=result, tail=pane_tail(f"{sess}:{win}")))
@@ -257,7 +293,7 @@ def start_session(name, man, say=print, path=None, reason=None):
         cmd = claude_cmd()
     send_line(f"{sess}:claude", cmd)
     tmux("select-window", "-t", f"{sess}:claude")
-    say(f"{name}: session ready" + (f" (PORT={man['port']})" if man else ""))
+    say(f"{name}: session ready" + (f" (PORT={man['port']})" if man and man.get("port") else ""))
 
 
 def investigate_window(name, path, reason):
@@ -276,7 +312,7 @@ def own_session():
 def project_ports(man):
     if not man:
         return []
-    ports = {man["port"]}
+    ports = {man["port"]} if man.get("port") else set()
     ports.update(s["ready_port"] for s in man.get("service", [])
                  if isinstance(s.get("ready_port"), int) and not isinstance(s.get("ready_port"), bool))
     return sorted(ports)
@@ -288,7 +324,7 @@ def stop_project(name, man, say=print):
     if own_session() == sess:
         raise RuntimeError(f"this menu is running inside {sess}; run Stop from another terminal")
     path = manifest_path(man) if man else None
-    env = dict(os.environ, **session_env(man)) if man else dict(os.environ)
+    env = dict(os.environ, **session_env(man, name))
     for svc in reversed(man.get("service", []) if man else []):
         if "stop" in svc:
             say(f"{name}: stop {svc['name']}: {svc['stop']}")
@@ -471,17 +507,18 @@ def tailnet_host():
 
 
 def live_sessions():
-    """Running sessions of hyperbeam projects (those with a manifest), most recently used first. session_last_attached is empty until a session's first
-    attach (it updates on every attach and switch-client), so session_created is the fallback."""
+    """Running sessions of hyperbeam projects (tagged @hb, or with a manifest), most recently used first. The port is None without a
+    manifest or without a port. session_last_attached is empty until a session's first attach (it updates on every attach and
+    switch-client), so session_created is the fallback."""
     by_sess = {sanitize(n): (n, m) for n, m in load_manifests().items()}
     out, here = [], own_session()
-    fmt = "#{session_name}\t#{session_last_attached}\t#{session_created}\t#{session_attached}"
+    fmt = "#{session_name}\t#{session_last_attached}\t#{session_created}\t#{session_attached}\t#{@hb}"
     for line in tmux("list-sessions", "-F", fmt, check=False).stdout.splitlines():
-        sess, last, created, attached = line.split("\t")
-        if sess not in by_sess:
+        sess, last, created, attached, tag = line.split("\t")
+        if sess == MENU or (sess not in by_sess and tag != "1"):
             continue
-        name, man = by_sess[sess]
-        out.append(dict(name=name, sess=sess, port=man["port"], here=sess == here,
+        name, man = by_sess.get(sess, (sess, {}))
+        out.append(dict(name=name, sess=sess, port=man.get("port"), here=sess == here,
                         ts=int(last or created or 0), attached=int(attached or 0)))
     return sorted(out, key=lambda s: -s["ts"])
 
@@ -496,10 +533,13 @@ def print_sessions(sessions, numbered):
     width = max(len(s["name"]) for s in sessions)
     for i, s in enumerate(sessions, 1):
         port = s["port"]
-        cols = [f"{i}" if numbered else "-", s["name"].ljust(width),
-                f"{port:<5}", "up  " if port_open(port) else "down", project_url(port) or "(no tailscale)"]
-        if not remote:
-            cols.append(f"local http://localhost:{port}")
+        cols = [f"{i}" if numbered else "-", s["name"].ljust(width)]
+        if port:
+            cols += [f"{port:<5}", "up  " if port_open(port) else "down", project_url(port) or "(no tailscale)"]
+            if not remote:
+                cols.append(f"local http://localhost:{port}")
+        else:
+            cols.append("no port")
         if s["here"]:
             cols.append("(here)")
         print("  ".join(cols))
@@ -565,6 +605,210 @@ def cmd_phone(_):
         return 0
     print(f"\nAttaching to {target['name']}...")
     return go_to(target)
+
+
+# ---------- info (kk) ----------
+URL_RE = re.compile(r"^(https?|postgres(?:ql)?|redis|mysql|mongodb(?:\+srv)?|amqp|nats)://[^\s'\"]+$")
+LOOPBACK = ("127.", "[::1]", "localhost")
+
+
+def local_to_tailnet(url, host):
+    return re.sub(r"//([^/@]*@)?(127\.0\.0\.1|localhost)", lambda m: f"//{m.group(1) or ''}{host}", url, count=1)
+
+
+def mask_password(url):
+    """URLs from .env files: hide a password unless the host is this machine."""
+    m = re.match(r"^([a-z+]+://[^:/@]+:)([^@/]+)(@.*)$", url)
+    if m and not re.match(r"^[a-z+]+://[^@]*@(127\.|localhost|\[::1\])", url):
+        return f"{m.group(1)}***{m.group(3)}"
+    return url
+
+
+def session_pids(sess):
+    """pids of everything running in a tmux session's panes (the pane processes and all their descendants)."""
+    roots = tmux("list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_pid}", check=False).stdout.split()
+    kids = {}
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit():
+            try:
+                st = (d / "stat").read_text()
+                kids.setdefault(int(st[st.rindex(")") + 2:].split()[1]), []).append(int(d.name))
+            except (OSError, ValueError):
+                pass
+    seen, todo = set(), [int(r) for r in roots]
+    while todo:
+        p = todo.pop()
+        if p not in seen:
+            seen.add(p)
+            todo += kids.get(p, [])
+    return seen
+
+
+def session_listeners(sess):
+    """[(port, process name, loopback_only)] for TCP ports listened on by processes inside the session."""
+    if not sess or not session_exists(sess):
+        return []
+    pids, out = session_pids(sess), {}
+    for line in run("ss", "-ltnpH").splitlines():
+        f = line.split()
+        m = re.search(r'\(\("([^"]+)",pid=(\d+)', line)
+        if len(f) < 4 or not m or int(m.group(2)) not in pids:
+            continue
+        addr, port = f[3].rsplit(":", 1)
+        lo = addr.startswith(LOOPBACK)
+        key = int(port)
+        out[key] = (key, m.group(1), lo and out.get(key, (0, 0, True))[2])
+    return sorted(out.values())
+
+
+def docker_containers(path):
+    """Containers that belong to the project, matched by the compose working_dir label or the supabase CLI workdir label:
+    [(name, [published host ports])]."""
+    if not shutil.which("docker"):
+        return []
+    fmt = '{{.Names}}\t{{.Ports}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.Label "com.supabase.cli.workdir"}}'
+    out = []
+    for line in run("docker", "ps", "--format", fmt).splitlines():
+        f = (line.split("\t") + ["", "", "", ""])[:4]
+        if str(path) in (f[2], f[3]):
+            ports = sorted({int(x) for x in re.findall(r":(\d+)->", f[1])})
+            out.append((f[0], ports))
+    return out
+
+
+def supabase_urls(path):
+    """URL values of `supabase status -o json` (never the keys). Only asked when supabase containers of this project run."""
+    if not shutil.which("supabase") or not (path / "supabase").is_dir():
+        return {}
+    r = subprocess.run(["supabase", "status", "-o", "json"], cwd=path, capture_output=True, text=True, timeout=10)
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return {}
+    urls = {k: v for k, v in d.items() if isinstance(v, str) and URL_RE.match(v)}
+    ref = (d.get("linked_project") or {}).get("project_ref")
+    if ref:
+        urls["LINKED_DASHBOARD"] = f"https://supabase.com/dashboard/project/{ref}"
+    return urls
+
+
+def git_web_url(path):
+    url = run("git", "-C", str(path), "remote", "get-url", "origin")
+    m = re.match(r"^(?:git@|ssh://git@)?([^:/]+)[:/](.+?)(?:\.git)?/?$", url) if url and not url.startswith("http") else None
+    if m:
+        host = "github.com" if m.group(1).startswith("github") else m.group(1)
+        return f"https://{host}/{m.group(2)}"
+    return re.sub(r"\.git$", "", url) if url.startswith("http") else ""
+
+
+def vercel_projects(path):
+    """Linked Vercel project names from .vercel/project.json or repo.json (no login needed; the URL itself needs one)."""
+    names = []
+    for f, key in ((path / ".vercel/project.json", None), (path / ".vercel/repo.json", "projects")):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        for p in (d.get(key, []) if key else [d]):
+            if p.get("name") or p.get("projectName"):
+                names.append(p.get("name") or p.get("projectName"))
+    return names
+
+
+def env_urls(path):
+    out = []
+    for f in sorted(path.glob(".env*")):
+        if f.name.endswith((".example", ".sample", ".template")) or not f.is_file():
+            continue
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
+            if m:
+                v = m.group(2).strip("'\"")
+                if URL_RE.match(v):
+                    out.append((m.group(1), mask_password(v), f.name))
+    return out
+
+
+def service_states(sess, man, host_ports):
+    """[(service, 'up'/'down'/'running'/'exited', detail)] for the manifest's services."""
+    out = []
+    for svc in (man or {}).get("service", []):
+        rp = svc.get("ready_port", man.get("port") if "ready_delay" not in svc else None)
+        if isinstance(rp, int) and not isinstance(rp, bool):
+            out.append((svc["name"], "up" if port_open(rp) else "down", f"port {rp}"))
+        else:
+            pane = tmux("capture-pane", "-p", "-t", f"={sess}:{svc['name']}", check=False).stdout
+            out.append((svc["name"], "exited" if re.search(r"\[hyperbeam\] exited: \d+", pane) else
+                        "running" if session_exists(sess) else "down", "no port"))
+    return out
+
+
+def project_info(name):
+    """The text `kk` prints. Discovery only; each source is skipped silently if it does not apply."""
+    from concurrent.futures import ThreadPoolExecutor
+    mans = load_manifests()
+    man = mans.get(name)
+    row = next((r for r in scan() if r["name"] == name), None)
+    path = manifest_path(man) if man else (row["path"] if row else None)
+    if path is None:
+        return f"hyperbeam info: no project called {name}"
+    sess, host = sanitize(name), tailnet_host()
+    running = session_exists(sess)
+    L = []
+
+    def section(title, lines):
+        lines = [x for x in lines if x]
+        if lines:
+            L.extend(["", title, *[f"  {x}" for x in lines]])
+
+    containers = docker_containers(path)
+    with ThreadPoolExecutor(2) as ex:
+        sb = ex.submit(supabase_urls, path) if any("supabase" in c[0] for c in containers) else None
+        gh = ex.submit(lambda: run("gh", "repo", "view", "--json", "homepageUrl", "-q", ".homepageUrl")) if shutil.which("gh") and (path / ".git").exists() else None
+        listeners = session_listeners(sess)
+        sbu = sb.result() if sb else {}
+        try:
+            homepage = gh.result(timeout=3) if gh else ""
+        except Exception:
+            homepage = ""
+    ports = {p: (proc, lo) for p, proc, lo in listeners}
+    if man and man.get("port") and man["port"] not in ports and port_open(man["port"]):
+        ports[man["port"]] = ("?", False)
+
+    L.append(f"{name}   {home_rel(path)}   session: {sess if running else '(not running)'}")
+    states = service_states(sess, man, ports)
+    section("Services", [f"{n:<12} {st:<7} {d}" for n, st, d in states])
+    section("App", [f"http://localhost:{p}  {proc}" + ("  (this machine only)" if lo else "") for p, (proc, lo) in sorted(ports.items())])
+    if host:
+        tail = [f"http://{host}:{p}  {proc}" for p, (proc, lo) in sorted(ports.items()) if not lo]
+        covered = {urlparse(u).port for u in sbu.values()}
+        tail += [f"{host}:{p}  {c}" for c, ps in containers for p in ps if p not in covered]
+        tail += [f"{local_to_tailnet(u, host)}  supabase {k}" for k, u in sbu.items() if "127.0.0.1" in u or "localhost" in u]
+        section("Tailscale", tail)
+    section("Docker", [f"localhost:{p}  {c}" for c, ps in containers for p in ps])
+    section("Supabase", [f"{u}  {k}" for k, u in sbu.items()])
+    vp = vercel_projects(path)
+    section("Vercel", [f"project {n}  (production URL: needs `vercel login`)" for n in vp])
+    web = git_web_url(path)
+    section("Git", [f"{web}  repo" if web else "", f"{homepage}  homepage (GitHub)" if homepage else ""])
+    section(".env", [f"{u}  {k} ({f})" for k, u, f in env_urls(path)])
+    section("Extra ([links])", [f"{u}  {k}" for k, u in ((man or {}).get("links") or {}).items()])
+    L.extend(["", f"keys: {HINT}   (drag to select and copy)"])
+    return "\n".join(L)
+
+
+def cmd_info(a):
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        here = own_session()
+        name = next((n for n in [*load_manifests(), *(r["name"] for r in scan())] if sanitize(n) == here), None)
+    if not name:
+        sys.exit("hyperbeam info: no project (run it in a project session, or give a name)")
+    print(project_info(name))
 
 
 # ---------- CLI ----------
@@ -665,7 +909,7 @@ class Menu(App):
     #keys { width: auto; height: 1; padding: 0 1; color: $text-muted; }
     #hint { height: 1; padding: 0 1; color: $text-muted; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"),
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"),
                 Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit"),
                 Binding("left", "tab(-1)", "prev tab", show=False), Binding("right", "tab(1)", "next tab", show=False)]
 
@@ -683,7 +927,7 @@ class Menu(App):
         yield Static("Loading projects...", id="notice", markup=False)
         with Horizontal(id="buttons"):
             for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("onboard", "Onboard (b)"),
-                               ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
+                               ("info", "Info (i)"), ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
@@ -792,7 +1036,7 @@ class Menu(App):
                                  ("uncommitted", p["dirty"]), ("no CLAUDE.md", not (p["path"] / "CLAUDE.md").exists())] if bad]
         self.query_one("#detail", Static).update(
             f"{home_rel(p['path'])}   {p['remote'] or ''}\n"
-            f"services: {svcs or '-'}   port: {p['port'] or '-'}   url: {project_url(p['port']) or '-'}\nwarnings: {', '.join(warn) or 'none'}")
+            f"services: {svcs or '-'}   port: {p['port'] or 'none'}   url: {project_url(p['port']) or '-'}\nwarnings: {', '.join(warn) or 'none'}")
 
     def say(self, msg):
         self.query_one("#notice", Static).update(msg)
@@ -883,6 +1127,16 @@ class Menu(App):
         self.busy.add(p["name"])
         self.run_worker(lambda: self._open(p, onboard=True), thread=True)
 
+    def action_info(self):
+        """The same text as `kk`, in a plain tmux window (so mouse-drag copy works), closed with Enter."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        win = f"info-{sanitize(p['name'])}"
+        tmux("kill-window", "-t", f"={MENU}:={win}", check=False)
+        tmux("new-window", "-t", f"{MENU}:", "-n", win,
+             f"{SELF} info {shlex.quote(p['name'])}; echo; read -r -p '[Enter closes this window] '")
+
     def action_quit(self):
         """Quit detaches the client; the menu keeps running in its tmux session."""
         c = menu_client()
@@ -907,6 +1161,9 @@ def main():
     s.set_defaults(f=cmd_stop)
     sub.add_parser("list", help="numbered list of running sessions with URLs; a number switches to it").set_defaults(f=cmd_list)
     sub.add_parser("phone", help="print the URLs, then attach to the most recently used session").set_defaults(f=cmd_phone)
+    i = sub.add_parser("info", help="URLs and endpoints of a project (alias: kk)")
+    i.add_argument("project", nargs="?")
+    i.set_defaults(f=cmd_info)
     sub.add_parser("_menu").set_defaults(f=lambda _: run_menu())
     st = sub.add_parser("_stack")
     st.add_argument("direction", choices=["next", "prev"])
@@ -925,7 +1182,10 @@ def main():
     w = sub.add_parser("_warn")
     w.add_argument("path")
     w.set_defaults(f=cmd_warn)
-    a = ap.parse_args()
+    argv = sys.argv[1:]
+    if Path(sys.argv[0]).name == "kk":      # ~/.local/bin/kk is a symlink to this script
+        argv = ["info", *argv]
+    a = ap.parse_args(argv)
     if a.cmd is None:
         cmd_menu(a)
     else:
