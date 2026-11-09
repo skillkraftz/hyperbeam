@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
@@ -154,6 +154,45 @@ def touch_opened(name):
     st.setdefault("opened", {})[name] = time.time()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "state.json").write_text(json.dumps(st))
+    journal_record(name)
+
+
+# ---------- session record (journal.json): which projects were worked on since the menu started ----------
+JOURNAL = lambda: STATE_DIR / "journal.json"
+
+
+def load_journal():
+    try:
+        d = json.loads(JOURNAL().read_text())
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("projects", {})
+    return d
+
+
+def save_journal(d):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    JOURNAL().write_text(json.dumps(d, indent=1))
+
+
+def journal_start():
+    """The menu started. A record that wasn't cleared by a completed Done for now survives, with its original start."""
+    d = load_journal()
+    d.setdefault("started", time.time())
+    d["menu_started"] = time.time()
+    save_journal(d)
+
+
+def journal_record(name):
+    d = load_journal()
+    now = time.time()
+    d.setdefault("started", now)
+    d["projects"].setdefault(name, {"first": now})["last"] = now
+    save_journal(d)
+
+
+def journal_clear():
+    JOURNAL().unlink(missing_ok=True)
 
 
 def build_projects():
@@ -279,6 +318,39 @@ def investigate_prompt(name, path, sess, reason, failures, findings=()):
 def recover_prompt(name, path, sess, findings):
     ctx = [f"Project name: {name}", f"Project path: {path}", f"tmux session: {sess}", "", "Start check findings:"] + [f"- {x}" for x in findings]
     return write_prompt(sess, (HERE / "RECOVER.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
+
+
+def wrapup_prompt(results, sess):
+    ctx = ["Projects checked (findings per project; values of secrets are never shown):", ""]
+    for r in results:
+        ctx += [format_wrapup(r, cap=40), f"  path: {r['path']}", ""]
+    return write_prompt(sess, (HERE / "WRAPUP.md").read_text() + "\n\n---\n" + "\n".join(ctx))
+
+
+def find_claude_pane(sess):
+    """The pane to start the wrap-up in: the one running claude, else the first pane of the first window (`work`, Claude's pane)."""
+    rows = [l.split("\t") for l in tmux("list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_id}\t#{pane_current_command}\t#{window_name}",
+                                        check=False).stdout.splitlines()]
+    return (next((r[0] for r in rows if r[1] == "claude"), None)
+            or next((r[0] for r in rows if r[2] in ("work", "hyperbeam")), None) or (rows[0][0] if rows else None))
+
+
+def start_wrapup(sess, results):
+    """Start Claude on the findings in the session's Claude pane. If Claude already runs there, type a one-line instruction that points at the
+    prompt file (the prompt itself is several KB with newlines); else start `claude` with it. Returns the pane id."""
+    pane = find_claude_pane(sess)
+    if not pane:
+        raise RuntimeError(f"no pane to start Claude in {sess}")
+    f = wrapup_prompt(results, sess)
+    running = tmux("display-message", "-p", "-t", pane, "#{pane_current_command}").stdout.strip() == "claude"
+    if running:
+        send_line(pane, f"Wrap-up: read {f} and follow it.")
+    else:
+        dirs = "".join(f" --add-dir {shlex.quote(r['path'])}" for r in results if Path(r["path"]) != Path(tmux('display-message', '-p', '-t', pane, '#{pane_current_path}').stdout.strip()))
+        send_line(pane, f'claude "$(cat {shlex.quote(str(f))})"{dirs}')
+    tmux("select-window", "-t", pane, check=False)
+    tmux("select-pane", "-t", pane, check=False)
+    return pane
 
 
 def claude_cmd(prompt_file=None, cont=False, add_dir=False):
@@ -409,7 +481,7 @@ def git_fetch(path):
         pass
 
 
-def git_problems(path, fetch=False):
+def git_problems(path, fetch=False, behind=True):
     """Things worth sorting out in a repo, as short sentences. steno-*.txt files are left out of the counts; one that git
     could commit (not ignored: untracked, or tracked) is reported as a warning instead. No repo: []."""
     path = Path(path)
@@ -437,11 +509,11 @@ def git_problems(path, fetch=False):
             out.append(f"{what} in progress")
     up = git_out(path, "rev-parse", "--abbrev-ref", "@{u}") if branch else ""
     if up:
-        ahead, behind = (git_out(path, "rev-list", "--left-right", "--count", "HEAD...@{u}") or "0 0").split()
+        ahead, nbehind = (git_out(path, "rev-list", "--left-right", "--count", "HEAD...@{u}") or "0 0").split()
         if int(ahead):
             out.append(f"{ahead} unpushed commit{'s' if ahead != '1' else ''} on {branch}")
-        if int(behind):
-            out.append(f"behind {up} by {behind} commit{'s' if behind != '1' else ''}")
+        if int(nbehind) and behind:
+            out.append(f"behind {up} by {nbehind} commit{'s' if nbehind != '1' else ''}")
     elif git_out(path, "remote"):
         n = git_out(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
         if n and n != "0":
@@ -461,6 +533,165 @@ def start_check(name, path, fetch=True):
     if lay and not lay.get("clean") and not session_exists(sanitize(name)):
         out.append(f"not stopped cleanly (layout saved {ago_text(lay['saved'])}, no clean stop recorded: crash, reboot or killed session)")
     return out + git_problems(path, fetch)
+
+
+# ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
+SECRET_PATTERNS = [
+    ("private key header", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----")),
+    ("AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("Stripe live key", re.compile(r"\b[sr]k_live_[A-Za-z0-9]{16,}")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("Anthropic/OpenAI key", re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{32,}")),
+    ("URL with password", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/@'\"]+:([^\s@/'\"]{6,})@(?!localhost|127\.|0\.0\.0\.0|\[::1\]|\$|\{|<)[^\s'\"]+", re.I)),
+]
+KEYWORD = r"(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|private[_-]?key|access[_-]?key|auth[_-]?key)"
+ASSIGN_QUOTED = re.compile(rf"""\b[\w.-]*{KEYWORD}[\w.-]*["']?\s*[:=]\s*(["'])([^"'\s]{{8,}})\1""", re.I)
+ASSIGN_BARE = re.compile(rf"""^\s*(?:export\s+)?[A-Za-z0-9_.-]*{KEYWORD}[A-Za-z0-9_.-]*\s*[:=]\s*([^\s#'"]{{8,}})\s*$""", re.I)
+BARE_FILES = re.compile(r"(^|/)\.env[^/]*$|\.(ini|cfg|conf|properties|ya?ml|toml)$", re.I)
+PLACEHOLDER = re.compile(r"""(?ix)^(your|change|example|sample|dummy|fake|test|todo|placeholder|xxx|\.\.\.|<|\$|\{|%|\*|null|none|true|false|undefined|env\b|process\.|os\.|import\.meta|getenv|secrets?\.|config\.|settings\.)
+                             |\$\{|\{\{|<%|[(\[]|(?:password|secret|token|changeme|postgres|localhost)$""")
+SECRET_NAMES = re.compile(r"""(?ix)(^|/)(\.env(\.[^/]+)?|id_(rsa|dsa|ecdsa|ed25519)|[^/]+\.(pem|key|p12|pfx|jks|keystore)|
+                          credentials(\.(json|ya?ml|csv|txt|xml|toml|ini))?|\.pgpass|\.netrc)$""")
+SAFE_NAMES = re.compile(r"\.(example|sample|template|dist|tpl|pub)$", re.I)
+SKIP_CONTENT = re.compile(r"(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|poetry\.lock|uv\.lock|Cargo\.lock)$|\.(lock|min\.js|map|svg)$", re.I)
+
+
+TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec|fixtures?|mocks?)/|\.(test|spec)\.[a-z]+$", re.I)
+
+
+def looks_secret(v):
+    """A literal that could be a real secret: not a placeholder, some variety (>= 6 distinct characters, and a digit or mixed case/symbol)."""
+    if PLACEHOLDER.search(v) or len(set(v)) < 6:
+        return False
+    return any(c.isdigit() for c in v) or (any(c.islower() for c in v) and any(c.isupper() for c in v)) or any(not c.isalnum() for c in v)
+
+
+def scan_line(fname, line):
+    """Pattern names that match one line of a file. The line itself is never returned."""
+    hits = [n for n, rx in SECRET_PATTERNS if rx.search(line)]
+    if "URL with password" in hits:
+        m = SECRET_PATTERNS[-1][1].search(line)
+        if m and not looks_secret(m.group(1)):
+            hits.remove("URL with password")
+    if not TEST_PATH.search(fname):         # fixtures and tests are full of fake literals; provider-specific patterns above still apply
+        m = ASSIGN_QUOTED.search(line)
+        if m and looks_secret(m.group(2)):
+            hits.append("secret-like assignment")
+        elif BARE_FILES.search(fname) and (m := ASSIGN_BARE.match(line)) and looks_secret(m.group(1)):
+            hits.append("secret-like assignment")
+    return hits
+
+
+def scan_diff(text):
+    """Added lines of a unified diff (-U0, optionally `git log -p` with @@commit markers) -> [(file, line, pattern, commit)]."""
+    out, fname, ln, commit = [], None, 0, ""
+    for l in text.splitlines():
+        if l.startswith("@@commit"):
+            commit = l[8:]
+        elif l.startswith("+++ "):
+            fname = l[4:].removeprefix("b/") if l != "+++ /dev/null" else None
+        elif l.startswith("@@") and fname:
+            m = re.search(r"\+(\d+)", l)
+            ln = int(m.group(1)) if m else 0
+        elif l.startswith("+") and fname and not SKIP_CONTENT.search(fname) and not STENO_RE.match(Path(fname).name):
+            for p in scan_line(fname, l[1:]):
+                out.append((fname, ln, p, commit))
+            ln += 1
+    return out
+
+
+def scan_file(path, rel):
+    """Whole-file scan (untracked files, or tracked ones with --all)."""
+    f = Path(path) / rel
+    try:
+        if f.stat().st_size > 300_000 or SKIP_CONTENT.search(rel) or STENO_RE.match(f.name):
+            return []
+        data = f.read_bytes()
+    except OSError:
+        return []
+    if b"\0" in data[:8192]:
+        return []
+    return [(rel, i, p, "") for i, l in enumerate(data.decode(errors="replace").splitlines(), 1) for p in scan_line(rel, l)]
+
+
+def secret_findings(path, since, all_tracked=False):
+    """Obvious secrets in: commits since `since` (unix time), staged and unstaged changes, untracked files not ignored (contents), and
+    tracked/untracked files with secret-looking names. Returns sentences with file, line, pattern (and commit); no values."""
+    path = Path(path)
+    hits = []
+    if since:
+        hits += scan_diff(git_out(path, "log", "--no-merges", "-p", "-U0", "--no-color", "--no-ext-diff", f"--since={int(since)}", "--format=@@commit%h"))
+    hits += scan_diff(git_out(path, "diff", "--cached", "-U0", "--no-color", "--no-ext-diff"))
+    hits += scan_diff(git_out(path, "diff", "-U0", "--no-color", "--no-ext-diff"))
+    others = git_out(path, "ls-files", "--others", "--exclude-standard").splitlines()
+    for rel in others:
+        hits += scan_file(path, rel)
+    tracked = git_out(path, "ls-files").splitlines()
+    if all_tracked:
+        for rel in tracked:
+            hits += scan_file(path, rel)
+    out, seen = [], set()
+    for rel in tracked + others:
+        if SECRET_NAMES.search(rel) and not SAFE_NAMES.search(rel) and not STENO_RE.match(Path(rel).name):
+            out.append(f"{rel}: secret-looking file name ({'tracked' if rel in tracked else 'untracked, not ignored'})")
+    for fname, ln, p, commit in hits:
+        key = (fname, ln, p)
+        if key not in seen:
+            seen.add(key)
+            out.append(f"{fname}:{ln} {p}" + (f" (commit {commit})" if commit else ""))
+    return out
+
+
+def wrapup_check(name, path, since=None):
+    """One project's wrap-up check: git state (without 'behind', and no network), secrets, steno files. -> dict with sentences."""
+    git = git_problems(path, fetch=False, behind=False)
+    steno = [g for g in git if g.startswith("steno file")]
+    git = [g for g in git if not g.startswith("steno file")]
+    tracked = [f for f in git_out(path, "ls-files").splitlines() if STENO_RE.match(Path(f).name) and is_steno(path, f)]
+    if tracked:
+        steno = []          # a tracked steno file is also "not ignored": one message is enough
+        steno.append("steno file(s) tracked in git: " + ", ".join(tracked) + " (personal notes: remove from the index, never commit)")
+    return dict(name=name, path=str(path), git=git, secrets=secret_findings(path, since) if git_out(path, "rev-parse", "--git-dir") else [], steno=steno)
+
+
+def wrapup_clean(r):
+    return not (r["git"] or r["secrets"] or r["steno"])
+
+
+def format_wrapup(r, cap=12):
+    if wrapup_clean(r):
+        return f"{r['name']}: clean"
+    lines = [f"{r['name']}:"]
+    lines += [f"  git: {g}" for g in r["git"]]
+    lines += [f"  steno: {g}" for g in r["steno"]]
+    lines += [f"  secrets: {x}" for x in r["secrets"][:cap]]
+    if len(r["secrets"]) > cap:
+        lines.append(f"  secrets: +{len(r['secrets']) - cap} more")
+    return "\n".join(lines)
+
+
+def project_path(name):
+    man = load_manifests().get(name)
+    if man:
+        return manifest_path(man)
+    row = next((r for r in scan() if r["name"] == name), None)
+    return row["path"] if row else None
+
+
+def session_since(name):
+    """Start of the work to check: the session record's start, else when the project's tmux session was created, else 12 hours ago."""
+    d = load_journal()
+    if name in d["projects"] and d.get("started"):
+        return d["started"]
+    c = tmux("display-message", "-p", "-t", f"={sanitize(name)}", "#{session_created}", check=False).stdout.strip()
+    return int(c) if c.isdigit() else time.time() - 12 * 3600
+
+
+def check_project(name):
+    p = project_path(name)
+    return wrapup_check(name, p, session_since(name)) if p else None
 
 
 def ask_tty(text):
@@ -956,6 +1187,28 @@ def cmd_phone(_):
     return go_to(target)
 
 
+def cmd_save(a):
+    """tmux hooks: save every layout; with a session name (client-session-changed) also record that project in the session record."""
+    save_all()
+    if a.session and a.session != MENU and tmux("show-options", "-t", f"={a.session}", "-v", "@hb", check=False).stdout.strip() == "1":
+        journal_record(session_project(a.session))
+
+
+def cmd_wrapup(a):
+    if a.counts:
+        hits = []
+        for rel in git_out(a.path, "ls-files").splitlines():
+            hits += scan_file(a.path, rel)
+        from collections import Counter
+        c = Counter(h[2] for h in hits)
+        print(f"{Path(a.path).name}: {len(hits)} hits " + ", ".join(f"{k}={v}" for k, v in sorted(c.items())))
+        return
+    r = wrapup_check(Path(a.path).name, a.path, a.since)
+    if a.all:
+        r["secrets"] += [f"{f}:{l} {p}" for f, l, p, _ in (h for rel in git_out(a.path, "ls-files").splitlines() for h in scan_file(a.path, rel))]
+    print(format_wrapup(r))
+
+
 # ---------- info (kk) ----------
 URL_RE = re.compile(r"^(https?|postgres(?:ql)?|redis|mysql|mongodb(?:\+srv)?|amqp|nats)://[^\s'\"]+$")
 LOOPBACK = ("127.", "[::1]", "localhost")
@@ -1187,8 +1440,21 @@ def cmd_open(args):
 
 def cmd_stop(args):
     man = load_manifests().get(args.name)
-    if man is None and not session_exists(sanitize(args.name)):
+    sess = sanitize(args.name)
+    if man is None and not session_exists(sess):
         sys.exit(f"hyperbeam: {args.name} has no manifest and is not running")
+    if not args.force:
+        r = check_project(args.name)
+        if r and not wrapup_clean(r):
+            print(format_wrapup(r))
+            if not sys.stdin.isatty():
+                sys.exit("hyperbeam: not clean; run it in a terminal to choose, or use --force")
+            pick = input("[w] wrap up with Claude  [s] stop anyway  [c] cancel: ").strip().lower()[:1]
+            if pick == "w" and session_exists(sess):
+                start_wrapup(sess, [r])
+                sys.exit(f"Claude started in {sess}'s Claude pane; attach with `hyperbeam open {args.name}`, and stop again when it is done.")
+            if pick != "s":
+                sys.exit("hyperbeam: not stopped")
     try:
         sys.exit(0 if stop_project(args.name, man) else 1)
     except RuntimeError as e:
@@ -1247,6 +1513,40 @@ class Confirm(ModalScreen):
         self.dismiss(value)
 
 
+class Choice(ModalScreen):
+    """Several buttons; `options` is [(id, label, key)]. The last one is also Escape."""
+    DEFAULT_CSS = """
+    Choice { align: center middle; }
+    Choice > Vertical { width: 84; height: auto; max-height: 90%; border: round $accent; background: $surface; padding: 1 2; }
+    Choice VerticalScroll { height: auto; max-height: 24; }
+    Choice Horizontal { height: 1; margin-top: 1; }
+    Choice Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 10; }
+    """
+
+    def __init__(self, text, options):
+        super().__init__()
+        self.text, self.options = text, options
+
+    def on_key(self, event):
+        for oid, _, key in self.options:
+            if event.key == key or (event.key == "escape" and oid == self.options[-1][0]):
+                event.stop()
+                self.dismiss(oid)
+                return
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with VerticalScroll():
+                yield Static(self.text, markup=False)
+            with Horizontal():
+                for oid, label, _ in self.options:
+                    yield Button(label, id=f"c-{oid}")
+
+    def on_button_pressed(self, event):
+        event.stop()
+        self.dismiss(event.button.id[2:])
+
+
 class Menu(App):
     TITLE = "hyperbeam"
     ENABLE_COMMAND_PALETTE = False
@@ -1261,7 +1561,7 @@ class Menu(App):
     #keys { width: auto; height: 1; padding: 0 1; color: $text-muted; }
     #hint { height: 1; padding: 0 1; color: $text-muted; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("m", "mode", "Mode"),
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("d", "done", "Done for now"), Binding("m", "mode", "Mode"),
                 Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit"),
                 Binding("left", "tab(-1)", "prev tab", show=False), Binding("right", "tab(1)", "next tab", show=False)]
 
@@ -1279,7 +1579,7 @@ class Menu(App):
         yield Static("Loading projects...", id="notice", markup=False)
         with Horizontal(id="buttons"):
             for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("onboard", "Onboard (b)"),
-                               ("info", "Info (i)"), ("mode", f"Mode: {open_mode()} (m)"), ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
+                               ("info", "Info (i)"), ("done", "Done for now (d)"), ("mode", f"Mode: {open_mode()} (m)"), ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
@@ -1291,6 +1591,7 @@ class Menu(App):
         self.action_refresh()
         self.set_interval(3, self.poll_running)
         self.set_interval(300, self.save_layouts)
+        journal_start()
 
     # --- data ---
     def action_refresh(self):
@@ -1484,6 +1785,13 @@ class Menu(App):
     def save_layouts(self):
         self.run_worker(save_all, thread=True, group="save")
 
+    def choose(self, text, options):
+        """Like ask(): a modal with several buttons, from a worker thread; returns the chosen id."""
+        done, box = threading.Event(), []
+        self.call_from_thread(self.push_screen, Choice(text, options), lambda v: (box.append(v), done.set()))
+        done.wait()
+        return box[0]
+
     def action_stop(self):
         p = self.current()
         if not p:
@@ -1491,22 +1799,72 @@ class Menu(App):
         man = load_manifests().get(p["name"])
         if not man and not p["running"]:
             return self.say(f"{p['name']} is not running.")
-        ports = ", ".join(map(str, project_ports(man))) or "(none: no manifest)"
+        if p["name"] in self.busy:
+            return self.say(f"{p['name']} is busy.")
+        self.busy.add(p["name"])
+        self.say(f"{p['name']}: checking for unfinished work...")
+        self.run_worker(lambda: self._stop(p, man), thread=True)
 
-        def after(yes):
-            if yes and p["name"] not in self.busy:
-                self.busy.add(p["name"])
-                self.run_worker(lambda: self._stop(p), thread=True)
-        self.push_screen(Confirm(f"Stop {p['name']}?\n\nRuns its stop commands in reverse order, kills the tmux session, "
-                                 f"and checks that port(s) {ports} are free."), after)
-
-    def _stop(self, p):
+    def _stop(self, p, man):
+        """Stop: the wrap-up check first. Clean: confirm and stop. Not clean: wrap up with Claude, stop anyway, or cancel."""
+        name = p["name"]
         try:
-            stop_project(p["name"], load_manifests().get(p["name"]), self.say_from_thread)
+            r = check_project(name)
+            if r and not wrapup_clean(r):
+                pick = self.choose(f"{format_wrapup(r)}\n\nStop {name} anyway?", [
+                    ("wrap", "Start Claude to wrap up (w)", "w"), ("stop", "Stop anyway (s)", "s"), ("cancel", "Cancel (c)", "c")])
+                if pick == "wrap":
+                    start_wrapup(sanitize(name), [r])
+                    show_session(sanitize(name))
+                    return self.say_from_thread(f"{name}: Claude is wrapping up in its Claude pane. Stop again when it says it's done.")
+                if pick != "stop":
+                    return self.say_from_thread(f"{name}: not stopped.")
+            else:
+                ports = ", ".join(map(str, project_ports(man))) or "(none: no manifest)"
+                if not self.ask(f"{name}: all clean (nothing uncommitted, unpushed or secret-looking).\n\nStop it? Runs its stop commands in reverse order, "
+                                f"kills the tmux session, and checks that port(s) {ports} are free."):
+                    return self.say_from_thread(f"{name}: not stopped.")
+            stop_project(name, man, self.say_from_thread)
         except Exception as e:
-            self.say_from_thread(f"{p['name']}: ERROR {e}")
+            self.say_from_thread(f"{name}: ERROR {e}")
         finally:
-            self.busy.discard(p["name"])
+            self.busy.discard(name)
+            self.call_from_thread(self.reload, True)
+
+    def action_done(self):
+        if "@done" in self.busy:
+            return self.say("Done for now is already running.")
+        self.busy.add("@done")
+        self.say("Done for now: checking every project in the session record...")
+        self.run_worker(self._done, thread=True)
+
+    def _done(self):
+        """Done for now: the wrap-up check on every project worked on since the menu started. All clean: offer to stop their sessions.
+        Otherwise offer Claude (in the hyperbeam session's Claude pane); the user presses Done again when finished."""
+        try:
+            names = sorted(load_journal()["projects"])
+            if not names:
+                return self.say_from_thread("Done for now: no project has been opened since the menu started.")
+            results = [r for r in (check_project(n) for n in names) if r]
+            dirty = [r for r in results if not wrapup_clean(r)]
+            if dirty:
+                text = "\n\n".join(format_wrapup(r) for r in results)
+                if self.choose(f"{text}\n\nStart Claude to wrap up?", [("wrap", "Start Claude to wrap up (w)", "w"), ("close", "Close (c)", "c")]) == "wrap":
+                    start_wrapup(MENU, dirty)
+                    return self.say_from_thread("Done for now: Claude is wrapping up in the hyperbeam session's Claude pane. Press Done again when it says it's done.")
+                return self.say_from_thread("Done for now: not clean, nothing stopped.")
+            running = [n for n in names if sanitize(n) != MENU and session_exists(sanitize(n))]
+            msg = f"All clean: {', '.join(names)}.\n\n" + (f"Stop these sessions? {', '.join(running)}" if running else "No session of them is running.")
+            if running and not self.ask(msg):
+                return self.say_from_thread("Done for now: all clean, nothing stopped.")
+            for n in running:
+                stop_project(n, load_manifests().get(n), self.say_from_thread)
+            journal_clear()
+            self.say_from_thread("Done for now: all clean" + (f"; stopped {', '.join(running)}" if running else "") + ". Session record cleared.")
+        except Exception as e:
+            self.say_from_thread(f"Done for now: ERROR {e}")
+        finally:
+            self.busy.discard("@done")
             self.call_from_thread(self.reload, True)
 
     def action_onboard(self):
@@ -1549,6 +1907,7 @@ def main():
     o.set_defaults(f=cmd_open)
     s = sub.add_parser("stop", help="run stop commands, kill the session, check the ports")
     s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="skip the wrap-up check")
     s.set_defaults(f=cmd_stop)
     sub.add_parser("list", help="numbered list of running sessions with URLs; a number switches to it").set_defaults(f=cmd_list)
     sub.add_parser("phone", help="print the URLs, then attach to the most recently used session").set_defaults(f=cmd_phone)
@@ -1578,7 +1937,15 @@ def main():
     ck.add_argument("path")
     ck.add_argument("--fetch", action="store_true")
     ck.set_defaults(f=lambda a: print("\n".join(git_problems(a.path, a.fetch)) or "(nothing found)"))
-    sub.add_parser("_save").set_defaults(f=lambda _: save_all() and None)
+    wc = sub.add_parser("_wrapup", help="print the wrap-up check for a directory")
+    wc.add_argument("path")
+    wc.add_argument("--since", type=float)
+    wc.add_argument("--all", action="store_true", help="scan every tracked file too (pattern testing; counts only with --counts)")
+    wc.add_argument("--counts", action="store_true")
+    wc.set_defaults(f=cmd_wrapup)
+    sv = sub.add_parser("_save")
+    sv.add_argument("session", nargs="?")
+    sv.set_defaults(f=cmd_save)
     argv = sys.argv[1:]
     if Path(sys.argv[0]).name == "kk":      # ~/.local/bin/kk is a symlink to this script
         argv = ["info", *argv]
