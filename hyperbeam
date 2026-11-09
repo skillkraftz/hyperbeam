@@ -6,6 +6,7 @@
 """hyperbeam: a control panel for ~/projects. No arguments opens the menu.
 
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
+(_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
 import argparse, json, os, re, shlex, socket, subprocess, sys, time, tomllib
 from pathlib import Path
@@ -27,6 +28,8 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 SKIP = {"node_modules", ".venv", "venv", "target", "dist", "build", "out", "__pycache__",
         ".next", ".cache", ".tox", "vendor", ".git"}
 SELF = shlex.quote(str(HERE / "hyperbeam"))
+MENU = "hyperbeam"          # name of the tmux session the menu runs in
+HINT = "M-[ M-] stack  M-y copy"     # the keys of hyperbeam.conf, shown in the menu and in the status bar
 
 
 def run(*a):
@@ -39,7 +42,9 @@ def tmux(*a, check=True):
 
 
 def sanitize(name):
-    return re.sub(r"[.:]", "_", name)
+    """tmux session name of a project. The project called "hyperbeam" must not take the menu's session name."""
+    s = re.sub(r"[.:]", "_", name)
+    return "hyperbeam-project" if s == MENU else s
 
 
 def home_rel(p):
@@ -173,28 +178,94 @@ def session_exists(sess):
     return tmux("has-session", "-t", f"={sess}", check=False).returncode == 0
 
 
-def start_session(name, man, say=print):
+def tag_session(sess):
+    """Mark a session as one of hyperbeam's (the stack keys use the mark) and put the key hints in its status bar."""
+    tmux("set-option", "-t", sess, "@hb", "1")
+    base = tmux("show-options", "-gv", "status-right", check=False).stdout.strip()
+    tmux("set-option", "-t", sess, "status-right-length", "120")
+    tmux("set-option", "-t", sess, "status-right", f"#[fg=#888888]{HINT} #[default]{base}")
+
+
+def pane_tail(target, n=50):
+    out = tmux("capture-pane", "-p", "-J", "-S", "-", "-t", target, check=False).stdout.rstrip().splitlines()
+    return "\n".join(out[-n:])
+
+
+def investigate_prompt(name, path, sess, reason, failures):
+    """ONBOARDING.md plus the facts about this project and what went wrong. Written to a file; returns its path."""
+    mp = MANIFESTS / f"{name}.toml"
+    ctx = [f"Project name: {name}", f"Project path: {path}",
+           f"Manifest: {mp if mp.exists() else 'none'}" + ("" if mp.exists() else f" (write it to {mp} once the user approves)"),
+           f"tmux session: {sess} (you are in its `claude` window; start services in new windows of this session)",
+           f"Why you were started: {reason}"]
+    for f in failures:
+        ctx.append(f"\nService `{f['name']}` failed: {f['result']}\nLast lines of its window:\n```\n{f['tail'] or '(empty)'}\n```")
+    d = STATE_DIR / "prompts"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{sess}-{time.strftime('%Y%m%d-%H%M%S')}.md"
+    f.write_text((HERE / "ONBOARDING.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
+    f.chmod(0o600)
+    return f
+
+
+def claude_cmd(prompt_file=None):
+    """Plain `claude`, or claude started with the investigate prompt (prompt first: --add-dir takes a list)."""
+    if prompt_file is None:
+        return "claude"
+    return f'claude "$(cat {shlex.quote(str(prompt_file))})" --add-dir {shlex.quote(str(HERE))}'
+
+
+def send_line(target, text):
+    tmux("send-keys", "-t", target, "-l", text)
+    tmux("send-keys", "-t", target, "Enter")
+
+
+def start_session(name, man, say=print, path=None, reason=None):
+    """Create the project's session. Without a manifest (man is None), or if a service fails, or if `reason` is given
+    (Onboard), the claude window starts with the investigate prompt instead of plain `claude`."""
     sess = sanitize(name)
-    path = manifest_path(man)
+    path = manifest_path(man) if man else Path(path)
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
-    port = str(man["port"])
-    envargs = [x for k, v in session_env(man).items() for x in ("-e", f"{k}={v}")]
+    env = session_env(man) if man else {"HOST": "0.0.0.0"}
+    envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
     tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path), *envargs)
-    tmux("send-keys", "-t", f"{sess}:claude", "-l", "claude")
-    tmux("send-keys", "-t", f"{sess}:claude", "Enter")
+    tag_session(sess)
+    services = man.get("service", []) if man else []
+    if services:
+        send_line(f"{sess}:claude", "echo '[hyperbeam] starting services; Claude starts when they are done'")
     tmux("new-window", "-t", f"{sess}:", "-n", "shell", "-c", str(path))
-    tmux("send-keys", "-t", f"{sess}:shell", "-l", f"clear; {SELF} _warn {shlex.quote(str(path))}")
-    tmux("send-keys", "-t", f"{sess}:shell", "Enter")
-    for svc in man.get("service", []):
+    send_line(f"{sess}:shell", f"clear; {SELF} _warn {shlex.quote(str(path))}")
+    failures = []
+    for svc in services:
         win = svc["name"]
         tmux("new-window", "-t", f"{sess}:", "-n", win, "-c", str(path))
-        tmux("send-keys", "-t", f"{sess}:{win}", "-l", f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
-        tmux("send-keys", "-t", f"{sess}:{win}", "Enter")
+        send_line(f"{sess}:{win}", f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
         say(f"{name}: started {win}, waiting...")
-        say(f"{name}: {win}: {wait_ready(sess, win, svc, man['port'])}")
+        result = wait_ready(sess, win, svc, man["port"])
+        say(f"{name}: {win}: {result}")
+        if result.startswith("WARNING"):
+            failures.append(dict(name=win, result=result, tail=pane_tail(f"{sess}:{win}")))
+    if man is None:
+        reason = reason or "no manifest"
+    elif failures:
+        reason = reason or "a service failed to start"
+    if reason:
+        cmd = claude_cmd(investigate_prompt(name, path, sess, reason, failures))
+        say(f"{name}: {reason}; Claude starts with the investigate prompt")
+    else:
+        cmd = claude_cmd()
+    send_line(f"{sess}:claude", cmd)
     tmux("select-window", "-t", f"{sess}:claude")
-    say(f"{name}: session ready (PORT={port})")
+    say(f"{name}: session ready" + (f" (PORT={man['port']})" if man else ""))
+
+
+def investigate_window(name, path, reason):
+    """Onboard on a session that is already running: a new `investigate` window with the prompt."""
+    sess = sanitize(name)
+    f = investigate_prompt(name, path, sess, reason, [])
+    tmux("new-window", "-t", f"{sess}:", "-n", "investigate", "-c", str(path))
+    send_line(f"{sess}:investigate", claude_cmd(f))
 
 
 def own_session():
@@ -203,6 +274,8 @@ def own_session():
 
 
 def project_ports(man):
+    if not man:
+        return []
     ports = {man["port"]}
     ports.update(s["ready_port"] for s in man.get("service", [])
                  if isinstance(s.get("ready_port"), int) and not isinstance(s.get("ready_port"), bool))
@@ -214,9 +287,9 @@ def stop_project(name, man, say=print):
     sess = sanitize(name)
     if own_session() == sess:
         raise RuntimeError(f"this menu is running inside {sess}; run Stop from another terminal")
-    path = manifest_path(man)
-    env = dict(os.environ, **session_env(man))
-    for svc in reversed(man.get("service", [])):
+    path = manifest_path(man) if man else None
+    env = dict(os.environ, **session_env(man)) if man else dict(os.environ)
+    for svc in reversed(man.get("service", []) if man else []):
         if "stop" in svc:
             say(f"{name}: stop {svc['name']}: {svc['stop']}")
             try:
@@ -237,7 +310,7 @@ def stop_project(name, man, say=print):
         for p, info in left:
             say(f"{name}: WARNING port {p} still listening: {info.split(chr(10))[0][:120]}")
         return False
-    say(f"{name}: stopped; ports {', '.join(map(str, ports))} are free")
+    say(f"{name}: stopped" + (f"; ports {', '.join(map(str, ports))} are free" if ports else " (no manifest: no ports to check)"))
     return True
 
 
@@ -247,18 +320,6 @@ def is_remote():
         or not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
 
 
-def clean_env():
-    env = dict(os.environ)
-    env.pop("TMUX", None)
-    return env
-
-
-def spawn_kitty(title, *cmd, cwd=None):
-    subprocess.Popen(["kitty", "--title", title, *(["--directory", str(cwd)] if cwd else []), *cmd],
-                     env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
-
-
 def attach_here(sess):
     """Switch or attach in the current terminal (used over SSH and by the CLI)."""
     if os.environ.get("TMUX"):
@@ -266,14 +327,130 @@ def attach_here(sess):
     return subprocess.run(["tmux", "attach", "-t", sess]).returncode
 
 
-def clients_attached(sess):
-    return len(tmux("list-clients", "-t", f"={sess}", check=False).stdout.split())
+# ---------- the menu session, the stack, copy ----------
+def menu_client():
+    """The client that is looking at the menu session (the most recently active one), or ''."""
+    rows = [l.split(None, 1) for l in tmux("list-clients", "-t", f"={MENU}", "-F", "#{client_activity} #{client_name}",
+                                          check=False).stdout.splitlines()]
+    rows = [r for r in rows if len(r) == 2]
+    return max(rows, key=lambda r: int(r[0]))[1] if rows else ""
 
 
-def onboarding_prompt(p):
-    text = (HERE / "ONBOARDING.md").read_text()
-    return (f"{text}\n\n---\nProject name: {p['name']}\nProject path: {p['path']}\n"
-            f"Manifest to write: {HERE}/projects/{p['name']}.toml\n")
+def show_session(sess):
+    """Switch the client that is looking at the menu to `sess`."""
+    c = menu_client()
+    if not c:
+        raise RuntimeError("no client is attached to the menu session")
+    tmux("switch-client", "-c", c, "-t", f"={sess}")
+
+
+def source_conf():
+    """Load hyperbeam.conf into the running tmux server (tmux.conf also sources it at server start)."""
+    tmux("source-file", "-q", str(HERE / "hyperbeam.conf"), check=False)
+
+
+def stack():
+    """The session stack: the menu, then hyperbeam's project sessions in the order they were created."""
+    fmt = "#{session_created}\t#{session_name}\t#{@hb}"
+    rows = sorted(l.split("\t") for l in tmux("list-sessions", "-F", fmt, check=False).stdout.splitlines())
+    names = [r[1] for r in rows if len(r) == 3 and r[2] == "1" and r[1] != MENU]
+    return ([MENU] if session_exists(MENU) else []) + names
+
+
+def client_is_remote(pid):
+    """Is the tmux client with this pid on an SSH/mosh connection? Looks at its environment and its ancestors."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        if any(e.startswith((b"SSH_CONNECTION=", b"SSH_TTY=")) for e in env):
+            return True
+    except OSError:
+        pass
+    p = int(pid)
+    for _ in range(40):
+        try:
+            stat = Path(f"/proc/{p}/stat").read_text()
+        except OSError:
+            break
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        if comm.startswith(("sshd", "mosh-server", "tailscaled")):
+            return True
+        p = int(stat[stat.rindex(")") + 2:].split()[1])
+        if p <= 1:
+            break
+    return False
+
+
+def wl_copy(text):
+    """Put text on the Wayland clipboard. A tmux server that was started over SSH has no WAYLAND_DISPLAY: use the socket."""
+    env = dict(os.environ)
+    rt = env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not env.get("WAYLAND_DISPLAY"):
+        socks = sorted(Path(rt).glob("wayland-[0-9]*"))
+        socks = [x for x in socks if not x.name.endswith(".lock")]
+        if not socks:
+            raise RuntimeError("no Wayland display")
+        env["WAYLAND_DISPLAY"] = socks[0].name
+    subprocess.run(["wl-copy"], input=text.encode(), env=env, stdin=None, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=5, check=True)
+
+
+def tmux_msg(client, msg):
+    tmux("display-message", "-c", client, msg, check=False)
+
+
+def cmd_stack(a):
+    names = stack()
+    if len(names) < 2:
+        return tmux_msg(a.client, "stack: only one session")
+    step = 1 if a.direction == "next" else -1
+    i = (names.index(a.session) + step) % len(names) if a.session in names else (0 if step > 0 else -1)
+    tmux("switch-client", "-c", a.client, "-t", f"={names[i]}")
+    tmux_msg(a.client, f"stack {names.index(names[i]) + 1}/{len(names)}: {names[i]}")
+
+
+def cmd_copy_pane(a):
+    """M-y: the pane's whole scrollback, trailing blank lines trimmed. Local client: clipboard. Remote: a file in the outbox."""
+    out = tmux("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", a.pane, check=False).stdout
+    lines = [l.rstrip() for l in out.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    text = "\n".join(lines) + "\n"
+    n = len(lines)
+    if not client_is_remote(a.client_pid):
+        try:
+            wl_copy(text)
+            return tmux_msg(a.client, f"copied {n} lines")
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            why = f"clipboard failed ({e}); "
+    else:
+        why = ""
+    d = STATE_DIR / "outbox"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{a.session}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    f.write_text(text)
+    f.chmod(0o600)
+    tmux_msg(a.client, f"{why}saved {n} lines: {home_rel(f)}")
+
+
+def cmd_clip(a):
+    """Mouse drag-select: tmux pipes the selection here. Local client: also onto the Wayland clipboard."""
+    text = sys.stdin.read()
+    if text and not client_is_remote(a.client_pid):
+        try:
+            wl_copy(text)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            pass
+
+
+def cmd_menu(_):
+    """`hyperbeam` with no arguments: attach to the menu session (creating it if needed)."""
+    if own_session() == MENU:
+        return run_menu()
+    if not session_exists(MENU):
+        tmux("new-session", "-d", "-s", MENU, "-n", "menu", f"{SELF} _menu; echo; echo '[hyperbeam] menu exited, press Enter'; read")
+        tag_session(MENU)
+    source_conf()
+    return attach_here(MENU)
 
 
 # ---------- sessions, URLs, list, phone ----------
@@ -403,12 +580,13 @@ def cmd_scan(_):
 
 
 def cmd_open(args):
-    man = load_manifests().get(args.name)
-    if man is None:
-        sys.exit(f"hyperbeam: {args.name} has no manifest (use Onboard in the menu)")
     sess = sanitize(args.name)
     if not session_exists(sess):
-        start_session(args.name, man)
+        row = next((r for r in scan() if r["name"] == args.name), None)
+        man = load_manifests().get(args.name)
+        if row is None and man is None:
+            sys.exit(f"hyperbeam: no project called {args.name} (try `hyperbeam scan`)")
+        start_session(args.name, man, path=row["path"] if row else None)
     touch_opened(args.name)
     if not args.detach:
         sys.exit(attach_here(sess))
@@ -416,8 +594,8 @@ def cmd_open(args):
 
 def cmd_stop(args):
     man = load_manifests().get(args.name)
-    if man is None:
-        sys.exit(f"hyperbeam: {args.name} has no manifest")
+    if man is None and not session_exists(sanitize(args.name)):
+        sys.exit(f"hyperbeam: {args.name} has no manifest and is not running")
     sys.exit(0 if stop_project(args.name, man) else 1)
 
 
@@ -484,6 +662,7 @@ class Menu(App):
     #notice { height: 3; padding: 0 1; }
     #buttons { height: 1; margin-top: 1; }
     #buttons Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 12; }
+    #keys { width: auto; height: 1; padding: 0 1; color: $text-muted; }
     #hint { height: 1; padding: 0 1; color: $text-muted; }
     """
     BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"),
@@ -508,7 +687,8 @@ class Menu(App):
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
-        yield Static("up/down: select   left/right: tab   Enter or click a row: open", id="hint")
+            yield Static(HINT, id="keys", markup=False)
+        yield Static("up/down: select   left/right: tab   Enter or click a row: open   Quit detaches (the menu keeps running)", id="hint")
 
     def on_mount(self):
         self.query_one("#list", OptionList).focus()
@@ -645,48 +825,38 @@ class Menu(App):
         p = self.current()
         if not p:
             return self.say("Nothing selected.")
-        if not p["manifest"]:
-            return self.say(f"{p['name']} is not configured. Press Onboard (b) to set it up with Claude.")
         if p["name"] in self.busy:
             return self.say(f"{p['name']} is busy.")
         self.busy.add(p["name"])
         self.run_worker(lambda: self._open(p), thread=True)
 
-    def _open(self, p):
+    def _open(self, p, onboard=False):
+        """Open: start the session if needed (no manifest or a failing start lands in Claude with the investigate prompt),
+        then switch this client to it. Onboard forces the investigate prompt."""
         name, sess = p["name"], sanitize(p["name"])
         try:
-            man = load_manifests()[name]
+            man = load_manifests().get(name)
             if not session_exists(sess):
-                start_session(name, man, self.say_from_thread)
+                start_session(name, man, self.say_from_thread, path=p["path"], reason="Onboard requested" if onboard else None)
+            elif onboard:
+                investigate_window(name, p["path"], "Onboard requested; the session was already running")
             touch_opened(name)
-            if is_remote():
-                self.call_from_thread(self.attach_here_suspended, sess)
-            else:
-                already = clients_attached(sess)
-                spawn_kitty(f"hyperbeam: {name}", "tmux", "attach", "-t", sess)
-                self.say_from_thread(f"{name}: opened in a new kitty window"
-                                     + (" (it was already open in another window; GNOME/Wayland can't focus it)" if already else ""))
+            show_session(sess)
+            self.say_from_thread(f"{name}: switched ({HINT})")
         except Exception as e:
             self.say_from_thread(f"{name}: ERROR {e}")
         finally:
             self.busy.discard(name)
             self.call_from_thread(self.reload, True)
 
-    def attach_here_suspended(self, sess):
-        if os.environ.get("TMUX"):
-            attach_here(sess)
-            self.say(f"Switched to {sess}.")
-            return
-        with self.suspend():
-            attach_here(sess)
-
     def action_stop(self):
         p = self.current()
         if not p:
             return self.say("Nothing selected.")
-        if not p["manifest"]:
-            return self.say(f"{p['name']} has no manifest, nothing to stop.")
-        ports = ", ".join(map(str, project_ports(load_manifests()[p["name"]])))
+        man = load_manifests().get(p["name"])
+        if not man and not p["running"]:
+            return self.say(f"{p['name']} is not running.")
+        ports = ", ".join(map(str, project_ports(man))) or "(none: no manifest)"
 
         def after(yes):
             if yes and p["name"] not in self.busy:
@@ -697,7 +867,7 @@ class Menu(App):
 
     def _stop(self, p):
         try:
-            stop_project(p["name"], load_manifests()[p["name"]], self.say_from_thread)
+            stop_project(p["name"], load_manifests().get(p["name"]), self.say_from_thread)
         except Exception as e:
             self.say_from_thread(f"{p['name']}: ERROR {e}")
         finally:
@@ -708,14 +878,20 @@ class Menu(App):
         p = self.current()
         if not p:
             return self.say("Nothing selected.")
-        prompt = onboarding_prompt(p)
-        if is_remote():
-            with self.suspend():
-                subprocess.run(["claude", prompt], cwd=HERE)
-            self.action_refresh()
-        else:
-            spawn_kitty(f"onboard: {p['name']}", "claude", prompt, cwd=HERE)
-            self.say(f"Onboarding {p['name']}: Claude is open in a new kitty window in {home_rel(HERE)}. Press Refresh when it is done.")
+        if p["name"] in self.busy:
+            return self.say(f"{p['name']} is busy.")
+        self.busy.add(p["name"])
+        self.run_worker(lambda: self._open(p, onboard=True), thread=True)
+
+    def action_quit(self):
+        """Quit detaches the client; the menu keeps running in its tmux session."""
+        c = menu_client()
+        if c:
+            tmux("detach-client", "-t", c, check=False)
+
+
+def run_menu():
+    Menu().run()
 
 
 def main():
@@ -731,12 +907,27 @@ def main():
     s.set_defaults(f=cmd_stop)
     sub.add_parser("list", help="numbered list of running sessions with URLs; a number switches to it").set_defaults(f=cmd_list)
     sub.add_parser("phone", help="print the URLs, then attach to the most recently used session").set_defaults(f=cmd_phone)
+    sub.add_parser("_menu").set_defaults(f=lambda _: run_menu())
+    st = sub.add_parser("_stack")
+    st.add_argument("direction", choices=["next", "prev"])
+    st.add_argument("client")
+    st.add_argument("session")
+    st.set_defaults(f=cmd_stack)
+    cp = sub.add_parser("_copy-pane")
+    cp.add_argument("client_pid")
+    cp.add_argument("client")
+    cp.add_argument("pane")
+    cp.add_argument("session")
+    cp.set_defaults(f=cmd_copy_pane)
+    cl = sub.add_parser("_clip")
+    cl.add_argument("client_pid")
+    cl.set_defaults(f=cmd_clip)
     w = sub.add_parser("_warn")
     w.add_argument("path")
     w.set_defaults(f=cmd_warn)
     a = ap.parse_args()
     if a.cmd is None:
-        Menu().run()
+        cmd_menu(a)
     else:
         sys.exit(a.f(a) or 0)
 
