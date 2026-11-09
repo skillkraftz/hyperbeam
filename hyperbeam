@@ -16,7 +16,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen, Screen
+from textual.screen import ModalScreen
 from textual.widgets import Button, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
@@ -424,49 +424,81 @@ def read_status(name):
 
 def clear_status(name):
     (status_dir("status") / f"{name}.json").unlink(missing_ok=True)
-    (status_dir("waiting") / name).unlink(missing_ok=True)
+    (status_dir("claude") / name).unlink(missing_ok=True)
 
 
-def waiting_reason(name):
+def recheck(name, path):
+    """Refresh: run the git checks again and store the result, so a red dot clears when the problem is gone."""
+    write_status(name, git_problems(path, fetch=False, behind=False))
+
+
+def claude_state(name):
+    """('waiting', reason) / ('working', '') from the hooks' state file; ('', '') if none or if no Claude runs in the session any more."""
     try:
-        return (status_dir("waiting") / name).read_text().strip() or "waiting for you"
+        txt = (status_dir("claude") / name).read_text().strip()
     except OSError:
-        return ""
+        return "", ""
+    pane = find_claude_pane(sanitize(name))
+    if not pane or pane_command(pane) != "claude":
+        return "", ""
+    kind, _, reason = txt.partition(" ")
+    return (kind, reason) if kind in ("waiting", "working") else ("", "")
+
+
+def red_findings(name, man):
+    """Why a running project is red, as separate sentences: services down or exited, and the stored start-check/recheck problems."""
+    sess = sanitize(name)
+    return [f"service {n} {st} ({d})" for n, st, d in service_states(sess, man, {}) if st in ("down", "exited")] + read_status(name).get("findings", [])
+
+
+def fix_project(name, man, path):
+    """Fix: RECOVER.md plus the red reasons into the project's Claude pane (inject_prompt). Returns the findings."""
+    sess = sanitize(name)
+    pane = find_claude_pane(sess)
+    findings = red_findings(name, man)
+    if not pane or not findings:
+        raise RuntimeError("nothing to fix" if not findings else f"no pane to start Claude in {sess}")
+    inject_prompt(pane, recover_prompt(name, path, sess, findings))
+    tmux("select-window", "-t", pane, check=False)
+    tmux("select-pane", "-t", pane, check=False)
+    return findings
 
 
 def project_status(name, man):
-    """(colour, reason) of a running project, None if it isn't running. Priority red > blue > green."""
+    """(colour, reason) of a running project, None if it isn't running. Priority red > blue (Claude waits) > cyan (Claude works) > green."""
     sess = sanitize(name)
     if not session_exists(sess):
         return None
-    red = [f"service {n} {st} ({d})" for n, st, d in service_states(sess, man, {}) if st in ("down", "exited")]
-    red += [f for f in read_status(name).get("findings", []) if f not in " ".join(red)]
+    red = red_findings(name, man)
     if red:
         return "red", "; ".join(red)
-    w = waiting_reason(name)
-    if w:
-        return "blue", f"Claude: {w}"
+    kind, reason = claude_state(name)
+    if kind == "waiting":
+        return "blue", f"Claude is waiting: {reason or 'for you'}"
+    if kind == "working":
+        return "cyan", "Claude is working"
     return "green", "running, services up" if man and man.get("service") else "running"
 
 
-HOOK_MARK = "hyperbeam/waiting"
-HOOK_CMDS = {      # plain shell, no Python: fast; nothing happens outside hyperbeam sessions (no $HB_PROJECT)
-    "Stop": ('', 'finished responding'),
-    "Notification": ('permission_prompt|idle_prompt', 'needs your input or permission'),
-    "UserPromptSubmit": ('', None),
+HOOK_MARKS = ("hyperbeam/waiting", "hyperbeam/claude")     # the second is current; the first is what PR #10 installed
+# event -> (matcher, state written). Plain shell, no Python: fast; nothing happens outside hyperbeam sessions (no $HB_PROJECT).
+HOOK_CMDS = {
+    "Stop": ("", "waiting finished responding"),
+    "Notification": ("", "waiting needs your input or permission"),
+    "PreToolUse": ("AskUserQuestion|ExitPlanMode", "waiting asks you a question"),
+    "PostToolUse": ("", "working"),
+    "UserPromptSubmit": ("", "working"),
 }
 
 
-def hook_command(reason):
-    d = '"${XDG_STATE_HOME:-$HOME/.local/state}/hyperbeam/waiting"'
-    if reason is None:
-        return f'[ -n "$HB_PROJECT" ] && rm -f {d}/"$HB_PROJECT"; exit 0'
-    return f'[ -n "$HB_PROJECT" ] && {{ mkdir -p {d}; echo "{reason}" > {d}/"$HB_PROJECT"; }}; exit 0'
+def hook_command(state):
+    d = '"${XDG_STATE_HOME:-$HOME/.local/state}/hyperbeam/claude"'
+    return f'[ -n "$HB_PROJECT" ] && {{ mkdir -p {d}; echo "{state}" > {d}/"$HB_PROJECT"; }}; exit 0'
 
 
 def install_hooks(settings=None):
-    """Merge hyperbeam's three hooks (Stop, Notification, UserPromptSubmit) into the user's Claude settings; nothing else is changed.
-    Idempotent (ours are recognised by the state path in the command). A backup of the file is kept next to it once."""
+    """Merge hyperbeam's hooks into the user's Claude settings; nothing else is changed. Idempotent (ours are recognised by the state path
+    in the command; PR #10's older ones are replaced). A backup of the file is kept next to it once."""
     f = Path(settings or Path.home() / ".claude/settings.json")
     data = json.loads(f.read_text()) if f.exists() else {}
     bak = f.with_name(f.name + ".hyperbeam-backup")
@@ -474,15 +506,19 @@ def install_hooks(settings=None):
         bak.write_text(f.read_text())
     hooks = data.setdefault("hooks", {})
     changed = []
-    for event, (matcher, reason) in HOOK_CMDS.items():
+    for event, (matcher, state) in HOOK_CMDS.items():
         groups = hooks.setdefault(event, [])
-        entry = {"type": "command", "command": hook_command(reason), "timeout": 5}
+        entry = {"type": "command", "command": hook_command(state), "timeout": 5}
         done = False
-        for g in groups:
+        for g in list(groups):
             for i, h in enumerate(g.get("hooks", [])):
-                if HOOK_MARK in h.get("command", ""):
-                    if h != entry:
+                if any(m in h.get("command", "") for m in HOOK_MARKS):
+                    if h != entry or g.get("matcher", "") != matcher:
                         g["hooks"][i] = entry
+                        if matcher:
+                            g["matcher"] = matcher
+                        else:
+                            g.pop("matcher", None)
                         changed.append(event)
                     done = True
         if not done:
@@ -652,13 +688,23 @@ def git_problems(path, fetch=False, behind=True):
     return out
 
 
-def start_check(name, path, fetch=True):
-    """Problems to report on Open: git state plus 'not stopped cleanly' (a saved layout with no clean-stop record and no running session)."""
-    out = []
+def crash_note(name):
+    """A saved layout with no clean-stop record and no running session: the last session crashed, was killed, or the machine went down.
+    Alone it is only a note (kk shows it until the project is opened); it is not a problem."""
     lay = load_layout(name)
     if lay and not lay.get("clean") and not session_exists(sanitize(name)):
-        out.append(f"not stopped cleanly (layout saved {ago_text(lay['saved'])}, no clean stop recorded: crash, reboot or killed session)")
-    return out + git_problems(path, fetch)
+        return f"last session did not stop cleanly (layout saved {ago_text(lay['saved'])}: crash, reboot or killed session)"
+    return ""
+
+
+def start_check(name, path, fetch=True):
+    """(problems, notes) on Open. Problems: git state. A crash with clean git is a note; with git problems it is added to them."""
+    problems = git_problems(path, fetch)
+    note = crash_note(name)
+    if note and problems:
+        problems.insert(0, note)
+        note = ""
+    return problems, [note] if note else []
 
 
 # ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
@@ -841,12 +887,12 @@ def open_project(name, path, man, ask, say, onboard=False):
     lay = load_layout(name)
     restore = lay if lay and ask(f"Restore last layout of {name}?\n\n{describe_layout(lay)}") else None
     say(f"{name}: checking git state...")
-    findings = start_check(name, path)
+    findings, notes = start_check(name, path)
     recover = False
     if findings and man and not onboard:
         recover = ask("Start Claude to sort it out?\n\n" + "\n".join(f"- {f}" for f in findings))
     start_session(name, man, say, path=path, reason="Onboard requested" if onboard else None,
-                  restore=restore, findings=findings, recover=recover)
+                  restore=restore, findings=findings, recover=recover, notes=notes)
 
 
 def new_pane(args, cmd=None):
@@ -902,7 +948,7 @@ def restore_layout(sess, path, lay, envargs):
     return plan
 
 
-def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False):
+def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=()):
     """Create the project's session: the default layout, or `restore` (a saved layout).
     Default: window `work` (Claude left, a shell right), then one window per service. Services start in manifest order, each after the
     previous one is ready. Then the first shell pane prints the start-check findings and real warnings and runs `kk`, and Claude starts:
@@ -948,10 +994,10 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
             failures.append(dict(name=win, result=result, tail=pane_tail(target)))
     if shell:
         ff = ""
-        if findings:
+        if findings or notes:
             d = STATE_DIR / "startcheck"
             d.mkdir(parents=True, exist_ok=True)
-            (d / f"{sess}.txt").write_text("\n".join(findings) + "\n")
+            (d / f"{sess}.txt").write_text("\n".join([*findings, *[f"note: {n}" for n in notes]]) + "\n")
             ff = f" --findings {shlex.quote(str(d / (sess + '.txt')))}"
         send_line(shell, f"clear; {SELF} _warn {shlex.quote(str(path))}{ff}; {SELF} info {shlex.quote(name)}")
     if man is None:
@@ -1481,12 +1527,12 @@ def service_states(sess, man, host_ports):
     return out
 
 
-def project_info(name):
-    """The text `kk` prints. Discovery only; each source is skipped silently if it does not apply."""
+def project_info(name, rows=None, footer=True):
+    """The text `kk` prints. Discovery only; each source is skipped silently if it does not apply. `rows`: a scan() result to reuse."""
     from concurrent.futures import ThreadPoolExecutor
     mans = load_manifests()
     man = mans.get(name)
-    row = next((r for r in scan() if r["name"] == name), None)
+    row = None if man else next((r for r in (rows if rows is not None else scan()) if r["name"] == name), None)
     path = manifest_path(man) if man else (row["path"] if row else None)
     if path is None:
         return f"hyperbeam info: no project called {name}"
@@ -1533,23 +1579,32 @@ def project_info(name):
     section("Git", [f"{web}  repo" if web else "", f"{homepage}  homepage (GitHub)" if homepage else ""])
     section(".env", [f"{u}  {k} ({f})" for k, u, f in env_urls(path)])
     section("Extra ([links])", [f"{u}  {k}" for k, u in ((man or {}).get("links") or {}).items()])
-    L.extend(["", f"keys: {HINT}   (drag to select and copy)"])
+    if footer:
+        L.extend(["", f"keys: {HINT}   (drag to select and copy)"])
     return "\n".join(L)
 
 
+DIVIDER = "─" * 44
+
+
 def menu_overview():
-    """kk in the hyperbeam session: every open project with its dot colour and why."""
+    """kk in the hyperbeam session: for each open project its status line, its full kk detail, then a divider. Then notes (projects whose last session crashed)."""
     mans = load_manifests()
-    rows = []
-    for sess in stack():
-        if sess == MENU:
-            continue
-        name = session_project(sess)
+    open_names = [session_project(x) for x in stack() if x != MENU]
+    rows = scan() if any(n not in mans for n in open_names) else []
+    items = []
+    for name in open_names:
         st = project_status(name, mans.get(name)) or ("none", "not running")
-        rows.append((["red", "blue", "green", "none"].index(st[0]), name, st))
+        items.append((["red", "blue", "cyan", "green", "none"].index(st[0]), name, st))
     L = ["hyperbeam: open projects", ""]
-    L += [f"[{st[0]}] {name}\n    {st[1]}" for _, name, st in sorted(rows)] or ["(no project is open)"]
-    L += ["", f"keys: {HINT}   (drag to select and copy)"]
+    for _, name, st in sorted(items):
+        L += [f"[{st[0]}] {name}: {st[1]}", "", project_info(name, rows, footer=False), "", DIVIDER, ""]
+    if not items:
+        L += ["(no project is open)", ""]
+    notes = [(n, crash_note(n)) for n in sorted(mans) if crash_note(n)]
+    if notes:
+        L += ["Notes (cleared when the project is opened)"] + [f"  {n}: {t}" for n, t in notes] + [""]
+    L += [f"keys: {HINT}   (drag to select and copy)"]
     return "\n".join(L)
 
 
@@ -1694,7 +1749,7 @@ class Choice(ModalScreen):
 
 
 ORANGE = "#ff9f43"
-DOT = {"green": "green", "red": "red", "blue": "dodger_blue1"}
+DOT = {"green": "green", "red": "red", "blue": "dodger_blue1", "cyan": "cyan"}
 
 
 def clip(text, width):
@@ -1713,58 +1768,97 @@ def row_text(p, st, width):
     return t
 
 
-class SettingsScreen(Screen):
-    """Settings: values cycle on Enter or click and are written to config.toml. Then the key cheat sheet."""
-    BINDINGS = [Binding("escape,q,t", "back", "Back")]
+class ProjectList(OptionList):
+    """A click or tap selects; a double click or tap (Textual's click chain count 2) or Enter opens."""
+    async def _on_click(self, event) -> None:
+        event.prevent_default()         # Textual calls the base class handler too, unless this is called: it would select on every click
+        i = event.style.meta.get("option")
+        if i is None or self._options[i].disabled:
+            return
+        self.highlighted = i
+        if event.chain >= 2:
+            self.action_select()
+        event.stop()
+
+
+class SettingsScreen(ModalScreen):
+    """Settings, a modal: it owns all input while open (App bindings don't reach past a modal; events are stopped here so they don't bubble
+    to the Menu's handlers). Up/Down choose a setting, Left/Right or the - and + buttons change it, Esc or Close goes back. Values are written to config.toml."""
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("up", "move(-1)", "Up"), Binding("down", "move(1)", "Down"),
+                Binding("left", "adjust(-1)", "Less"), Binding("right", "adjust(1)", "More"), Binding("enter", "adjust(1)", "More")]
     DEFAULT_CSS = """
-    SettingsScreen #sl { height: auto; max-height: 9; border: none; padding: 0; }
-    SettingsScreen #sheet { height: 1fr; padding: 0 1; }
-    SettingsScreen #sb { height: 1; margin-top: 1; }
-    SettingsScreen Button { height: 1 !important; border: none !important; min-width: 12; }
+    SettingsScreen { align: center top; }
+    SettingsScreen > Vertical { width: 100%; max-width: 70; height: 100%; background: $surface; padding: 0 1; }
+    SettingsScreen .srow { height: 1; }
+    SettingsScreen .srow Static { width: 1fr; }
+    SettingsScreen .srow.sel Static { background: $accent 40%; }
+    SettingsScreen .srow Button { height: 1 !important; border: none !important; min-width: 5; width: 5; margin-left: 1; }
+    SettingsScreen #sheet { height: 1fr; margin-top: 1; }
+    SettingsScreen #close { height: 1 !important; border: none !important; }
     """
     LABELS = [("open_mode", "open mode"), ("claude_model", "claude model"), ("claude_effort", "claude effort"),
               ("menu_width", "menu width"), ("recent_days", "recent (days)")]
 
+    def __init__(self):
+        super().__init__()
+        self.sel = 0
+
     def compose(self) -> ComposeResult:
-        yield Static("Settings", id="stitle")
-        yield OptionList(id="sl")
-        with VerticalScroll(id="sheet"):
-            yield Static(self.cheat(), markup=False)
-        yield Button("Back (esc)", id="sb")
+        with Vertical():
+            yield Static("Settings", id="stitle")
+            for key, label in self.LABELS:
+                with Horizontal(classes="srow", id=f"row-{key}"):
+                    yield Static("", id=f"v-{key}", markup=False)
+                    yield Button("−", id=f"m-{key}")
+                    yield Button("+", id=f"p-{key}")
+            with VerticalScroll(id="sheet"):
+                yield Static(self.cheat(), markup=False)
+            yield Button("Close (esc)", id="close")
 
     def cheat(self):
-        lines = ["Enter or click a setting to change it.", "", "hyperbeam keys (no prefix)"]
+        lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
         lines += [f"  {k}\n      {d}" for k, d in KEYS]
         lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, t settings, b onboard, i info, r refresh, q quit (detach)"]
+        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, b onboard, i info, r refresh, q quit (detach)"]
         return "\n".join(lines)
 
     def on_mount(self):
-        self.fill()
-        self.query_one("#sl", OptionList).focus()
+        self.show()
 
-    def fill(self, keep=0):
-        ol = self.query_one("#sl", OptionList)
-        ol.clear_options()
-        for key, label in self.LABELS:
-            ol.add_option(Option(Text(f" {label:<14}{cfg_get(key)}"), id=key))
-        ol.highlighted = keep
+    def show(self):
+        for i, (key, label) in enumerate(self.LABELS):
+            self.query_one(f"#v-{key}", Static).update(f" {label:<14}{cfg_get(key)}")
+            self.query_one(f"#row-{key}").set_class(i == self.sel, "sel")
 
-    def on_option_list_option_selected(self, event):
-        key = event.option.id
+    def change(self, key, step):
         vals = CHOICES[key]
         cur = cfg_get(key)
-        set_config(key, vals[(vals.index(cur) + 1) % len(vals)] if cur in vals else vals[0])
-        self.fill(self.query_one("#sl", OptionList).highlighted or 0)
-        if key == "menu_width":
-            self.app.fit_pane(force=True)
-        self.app.refresh_list()
+        i = vals.index(cur) if cur in vals else 0
+        new = vals[(i + 1) % 2] if len(vals) == 2 else vals[max(0, min(len(vals) - 1, i + step))]      # a toggle flips; a number clamps
+        if new != cur:
+            set_config(key, new)
+            if key == "menu_width":
+                self.app.fit_pane(force=True)
+            self.app.refresh_list()
+        self.show()
+
+    def action_move(self, step: int):
+        self.sel = max(0, min(len(self.LABELS) - 1, self.sel + step))
+        self.show()
+
+    def action_adjust(self, step: int):
+        self.change(self.LABELS[self.sel][0], step)
 
     def on_button_pressed(self, event):
         event.stop()
-        self.dismiss()
+        bid = event.button.id
+        if bid == "close":
+            return self.dismiss()
+        kind, key = bid.split("-", 1)
+        self.sel = [k for k, _ in self.LABELS].index(key)
+        self.change(key, -1 if kind == "m" else 1)
 
-    def action_back(self):
+    def action_close(self):
         self.dismiss()
 
 
@@ -1777,10 +1871,14 @@ class Menu(App):
     #why { height: 1; padding: 0 1; color: $text-muted; }
     #notice { height: 2; padding: 0 1; }
     #buttons { layout: grid; grid-size: 4; grid-gutter: 0 1; height: auto; }
+    .fix #buttons { grid-size: 5; }
     .narrow #buttons { grid-size: 2; }
+    .narrow.fix #buttons { grid-size: 3; }
+    #b-fix { display: none; }
+    .fix #b-fix { display: block; }
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"),
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"),
                 Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
@@ -1788,14 +1886,15 @@ class Menu(App):
         self.projects, self.busy, self.status = [], set(), {}
         self.keep_notice = False        # True after an action: the refresh then leaves its result message on screen
         self.last_narrow, self.auto_zoom = None, False
+        self.recheck_next = False       # Refresh: run the red checks again
 
     def compose(self) -> ComposeResult:
         yield Static("hyperbeam", id="title")
-        yield OptionList(id="list")
+        yield ProjectList(id="list")
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)")]:
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("fix", "Fix (f)")]:
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
@@ -1808,6 +1907,7 @@ class Menu(App):
         self.set_interval(2, self.fit_pane)
         self.set_interval(300, self.save_layouts)
         journal_start()
+        touch_opened("hyperbeam")       # the hyperbeam session is home: recent (bold) and part of the session record
 
     def on_resize(self, event):
         self.set_class(event.size.width < 50, "narrow")
@@ -1842,6 +1942,7 @@ class Menu(App):
 
     # --- data ---
     def action_refresh(self):
+        self.recheck_next = True
         self.reload(keep=False)
 
     def reload(self, keep):
@@ -1852,11 +1953,16 @@ class Menu(App):
 
     def _load(self):
         rows = build_projects()
-        status = self.compute_status(rows)
+        status = self.compute_status(rows, self.recheck_next)
+        self.recheck_next = False
         self.call_from_thread(self.apply, rows, status)
 
-    def compute_status(self, rows):
+    def compute_status(self, rows, recheck_all=False):
         mans = load_manifests()
+        if recheck_all:
+            for r in rows:
+                if r["running"]:
+                    recheck(r["name"], manifest_path(mans[r["name"]]) if r["name"] in mans else r["path"])
         return {r["name"]: project_status(r["name"], mans.get(r["name"])) for r in rows if r["running"]}
 
     def apply(self, rows, status):
@@ -1877,8 +1983,15 @@ class Menu(App):
 
     def poll_status(self):
         def work():
+            mans, changed = load_manifests(), False          # a manifest written or committed since the last scan shows up (port, "unset")
+            for p in self.projects:
+                m = mans.get(p["name"])
+                now = (m is not None, m.get("port") if m else None)
+                if (p["manifest"], p["port"]) != now:
+                    p["manifest"], p["port"] = now
+                    changed = True
             st = self.compute_status(self.projects)
-            if st != self.status:
+            if st != self.status or changed:
                 self.call_from_thread(self.set_status, st)
         self.run_worker(work, thread=True, group="status")
 
@@ -1917,6 +2030,7 @@ class Menu(App):
     def show_why(self):
         p, why = self.current(), ""
         st = self.status.get(p["name"]) if p and p["running"] else None
+        self.set_class(bool(st and st[0] == "red"), "fix")          # a red project gets a Fix button
         if st:
             why = f"[{st[0]}] {st[1]}"
         elif p and not p["manifest"]:
@@ -1931,15 +2045,47 @@ class Menu(App):
         self.call_from_thread(self.say, msg)
 
     # --- events ---
+    # Messages bubble from any screen up to the App, so every handler here checks that it came from the main list or the main buttons.
     def on_option_list_option_highlighted(self, event):
-        self.show_why()
+        if event.option_list.id == "list":
+            self.show_why()
 
     def on_option_list_option_selected(self, event):
-        self.action_open()
+        if event.option_list.id == "list":
+            self.action_open()
 
     def on_button_pressed(self, event):
         if event.button.id and event.button.id.startswith("b-"):
             getattr(self, "action_" + event.button.id[2:])()
+
+    def check_action(self, action, parameters):
+        """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
+        if action in ("open", "stop", "done", "settings", "fix", "onboard", "info", "refresh", "quit") and len(self.screen_stack) > 1:
+            return False
+        return True
+
+    def action_fix(self):
+        p = self.current()
+        st = self.status.get(p["name"]) if p and p["running"] else None
+        if not st or st[0] != "red":
+            return self.say("Fix: the selected project is not red.")
+        if p["name"] in self.busy:
+            return self.say(f"{p['name']} is busy.")
+        self.busy.add(p["name"])
+        self.run_worker(lambda: self._fix(p), thread=True)
+
+    def _fix(self, p):
+        name = p["name"]
+        try:
+            man = load_manifests().get(name)
+            fix_project(name, man, manifest_path(man) if man else p["path"])
+            show_session(sanitize(name))
+            self.say_from_thread(f"{name}: Claude is looking at it (recover prompt).")
+        except Exception as e:
+            self.say_from_thread(f"{name}: ERROR {e}")
+        finally:
+            self.busy.discard(name)
+            self.call_from_thread(self.reload, True)
 
     def action_settings(self):
         self.push_screen(SettingsScreen())
