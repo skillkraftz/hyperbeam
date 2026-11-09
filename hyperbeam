@@ -5,7 +5,7 @@
 # ///
 """hyperbeam: a control panel for ~/projects. No arguments opens the menu.
 
-CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME
+CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 """
 import argparse, json, os, re, shlex, socket, subprocess, sys, time, tomllib
 from pathlib import Path
@@ -158,6 +158,13 @@ def wait_ready(sess, win, svc, port):
     return f"WARNING timeout waiting for port {rp}"
 
 
+def session_env(man):
+    """Environment of a project's session: PORT, HB_PORT, HOST=0.0.0.0, then the manifest's [env] table."""
+    env = {"PORT": str(man["port"]), "HB_PORT": str(man["port"]), "HOST": "0.0.0.0"}
+    env.update({k: str(v) for k, v in man.get("env", {}).items()})
+    return env
+
+
 def manifest_path(man):
     return Path(os.path.expanduser(man["path"]))
 
@@ -172,8 +179,8 @@ def start_session(name, man, say=print):
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
     port = str(man["port"])
-    tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path),
-         "-e", f"PORT={port}", "-e", f"HB_PORT={port}")
+    envargs = [x for k, v in session_env(man).items() for x in ("-e", f"{k}={v}")]
+    tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path), *envargs)
     tmux("send-keys", "-t", f"{sess}:claude", "-l", "claude")
     tmux("send-keys", "-t", f"{sess}:claude", "Enter")
     tmux("new-window", "-t", f"{sess}:", "-n", "shell", "-c", str(path))
@@ -208,7 +215,7 @@ def stop_project(name, man, say=print):
     if own_session() == sess:
         raise RuntimeError(f"this menu is running inside {sess}; run Stop from another terminal")
     path = manifest_path(man)
-    env = dict(os.environ, PORT=str(man["port"]), HB_PORT=str(man["port"]))
+    env = dict(os.environ, **session_env(man))
     for svc in reversed(man.get("service", [])):
         if "stop" in svc:
             say(f"{name}: stop {svc['name']}: {svc['stop']}")
@@ -267,6 +274,120 @@ def onboarding_prompt(p):
     text = (HERE / "ONBOARDING.md").read_text()
     return (f"{text}\n\n---\nProject name: {p['name']}\nProject path: {p['path']}\n"
             f"Manifest to write: {HERE}/projects/{p['name']}.toml\n")
+
+
+# ---------- sessions, URLs, list, phone ----------
+_tailnet = []
+
+
+def tailnet_host():
+    """This machine's MagicDNS name (or its Tailscale IP), from `tailscale status --json`; None if unavailable."""
+    if not _tailnet:
+        host = None
+        try:
+            me = json.loads(run("tailscale", "status", "--json")).get("Self", {})
+            host = (me.get("DNSName") or "").rstrip(".") or next(iter(me.get("TailscaleIPs", [])), None)
+        except ValueError:
+            pass
+        _tailnet.append(host)
+    return _tailnet[0]
+
+
+def live_sessions():
+    """Running sessions of hyperbeam projects (those with a manifest), most recently used first. session_last_attached is empty until a session's first
+    attach (it updates on every attach and switch-client), so session_created is the fallback."""
+    by_sess = {sanitize(n): (n, m) for n, m in load_manifests().items()}
+    out, here = [], own_session()
+    fmt = "#{session_name}\t#{session_last_attached}\t#{session_created}\t#{session_attached}"
+    for line in tmux("list-sessions", "-F", fmt, check=False).stdout.splitlines():
+        sess, last, created, attached = line.split("\t")
+        if sess not in by_sess:
+            continue
+        name, man = by_sess[sess]
+        out.append(dict(name=name, sess=sess, port=man["port"], here=sess == here,
+                        ts=int(last or created or 0), attached=int(attached or 0)))
+    return sorted(out, key=lambda s: -s["ts"])
+
+
+def project_url(port):
+    host = tailnet_host()
+    return f"http://{host}:{port}" if host and port else None
+
+
+def print_sessions(sessions, numbered):
+    remote = is_remote()
+    width = max(len(s["name"]) for s in sessions)
+    for i, s in enumerate(sessions, 1):
+        port = s["port"]
+        cols = [f"{i}" if numbered else "-", s["name"].ljust(width),
+                f"{port:<5}", "up  " if port_open(port) else "down", project_url(port) or "(no tailscale)"]
+        if not remote:
+            cols.append(f"local http://localhost:{port}")
+        if s["here"]:
+            cols.append("(here)")
+        print("  ".join(cols))
+
+
+def read_choice(n):
+    """A number from 1..n, or None for quit. Up to 9 sessions it takes a single keypress."""
+    import termios, tty
+    while True:
+        sys.stdout.write(f"\nNumber to switch to (1-{n}), q to quit: ")
+        sys.stdout.flush()
+        if n <= 9:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            print(ch if ch.isprintable() else "")
+            if ch in ("q", "Q", "\x03", "\x04", "\x1b", ""):
+                return None
+            if ch.isdigit() and 1 <= int(ch) <= n:
+                return int(ch)
+        else:
+            try:
+                line = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if line.lower() == "q":
+                return None
+            if line.isdigit() and 1 <= int(line) <= n:
+                return int(line)
+
+
+def go_to(session):
+    touch_opened(session["name"])
+    return attach_here(session["sess"])
+
+
+def cmd_list(_):
+    sessions = live_sessions()
+    if not sessions:
+        print("No sessions running. Run `hyperbeam` for the menu.")
+        return 1
+    print_sessions(sessions, numbered=True)
+    if not sys.stdin.isatty():
+        return 0
+    choice = read_choice(len(sessions))
+    return 0 if choice is None else go_to(sessions[choice - 1])
+
+
+def cmd_phone(_):
+    sessions = live_sessions()
+    if not sessions:
+        print("Nothing is running. Try `hyperbeam list` or `hyperbeam` (the menu) to start something.")
+        return 1
+    print("Open projects (most recent first):")
+    print_sessions(sessions, numbered=False)
+    target = next((x for x in sessions if not x["here"]), None)
+    if target is None:
+        print("\nYou are already in the only running session.")
+        return 0
+    print(f"\nAttaching to {target['name']}...")
+    return go_to(target)
 
 
 # ---------- CLI ----------
@@ -491,7 +612,7 @@ class Menu(App):
                                  ("uncommitted", p["dirty"]), ("no CLAUDE.md", not (p["path"] / "CLAUDE.md").exists())] if bad]
         self.query_one("#detail", Static).update(
             f"{home_rel(p['path'])}   {p['remote'] or ''}\n"
-            f"services: {svcs or '-'}   port: {p['port'] or '-'}\nwarnings: {', '.join(warn) or 'none'}")
+            f"services: {svcs or '-'}   port: {p['port'] or '-'}   url: {project_url(p['port']) or '-'}\nwarnings: {', '.join(warn) or 'none'}")
 
     def say(self, msg):
         self.query_one("#notice", Static).update(msg)
@@ -608,6 +729,8 @@ def main():
     s = sub.add_parser("stop", help="run stop commands, kill the session, check the ports")
     s.add_argument("name")
     s.set_defaults(f=cmd_stop)
+    sub.add_parser("list", help="numbered list of running sessions with URLs; a number switches to it").set_defaults(f=cmd_list)
+    sub.add_parser("phone", help="print the URLs, then attach to the most recently used session").set_defaults(f=cmd_phone)
     w = sub.add_parser("_warn")
     w.add_argument("path")
     w.set_defaults(f=cmd_warn)
