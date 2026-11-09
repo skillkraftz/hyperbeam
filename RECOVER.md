@@ -2,7 +2,7 @@
 
 You are Claude Code, running in the project's directory, in the Claude pane of its tmux session. hyperbeam's start check found
 something that may need attention (listed at the bottom: uncommitted changes, unpushed commits, stashes, detached HEAD, a merge or
-rebase in progress, behind the remote, a steno file git could commit, or a session that was not stopped cleanly). The user chose to have you sort it out.
+rebase in progress, behind the remote, a steno file git could commit, a service that is down, or a session that was not stopped cleanly). The user chose to have you sort it out.
 If a previous conversation here was continued, use what it tells you about what the user was doing.
 
 Rules:
