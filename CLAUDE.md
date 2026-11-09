@@ -13,6 +13,8 @@ Works locally and from Termux over Tailscale.
 - ~/.config/tmux/tmux.conf already exists. hyperbeam never replaces it: it holds one added line, `source-file -q ~/.config/tmux/hyperbeam.conf`; everything else is in hyperbeam.conf (this repo), symlinked there (`ln -sfn ~/projects/hyperbeam/hyperbeam.conf ~/.config/tmux/hyperbeam.conf`).
 
 ## Rules
+- **Branch work happens in a git worktree at ~/.cache/hyperbeam-work/<branch>** (`git worktree add -b <branch> ~/.cache/hyperbeam-work/<branch> main`), so ~/projects/hyperbeam stays on main: the user's live hyperbeam runs from there, and manifest commits go to its main. Remove the worktree when the PR is open (`git worktree remove`). Test with the worktree's script, never the live symlink.
+- **WINDOWS: never open, focus or leave a real window (kitty or anything else) on the user's primary monitor.** The only screen allowed is the far-left monitor near 0/0 (eDP-1, the laptop panel, which the user does not use), and the window must not take focus. The primary monitor is DP-7, not the laptop. GNOME/Wayland can't place windows, so default to NOT opening any: test with an isolated tmux server and pty clients. If a real window is truly needed, use an Xwayland kitty (`HB_KITTY_ARGS="-o linux_display_server=x11 --class hbwin"`), move it with XMoveWindow to ~100,1000, check X focus before and after, and close it at once. Never run a test with `open_mode = "window"` unless that is the test.
 - Prototype for personal use: keep it simple.
 - Verify, don't assume. Check the machine before writing down a fact about it.
 - Never print or commit secrets (.env files, keys, tokens). Say only that such a file exists.
@@ -44,10 +46,27 @@ without PATH. `config.toml` holds the GitHub accounts that count as "mine".
   (not the current one). If nothing runs it says so and points at `list` and the menu.
 
 ## The menu
-Textual app in the storywheel style (tabs, option list, one-line buttons that never take focus, modal confirm). Everything is a visible
-button, with its key in the label. Tabs: Running, Recent (last opened, kept in ~/.local/state/hyperbeam/state.json), Mine, Others
-(not mine: other owner, no remote, no git), Not configured (no manifest), Settings (open_mode toggle, written to config.toml, and a cheat sheet of every hyperbeam key and the user's own prefix keys; Mode (m) toggles from any tab). It opens on the first non-empty of Running/Recent/Mine.
-Arrows move the selection, left/right change tab, Enter or a click on a row opens it.
+Textual app, built for a ~45-column phone screen: one list, no tabs. A row is a dot (only for running projects), the name (clipped with `…`
+so the dot and port always fit) and the port right-aligned (`unset` in orange = no manifest, `-` = manifest without a port). Name: bold white if
+opened within `recent_days`, else grey. Order: running, then recent, then the rest, alphabetical within each. Under the list one line gives the
+selected project's dot reason (or nothing). Buttons: Open (o), Stop (s), Done (d), Settings (t), a 2x2 grid below 50 columns. Hidden keys: b onboard,
+i info, r refresh, q quit (detach). Arrows move, Enter or a click on a row opens it.
+
+**Dots:** green = running, services up; red = a service is down/exited (checked live: ready port closed or the window printed `[hyperbeam] exited`), or the start check
+found problems (stored in ~/.local/state/hyperbeam/status/<project>.json, cleared on Stop), or the session crashed; blue = Claude waits for the user (hook state, below).
+Priority red > blue > green. `kk` shows the same as text: in a project session `status: [red] reason` plus the detail; in the hyperbeam session a list of every open project with `[colour]` and why.
+
+**Hooks (blue):** `hyperbeam _hooks` merges three command hooks into ~/.claude/settings.json (nothing else touched; one backup `settings.json.hyperbeam-backup`; idempotent): `Stop` and
+`Notification` (matcher `permission_prompt|idle_prompt`) write ~/.local/state/hyperbeam/waiting/$HB_PROJECT, `UserPromptSubmit` deletes it. Plain shell, ~20 ms, a no-op without $HB_PROJECT.
+Event names and settings structure are from the Claude Code docs (code.claude.com/docs/en/hooks).
+
+**Settings screen (t):** open_mode, claude_model (sonnet/opus/haiku/fable), claude_effort (low..max), menu_width, recent_days: Enter or click cycles a value and writes config.toml;
+below it the key cheat sheet. Every Claude hyperbeam starts is `claude --model <claude_model> --effort <claude_effort>` (defaults sonnet, medium).
+
+**Layout of the hyperbeam session:** the menu is a column of `menu_width` columns (default 45), Claude top right, a shell bottom right. The menu keeps its own width (`resize-pane -x`) when a client of another size attaches;
+on a client narrower than 2*width+10 (the phone) it zooms itself once (`M-z` shows the rest) and unzooms when the client gets wide again.
+
+**Prompt injection (`inject_prompt`, used by recover, wrap-up and onboarding):** Claude running in the target pane: one line `Read <file> and follow it.` and Enter. Otherwise `claude --continue "$(cat file)" || claude "$(cat file)"` (with the model/effort flags). Pane choice (`find_claude_pane`): the pane running claude, else the left pane of `work`, or pane 1 of the hyperbeam session. Never the menu pane (text sent there is keystrokes for the menu).
 
 - **Open (o):** open-or-onboard. Starts the tmux session if it isn't running, then shows it according to `open_mode` in config.toml:
   `"switch"` (default) switches the client that looks at the menu to it, at the laptop and over SSH (one terminal; the stack keys go back);
@@ -78,7 +97,7 @@ attaches (tested at 150 and 58 columns: at phone width the right pane gets ~9 co
 - Mouse is on. Dragging a selection copies it to the tmux buffer, and at the laptop to the Wayland clipboard too. Shift+drag is kitty's own selection.
 - `M-Left/Right/Up/Down` select the pane (wraps around), `M-z` zooms. Checked: tmux.conf binds M-Arrow only in the prefix table (resize), GNOME's Alt bindings (Tab, F4, Space, Esc, Above_Tab...) and kitty's defaults (ctrl+shift only) don't use plain Alt+Arrow or Alt+z, so nothing was moved.
   The cost: inside Claude Code's prompt, tmux now takes M-Left/M-Right, so Alt+arrow word jumps there don't work (Alt+b / Alt+f are the readline alternatives; not tested).
-- The keys are shown in the menu's button bar, the Settings tab and the status-right of every hyperbeam session (set per session at creation, so other sessions keep the old bar). If you change a key, change `KEYS`/`HINT` in the script and hyperbeam.conf.
+- The keys are shown in the Settings screen and the status-right of every hyperbeam session (set per session at creation, so other sessions keep the old bar). If you change a key, change `KEYS`/`HINT` in the script and hyperbeam.conf.
 - Local or remote is decided per client, not per server: `#{client_pid}` -> that process's environment has SSH_CONNECTION/SSH_TTY, or an ancestor is sshd*, mosh-server or tailscaled. `#{client_tty}` tells nothing (both are ptys).
 - wl-copy runs from the tmux server, so it needs the server's WAYLAND_DISPLAY; if the server was started over SSH it hasn't one, so the script falls back to the socket in $XDG_RUNTIME_DIR.
 - Window positioning: GNOME/Wayland gives clients no way to place windows. A kitty started with `-o linux_display_server=x11` is an Xwayland window and can be moved with XMoveWindow (tested: lands on the far-left monitor, X focus unchanged). Not used by hyperbeam.

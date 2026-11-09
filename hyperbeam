@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
@@ -57,24 +57,42 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-[ M-] stack  M-y copy"
 
 
-def open_mode():
-    """"switch" (default) or "window"; read from config.toml each time so the Settings toggle takes effect at once."""
+DEFAULTS = {"open_mode": "switch", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7}
+CHOICES = {"open_mode": ["switch", "window"], "claude_model": ["sonnet", "opus", "haiku", "fable"],
+           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
+CONFIG_NOTES = {"open_mode": '"switch": Open switches this terminal to the project (also over SSH). "window": a new kitty window per project at the laptop.',
+                "claude_model": "model for every Claude hyperbeam starts (claude --model): sonnet, opus, haiku, fable",
+                "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
+                "menu_width": "columns of the menu column in the hyperbeam session",
+                "recent_days": "a project opened within this many days is 'recent' (bold white in the menu)"}
+
+
+def cfg_get(key):
+    """A setting from config.toml, read each time so the Settings screen takes effect at once; default if missing or invalid."""
     try:
-        m = tomllib.loads(CONFIG_FILE.read_text()).get("open_mode", "switch")
+        v = tomllib.loads(CONFIG_FILE.read_text()).get(key, DEFAULTS[key])
     except (OSError, tomllib.TOMLDecodeError):
-        m = "switch"
-    return m if m in ("switch", "window") else "switch"
+        v = DEFAULTS[key]
+    return v if type(v) is type(DEFAULTS[key]) and (key not in ("claude_model", "claude_effort", "open_mode") or v in CHOICES[key]) else DEFAULTS[key]
+
+
+def set_config(key, value):
+    """Write a setting to config.toml, keeping the rest of the file (comments) as it is."""
+    text = CONFIG_FILE.read_text()
+    line = f"{key} = " + (json.dumps(value) if isinstance(value, str) else str(value))
+    if re.search(rf"^{key}\s*=.*$", text, flags=re.M):
+        text = re.sub(rf"^{key}\s*=.*$", line, text, flags=re.M)
+    else:
+        text = text.rstrip("\n") + f"\n# {CONFIG_NOTES[key]}\n{line}\n"
+    CONFIG_FILE.write_text(text)
+
+
+def open_mode():
+    return cfg_get("open_mode")
 
 
 def set_open_mode(mode):
-    """Write open_mode to config.toml, keeping the rest of the file (comments) as it is."""
-    text = CONFIG_FILE.read_text()
-    line = f'open_mode = "{mode}"'
-    if re.search(r"^open_mode\s*=.*$", text, flags=re.M):
-        text = re.sub(r"^open_mode\s*=.*$", line, text, flags=re.M)
-    else:
-        text = text.rstrip("\n") + f'\n# "switch": Open switches this client to the project. "window": a new kitty window per project (at the laptop).\n{line}\n'
-    CONFIG_FILE.write_text(text)
+    set_config("open_mode", mode)
 
 
 def run(*a):
@@ -328,29 +346,32 @@ def wrapup_prompt(results, sess):
 
 
 def find_claude_pane(sess):
-    """The pane to start the wrap-up in: the one running claude, else the first pane of the first window (`work`, Claude's pane)."""
-    rows = [l.split("\t") for l in tmux("list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_id}\t#{pane_current_command}\t#{window_name}",
+    """The pane for Claude: the one running claude; else the left pane of window `work` in a project session, or the top-right pane (index 1,
+    next to the menu) of the hyperbeam session. Never the menu pane: text sent to it would be keystrokes for the menu."""
+    rows = [l.split("\t") for l in tmux("list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_id}\t#{pane_current_command}\t#{window_name}\t#{pane_index}",
                                         check=False).stdout.splitlines()]
+    if sess == MENU:
+        rows = [r for r in rows if r[2] == "hyperbeam"]
+        return (next((r[0] for r in rows if r[1] == "claude"), None) or next((r[0] for r in rows if r[3] == "1"), None))
     return (next((r[0] for r in rows if r[1] == "claude"), None)
-            or next((r[0] for r in rows if r[2] in ("work", "hyperbeam")), None) or (rows[0][0] if rows else None))
+            or next((r[0] for r in rows if r[2] == "work"), None) or (rows[0][0] if rows else None))
 
 
 def start_wrapup(sess, results):
-    """Start Claude on the findings in the session's Claude pane. If Claude already runs there, type a one-line instruction that points at the
-    prompt file (the prompt itself is several KB with newlines); else start `claude` with it. Returns the pane id."""
+    """Wrap-up findings to Claude in the session's Claude pane (inject_prompt). Returns the pane id."""
     pane = find_claude_pane(sess)
     if not pane:
         raise RuntimeError(f"no pane to start Claude in {sess}")
-    f = wrapup_prompt(results, sess)
-    running = tmux("display-message", "-p", "-t", pane, "#{pane_current_command}").stdout.strip() == "claude"
-    if running:
-        send_line(pane, f"Wrap-up: read {f} and follow it.")
-    else:
-        dirs = "".join(f" --add-dir {shlex.quote(r['path'])}" for r in results if Path(r["path"]) != Path(tmux('display-message', '-p', '-t', pane, '#{pane_current_path}').stdout.strip()))
-        send_line(pane, f'claude "$(cat {shlex.quote(str(f))})"{dirs}')
+    here = tmux("display-message", "-p", "-t", pane, "#{pane_current_path}").stdout.strip()
+    inject_prompt(pane, wrapup_prompt(results, sess), [r["path"] for r in results if Path(r["path"]) != Path(here)])
     tmux("select-window", "-t", pane, check=False)
     tmux("select-pane", "-t", pane, check=False)
     return pane
+
+
+def claude_base():
+    """Every Claude hyperbeam starts uses the configured model and effort."""
+    return f"claude --model {cfg_get('claude_model')} --effort {cfg_get('claude_effort')}"
 
 
 def claude_cmd(prompt_file=None, cont=False, add_dir=False):
@@ -358,13 +379,118 @@ def claude_cmd(prompt_file=None, cont=False, add_dir=False):
     directory; it takes a prompt too), falling back to a fresh claude if there is none. The prompt comes first: --add-dir takes a list."""
     p = f' "$(cat {shlex.quote(str(prompt_file))})"' if prompt_file else ""
     tail = f" --add-dir {shlex.quote(str(HERE))}" if add_dir else ""
-    fresh = f"claude{p}{tail}"
-    return f"claude --continue{p}{tail} || {fresh}" if cont else fresh
+    fresh = f"{claude_base()}{p}{tail}"
+    return f"{claude_base()} --continue{p}{tail} || {fresh}" if cont else fresh
+
+
+def pane_command(pane):
+    return tmux("display-message", "-p", "-t", pane, "#{pane_current_command}", check=False).stdout.strip()
+
+
+def inject_prompt(pane, f, add_dirs=()):
+    """The one way a prompt file reaches Claude (recover, wrap-up, onboarding). Claude already running in the pane: one line pointing at the
+    file, then Enter. Otherwise start `claude --continue` with the prompt, falling back to a fresh `claude` if there is no conversation."""
+    if pane_command(pane) == "claude":
+        send_line(pane, f"Read {f} and follow it.")
+        return "injected"
+    dirs = "".join(f" --add-dir {shlex.quote(str(d))}" for d in add_dirs)
+    arg = f' "$(cat {shlex.quote(str(f))})"{dirs}'
+    send_line(pane, f"{claude_base()} --continue{arg} || {claude_base()}{arg}")
+    return "started"
 
 
 def send_line(target, text):
     tmux("send-keys", "-t", target, "-l", text)
     tmux("send-keys", "-t", target, "Enter")
+
+
+# ---------- status dots: red (service down, start-check findings, crash), blue (Claude waits for the user), green ----------
+def status_dir(kind):
+    return STATE_DIR / kind
+
+
+def write_status(name, findings):
+    d = status_dir("status")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.json").write_text(json.dumps({"findings": findings, "time": time.time()}))
+
+
+def read_status(name):
+    try:
+        return json.loads((status_dir("status") / f"{name}.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def clear_status(name):
+    (status_dir("status") / f"{name}.json").unlink(missing_ok=True)
+    (status_dir("waiting") / name).unlink(missing_ok=True)
+
+
+def waiting_reason(name):
+    try:
+        return (status_dir("waiting") / name).read_text().strip() or "waiting for you"
+    except OSError:
+        return ""
+
+
+def project_status(name, man):
+    """(colour, reason) of a running project, None if it isn't running. Priority red > blue > green."""
+    sess = sanitize(name)
+    if not session_exists(sess):
+        return None
+    red = [f"service {n} {st} ({d})" for n, st, d in service_states(sess, man, {}) if st in ("down", "exited")]
+    red += [f for f in read_status(name).get("findings", []) if f not in " ".join(red)]
+    if red:
+        return "red", "; ".join(red)
+    w = waiting_reason(name)
+    if w:
+        return "blue", f"Claude: {w}"
+    return "green", "running, services up" if man and man.get("service") else "running"
+
+
+HOOK_MARK = "hyperbeam/waiting"
+HOOK_CMDS = {      # plain shell, no Python: fast; nothing happens outside hyperbeam sessions (no $HB_PROJECT)
+    "Stop": ('', 'finished responding'),
+    "Notification": ('permission_prompt|idle_prompt', 'needs your input or permission'),
+    "UserPromptSubmit": ('', None),
+}
+
+
+def hook_command(reason):
+    d = '"${XDG_STATE_HOME:-$HOME/.local/state}/hyperbeam/waiting"'
+    if reason is None:
+        return f'[ -n "$HB_PROJECT" ] && rm -f {d}/"$HB_PROJECT"; exit 0'
+    return f'[ -n "$HB_PROJECT" ] && {{ mkdir -p {d}; echo "{reason}" > {d}/"$HB_PROJECT"; }}; exit 0'
+
+
+def install_hooks(settings=None):
+    """Merge hyperbeam's three hooks (Stop, Notification, UserPromptSubmit) into the user's Claude settings; nothing else is changed.
+    Idempotent (ours are recognised by the state path in the command). A backup of the file is kept next to it once."""
+    f = Path(settings or Path.home() / ".claude/settings.json")
+    data = json.loads(f.read_text()) if f.exists() else {}
+    bak = f.with_name(f.name + ".hyperbeam-backup")
+    if f.exists() and not bak.exists():
+        bak.write_text(f.read_text())
+    hooks = data.setdefault("hooks", {})
+    changed = []
+    for event, (matcher, reason) in HOOK_CMDS.items():
+        groups = hooks.setdefault(event, [])
+        entry = {"type": "command", "command": hook_command(reason), "timeout": 5}
+        done = False
+        for g in groups:
+            for i, h in enumerate(g.get("hooks", [])):
+                if HOOK_MARK in h.get("command", ""):
+                    if h != entry:
+                        g["hooks"][i] = entry
+                        changed.append(event)
+                    done = True
+        if not done:
+            groups.append({**({"matcher": matcher} if matcher else {}), "hooks": [entry]})
+            changed.append(event)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data, indent=2) + "\n")
+    return changed
 
 
 # ---------- layouts (saved under ~/.local/state/hyperbeam/layouts/<project>.json) ----------
@@ -729,17 +855,17 @@ def new_pane(args, cmd=None):
 
 
 def ensure_menu():
-    """The `hyperbeam` session: menu on the left, Claude (in ~/projects/hyperbeam) top right, a shell bottom right.
-    Splits are percentages, so the layout scales when a client of another size attaches."""
+    """The `hyperbeam` session: the menu as a thin left column (menu_width columns, kept by the menu itself when a client of another size
+    attaches), Claude (in ~/projects/hyperbeam) top right, a shell bottom right."""
     if session_exists(MENU):
         return
     clean_server_env()
     menu = new_pane(["new-session", "-d", "-s", MENU, "-n", "hyperbeam", "-x", "200", "-y", "50", "-c", str(HERE),
                      "-e", "HB_PROJECT=hyperbeam", "-e", "HOST=0.0.0.0"],
                     f"{SELF} _menu; echo; echo '[hyperbeam] menu exited, press Enter'; read")
-    claude = new_pane(["split-window", "-h", "-l", "45%", "-t", menu, "-c", str(HERE)])
+    claude = new_pane(["split-window", "-h", "-l", str(max(20, 200 - cfg_get("menu_width") - 1)), "-t", menu, "-c", str(HERE)])
     shell = new_pane(["split-window", "-v", "-l", "40%", "-t", claude, "-c", str(HERE)])
-    send_line(claude, "claude")
+    send_line(claude, claude_base())
     tmux("select-pane", "-t", menu)
     tag_session(MENU)
 
@@ -833,15 +959,15 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     elif failures:
         reason = reason or "a service failed to start"
     cont = bool(restore) and plan is not None and any(p[1] == "claude" for p in plan)
+    write_status(name, findings=list(findings))
     if reason:
-        cmd = claude_cmd(investigate_prompt(name, path, sess, reason, failures, findings), cont=cont, add_dir=True)
+        inject_prompt(first_claude, investigate_prompt(name, path, sess, reason, failures, findings), [HERE])
         say(f"{name}: {reason}; Claude starts with the investigate prompt")
     elif recover:
-        cmd = claude_cmd(recover_prompt(name, path, sess, findings), cont=cont)
+        inject_prompt(first_claude, recover_prompt(name, path, sess, findings))
         say(f"{name}: Claude starts with the recover prompt")
     else:
-        cmd = claude_cmd(cont=cont)
-    send_line(first_claude, cmd)
+        send_line(first_claude, claude_cmd(cont=cont))
     seen = {next(c for pid, _, c in plan if pid == first_claude)}
     for pid, role, cwd in claude_panes[1:]:          # more Claude panes: continue only if the directory differs (one conversation per directory)
         send_line(pid, claude_cmd(cont=cwd not in seen))
@@ -853,11 +979,14 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
 
 
 def investigate_window(name, path, reason):
-    """Onboard on a session that is already running: a new `investigate` window with the prompt."""
+    """Onboard on a session that is already running: the investigate prompt into its Claude pane (inject_prompt)."""
     sess = sanitize(name)
-    f = investigate_prompt(name, path, sess, reason, [])
-    tmux("new-window", "-t", f"{sess}:", "-n", "investigate", "-c", str(path))
-    send_line(f"{sess}:investigate", claude_cmd(f, add_dir=True))
+    pane = find_claude_pane(sess)
+    if not pane:
+        raise RuntimeError(f"no pane to start Claude in {sess}")
+    inject_prompt(pane, investigate_prompt(name, path, sess, reason, []), [HERE])
+    tmux("select-window", "-t", pane, check=False)
+    tmux("select-pane", "-t", pane, check=False)
 
 
 def own_session():
@@ -892,6 +1021,7 @@ def stop_project(name, man, say=print):
                 say(f"{name}: WARNING stop {svc['name']} timed out")
     if session_exists(sess):
         save_layout(name, clean=True)
+        clear_status(name)
         tmux("kill-session", "-t", f"={sess}", check=False)
         say(f"{name}: session killed")
     deadline = time.time() + 6
@@ -942,6 +1072,8 @@ def display_env():
 
 
 def spawn_kitty(sess):
+    if os.environ.get("HB_CONFIG") and not os.environ.get("HB_KITTY_ARGS"):      # a test config: never pop a window on the user's screens
+        raise RuntimeError("test configuration (HB_CONFIG) in use: refusing to open a real window")
     """open_mode = "window": a new kitty window attached to the session. HB_KITTY_ARGS adds kitty options (used by tests)."""
     subprocess.Popen(["kitty", "--title", f"hyperbeam: {sess}", *shlex.split(os.environ.get("HB_KITTY_ARGS", "")),
                       "tmux", "attach", "-t", f"={sess}"],
@@ -1382,6 +1514,8 @@ def project_info(name):
         ports[man["port"]] = ("?", False)
 
     L.append(f"{name}   {home_rel(path)}   session: {sess if running else '(not running)'}")
+    st = project_status(name, man)
+    L.append(f"status: [{st[0]}] {st[1]}" if st else "status: not running")
     states = service_states(sess, man, ports)
     section("Services", [f"{n:<12} {st:<7} {d}" for n, st, d in states])
     section("App", [f"http://localhost:{p}  {proc}" + ("  (this machine only)" if lo else "") for p, (proc, lo) in sorted(ports.items())])
@@ -1403,6 +1537,22 @@ def project_info(name):
     return "\n".join(L)
 
 
+def menu_overview():
+    """kk in the hyperbeam session: every open project with its dot colour and why."""
+    mans = load_manifests()
+    rows = []
+    for sess in stack():
+        if sess == MENU:
+            continue
+        name = session_project(sess)
+        st = project_status(name, mans.get(name)) or ("none", "not running")
+        rows.append((["red", "blue", "green", "none"].index(st[0]), name, st))
+    L = ["hyperbeam: open projects", ""]
+    L += [f"[{st[0]}] {name}\n    {st[1]}" for _, name, st in sorted(rows)] or ["(no project is open)"]
+    L += ["", f"keys: {HINT}   (drag to select and copy)"]
+    return "\n".join(L)
+
+
 def cmd_info(a):
     name = a.project or os.environ.get("HB_PROJECT")
     if not name:
@@ -1410,7 +1560,7 @@ def cmd_info(a):
         name = next((n for n in [*load_manifests(), *(r["name"] for r in scan())] if sanitize(n) == here), None)
     if not name:
         sys.exit("hyperbeam info: no project (run it in a project session, or give a name)")
-    print(project_info(name))
+    print(menu_overview() if sanitize(name) == MENU else project_info(name))
 
 
 # ---------- CLI ----------
@@ -1481,10 +1631,6 @@ def cmd_warn(args):
 
 
 # ---------- the menu ----------
-TABS = [("running", "Running"), ("recent", "Recent"), ("mine", "Mine"), ("others", "Others"),
-        ("unconfigured", "Not configured"), ("settings", "Settings")]
-
-
 class Confirm(ModalScreen):
     BINDINGS = [Binding("y,enter", "answer(True)", "Yes"), Binding("n,escape", "answer(False)", "No")]
     DEFAULT_CSS = """
@@ -1547,51 +1693,152 @@ class Choice(ModalScreen):
         self.dismiss(event.button.id[2:])
 
 
+ORANGE = "#ff9f43"
+DOT = {"green": "green", "red": "red", "blue": "dodger_blue1"}
+
+
+def clip(text, width):
+    return text if len(text) <= width else text[:max(0, width - 1)] + "…"
+
+
+def row_text(p, st, width):
+    """One list row: dot, name (clipped with … so the dot and port always fit), port right-aligned. `width` is the room for the row."""
+    port = str(p["port"]) if p.get("port") else ("-" if p["manifest"] else "unset")
+    pstyle = ORANGE if not p["manifest"] else "dim" if not p.get("port") else "cyan"
+    room = max(4, width - 2 - 1 - len(port))
+    t = Text(no_wrap=True, overflow="crop")
+    t.append("● " if st else "  ", style=DOT.get(st[0], "") if st else "")
+    t.append(clip(p["name"], room).ljust(room), style="bold white" if p["recent"] else "grey54")
+    t.append(" " + port, style=pstyle)
+    return t
+
+
+class SettingsScreen(Screen):
+    """Settings: values cycle on Enter or click and are written to config.toml. Then the key cheat sheet."""
+    BINDINGS = [Binding("escape,q,t", "back", "Back")]
+    DEFAULT_CSS = """
+    SettingsScreen #sl { height: auto; max-height: 9; border: none; padding: 0; }
+    SettingsScreen #sheet { height: 1fr; padding: 0 1; }
+    SettingsScreen #sb { height: 1; margin-top: 1; }
+    SettingsScreen Button { height: 1 !important; border: none !important; min-width: 12; }
+    """
+    LABELS = [("open_mode", "open mode"), ("claude_model", "claude model"), ("claude_effort", "claude effort"),
+              ("menu_width", "menu width"), ("recent_days", "recent (days)")]
+
+    def compose(self) -> ComposeResult:
+        yield Static("Settings", id="stitle")
+        yield OptionList(id="sl")
+        with VerticalScroll(id="sheet"):
+            yield Static(self.cheat(), markup=False)
+        yield Button("Back (esc)", id="sb")
+
+    def cheat(self):
+        lines = ["Enter or click a setting to change it.", "", "hyperbeam keys (no prefix)"]
+        lines += [f"  {k}\n      {d}" for k, d in KEYS]
+        lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
+        lines += ["", "menu keys: o open, s stop, d done, t settings, b onboard, i info, r refresh, q quit (detach)"]
+        return "\n".join(lines)
+
+    def on_mount(self):
+        self.fill()
+        self.query_one("#sl", OptionList).focus()
+
+    def fill(self, keep=0):
+        ol = self.query_one("#sl", OptionList)
+        ol.clear_options()
+        for key, label in self.LABELS:
+            ol.add_option(Option(Text(f" {label:<14}{cfg_get(key)}"), id=key))
+        ol.highlighted = keep
+
+    def on_option_list_option_selected(self, event):
+        key = event.option.id
+        vals = CHOICES[key]
+        cur = cfg_get(key)
+        set_config(key, vals[(vals.index(cur) + 1) % len(vals)] if cur in vals else vals[0])
+        self.fill(self.query_one("#sl", OptionList).highlighted or 0)
+        if key == "menu_width":
+            self.app.fit_pane(force=True)
+        self.app.refresh_list()
+
+    def on_button_pressed(self, event):
+        event.stop()
+        self.dismiss()
+
+    def action_back(self):
+        self.dismiss()
+
+
 class Menu(App):
     TITLE = "hyperbeam"
     ENABLE_COMMAND_PALETTE = False
     CSS = """
     #title { height: 1; padding: 0 1; text-style: bold; color: $accent; }
-    Tabs { height: 2; }
-    #list { height: 1fr; border: round $primary; }
-    #detail { height: 3; padding: 0 1; color: $text-muted; }
-    #notice { height: 3; padding: 0 1; }
-    #buttons { height: 1; margin-top: 1; }
-    #buttons Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 12; }
-    #keys { width: auto; height: 1; padding: 0 1; color: $text-muted; }
-    #hint { height: 1; padding: 0 1; color: $text-muted; }
+    #list { height: 1fr; border: none; padding: 0; scrollbar-size-vertical: 1; }
+    #why { height: 1; padding: 0 1; color: $text-muted; }
+    #notice { height: 2; padding: 0 1; }
+    #buttons { layout: grid; grid-size: 4; grid-gutter: 0 1; height: auto; }
+    .narrow #buttons { grid-size: 2; }
+    #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("d", "done", "Done for now"), Binding("m", "mode", "Mode"),
-                Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit"),
-                Binding("left", "tab(-1)", "prev tab", show=False), Binding("right", "tab(1)", "next tab", show=False)]
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"),
+                Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
-        self.projects, self.tab, self.busy = [], "running", set()
-        self.first_done = False
+        self.projects, self.busy, self.status = [], set(), {}
         self.keep_notice = False        # True after an action: the refresh then leaves its result message on screen
+        self.last_narrow, self.auto_zoom = None, False
 
     def compose(self) -> ComposeResult:
         yield Static("hyperbeam", id="title")
-        yield Tabs(*[Tab(label, id=f"t-{key}") for key, label in TABS], id="tabs")
         yield OptionList(id="list")
-        yield Static("", id="detail", markup=False)
+        yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
-        with Horizontal(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("onboard", "Onboard (b)"),
-                               ("info", "Info (i)"), ("done", "Done for now (d)"), ("mode", f"Mode: {open_mode()} (m)"), ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
+        with Container(id="buttons"):
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)")]:
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
-            yield Static(HINT, id="keys", markup=False)
-        yield Static("up/down: select   left/right: tab   Enter or click a row: open   Quit detaches (the menu keeps running)", id="hint")
 
     def on_mount(self):
         self.query_one("#list", OptionList).focus()
         self.action_refresh()
         self.set_interval(3, self.poll_running)
+        self.set_interval(5, self.poll_status)
+        self.set_interval(2, self.fit_pane)
         self.set_interval(300, self.save_layouts)
         journal_start()
+
+    def on_resize(self, event):
+        self.set_class(event.size.width < 50, "narrow")
+        self.call_after_refresh(self.refresh_list)
+        self.fit_pane()
+
+    # --- the menu pane inside the hyperbeam session: thin column on a wide client, the whole screen on a narrow one ---
+    def fit_pane(self, force=False):
+        pane = os.environ.get("TMUX_PANE")
+        if pane:
+            self.run_worker(lambda: self._fit(pane, force), thread=True, group="fit")
+
+    def _fit(self, pane, force):
+        v = tmux("display-message", "-p", "-t", pane, "#{window_width} #{window_zoomed_flag} #{pane_width}", check=False).stdout.split()
+        if len(v) != 3:
+            return
+        ww, zoomed, pw = int(v[0]), v[1] == "1", int(v[2])
+        want = cfg_get("menu_width")
+        narrow = ww < 2 * want + 10
+        if narrow != self.last_narrow or force:
+            self.last_narrow = narrow
+            if narrow and not zoomed:
+                tmux("resize-pane", "-Z", "-t", pane, check=False)      # phone: the menu takes the screen; M-z shows the rest
+                self.auto_zoom = True
+            elif not narrow:
+                if zoomed and self.auto_zoom:
+                    tmux("resize-pane", "-Z", "-t", pane, check=False)
+                    zoomed = False
+                self.auto_zoom = False
+        if not narrow and not zoomed and pw != want:
+            tmux("resize-pane", "-t", pane, "-x", str(want), check=False)
 
     # --- data ---
     def action_refresh(self):
@@ -1605,18 +1852,16 @@ class Menu(App):
 
     def _load(self):
         rows = build_projects()
-        self.call_from_thread(self.apply, rows)
+        status = self.compute_status(rows)
+        self.call_from_thread(self.apply, rows, status)
 
-    def apply(self, rows):
-        self.projects = rows
-        if not self.first_done:
-            self.first_done = True
-            for key in ("running", "recent", "mine"):
-                self.tab = key
-                if self.visible():
-                    break
-            self.query_one("#tabs", Tabs).active = f"t-{self.tab}"
-        self.render_list()
+    def compute_status(self, rows):
+        mans = load_manifests()
+        return {r["name"]: project_status(r["name"], mans.get(r["name"])) for r in rows if r["running"]}
+
+    def apply(self, rows, status):
+        self.projects, self.status = rows, status
+        self.refresh_list()
         if not self.keep_notice:
             self.say(f"{len(rows)} projects, {sum(1 for r in rows if r['running'])} running")
 
@@ -1628,79 +1873,39 @@ class Menu(App):
             changed |= now != p["running"]
             p["running"] = now
         if changed:
-            self.render_list()
+            self.poll_status()
 
-    def visible(self):
-        P, t = self.projects, self.tab
-        if t == "running":
-            return [p for p in P if p["running"]]
-        if t == "recent":
-            return sorted([p for p in P if p["opened"]], key=lambda p: -p["opened"])
-        if t == "mine":
-            return [p for p in P if p["owner"] == "mine"]
-        if t == "others":
-            return [p for p in P if p["owner"] != "mine"]
-        if t == "settings":
-            return []
-        return [p for p in P if not p["manifest"]]
+    def poll_status(self):
+        def work():
+            st = self.compute_status(self.projects)
+            if st != self.status:
+                self.call_from_thread(self.set_status, st)
+        self.run_worker(work, thread=True, group="status")
 
-    def render_settings(self):
+    def set_status(self, st):
+        self.status = st
+        self.refresh_list()
+
+    # --- the list: running, then recent, then the rest; alphabetical within each ---
+    def ordered(self):
+        days = cfg_get("recent_days")
+        now = time.time()
+        for p in self.projects:
+            p["recent"] = bool(p["opened"]) and now - p["opened"] < days * 86400
+        return sorted(self.projects, key=lambda p: (0 if p["running"] else 1 if p["recent"] else 2, p["name"].lower()))
+
+    def refresh_list(self):
         ol = self.query_one("#list", OptionList)
-        ol.clear_options()
-        ol.add_option(Option(Text(f"  open mode: {open_mode()}   (Enter or Mode (m) toggles it)", style="bold"), id="open_mode"))
-        mode_help = {"switch": "Open switches this terminal to the project (also over SSH).",
-                     "window": "Open starts a new kitty window per project at the laptop (over SSH it switches)."}
-        ol.add_option(Option(Text("      " + mode_help[open_mode()], style="dim"), disabled=True))
-        for title, keys in (("hyperbeam keys (no prefix)", KEYS), ("your tmux keys (prefix is C-a)", USER_KEYS)):
-            ol.add_option(Option(Text(f"\n  {title}", style="bold cyan"), disabled=True))
-            for k, d in keys:
-                ol.add_option(Option(Text(f"    {k:<22}{d}"), disabled=True))
-        ol.add_option(Option(Text("\n  Mouse: click a pane to select it; drag to select text and copy it (Shift+drag: kitty's selection).", style="dim"), disabled=True))
-        ol.highlighted = 0
-
-    def toggle_mode(self):
-        set_open_mode("window" if open_mode() == "switch" else "switch")
-        self.query_one("#b-mode", Button).label = f"Mode: {open_mode()} (m)"
-        if self.tab == "settings":
-            self.render_settings()
-        self.say(f"open mode: {open_mode()} (saved in config.toml)")
-
-    def action_mode(self):
-        self.toggle_mode()
-
-    def render_list(self):
-        ol = self.query_one("#list", OptionList)
-        if self.tab == "settings":
-            self.render_settings()
-            self.show_detail()
-            return
         keep = self.current()
         ol.clear_options()
-        rows = self.visible()
+        rows = self.ordered()
+        width = max(20, self.size.width - 2 - 1)    # the option's own padding, the 1-column scrollbar
         for p in rows:
-            t = Text()
-            t.append("● " if p["running"] else "  ", style="green")
-            t.append(f"{p['name']:<26}")
-            t.append(f"{p['owner']:<10}", style="dim")
-            t.append(f"{p['port'] or '-':>5} ", style="cyan" if p["manifest"] else "dim")
-            t.append("* " if p["dirty"] else "  ", style="yellow")
-            t.append("configured" if p["manifest"] else "not configured", style="dim")
-            if self.tab == "recent":
-                t.append(f"  {ago(p['opened'])}", style="dim")
-            ol.add_option(Option(t, id=p["name"]))
+            ol.add_option(Option(row_text(p, self.status.get(p["name"]) if p["running"] else None, width), id=p["name"]))
         if rows:
             names = [p["name"] for p in rows]
             ol.highlighted = names.index(keep["name"]) if keep and keep["name"] in names else 0
-            self.call_after_refresh(ol.scroll_to_highlight)
-        else:
-            ol.add_option(Option(Text("  (nothing here)", style="dim italic"), disabled=True))
-        counts = {"running": sum(p["running"] for p in self.projects), "recent": sum(1 for p in self.projects if p["opened"]),
-                  "mine": sum(p["owner"] == "mine" for p in self.projects),
-                  "others": sum(p["owner"] != "mine" for p in self.projects),
-                  "unconfigured": sum(not p["manifest"] for p in self.projects)}
-        for key, label in TABS:
-            self.query_one(f"#t-{key}", Tab).label = f"{label} ({counts[key]})" if key in counts else label
-        self.show_detail()
+        self.show_why()
 
     def current(self):
         ol = self.query_one("#list", OptionList)
@@ -1709,18 +1914,15 @@ class Menu(App):
         name = ol.get_option_at_index(ol.highlighted).id
         return next((p for p in self.projects if p["name"] == name), None)
 
-    def show_detail(self):
-        p = self.current()
-        if not p:
-            self.query_one("#detail", Static).update("")
-            return
-        man = load_manifests().get(p["name"])
-        svcs = ", ".join(s["name"] for s in man.get("service", [])) if man else ""
-        warn = [w for w, bad in [("no git", not p["git"]), ("no remote", p["git"] and not p["remote"]),
-                                 ("uncommitted", p["dirty"]), ("no CLAUDE.md", not (p["path"] / "CLAUDE.md").exists())] if bad]
-        self.query_one("#detail", Static).update(
-            f"{home_rel(p['path'])}   {p['remote'] or ''}\n"
-            f"services: {svcs or '-'}   port: {p['port'] or 'none'}   url: {project_url(p['port']) or '-'}\nwarnings: {', '.join(warn) or 'none'}")
+    def show_why(self):
+        p, why = self.current(), ""
+        st = self.status.get(p["name"]) if p and p["running"] else None
+        if st:
+            why = f"[{st[0]}] {st[1]}"
+        elif p and not p["manifest"]:
+            why = "no manifest: Open starts Claude to set it up"
+        w = self.query_one("#why", Static).size.width or 40
+        self.query_one("#why", Static).update(clip(why, w - 2))
 
     def say(self, msg):
         self.query_one("#notice", Static).update(msg)
@@ -1729,26 +1931,18 @@ class Menu(App):
         self.call_from_thread(self.say, msg)
 
     # --- events ---
-    def on_tabs_tab_activated(self, event):
-        if event.tab is not None:
-            self.tab = event.tab.id[2:]
-            self.render_list()
-
     def on_option_list_option_highlighted(self, event):
-        self.show_detail()
+        self.show_why()
 
     def on_option_list_option_selected(self, event):
-        if self.tab == "settings":
-            return self.toggle_mode() if event.option.id == "open_mode" else None
         self.action_open()
 
     def on_button_pressed(self, event):
         if event.button.id and event.button.id.startswith("b-"):
             getattr(self, "action_" + event.button.id[2:])()
 
-    def action_tab(self, step: int):
-        tabs = self.query_one("#tabs", Tabs)
-        tabs.action_next_tab() if step > 0 else tabs.action_previous_tab()
+    def action_settings(self):
+        self.push_screen(SettingsScreen())
 
     # --- actions ---
     def action_open(self):
@@ -1943,6 +2137,9 @@ def main():
     wc.add_argument("--all", action="store_true", help="scan every tracked file too (pattern testing; counts only with --counts)")
     wc.add_argument("--counts", action="store_true")
     wc.set_defaults(f=cmd_wrapup)
+    hk = sub.add_parser("_hooks", help="merge hyperbeam's Claude hooks (waiting state) into ~/.claude/settings.json")
+    hk.add_argument("--settings")
+    hk.set_defaults(f=lambda a: print("hooks updated: " + (", ".join(install_hooks(a.settings)) or "already installed")))
     sv = sub.add_parser("_save")
     sv.add_argument("session", nargs="?")
     sv.set_defaults(f=cmd_save)
