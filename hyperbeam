@@ -37,7 +37,8 @@ def clean_path(path, venv=""):
 
 strip_uv_env()
 HERE = Path(os.path.realpath(__file__)).parent
-CFG = tomllib.loads((HERE / "config.toml").read_text())
+CONFIG_FILE = Path(os.environ.get("HB_CONFIG", HERE / "config.toml"))   # (override is for tests)
+CFG = tomllib.loads(CONFIG_FILE.read_text())
 ROOT = Path(os.path.expanduser(CFG.get("projects_dir", "~/projects")))
 MANIFESTS = Path(os.environ.get("HB_MANIFESTS", HERE / "projects"))   # (override is for tests)
 ACCOUNTS = {a.lower() for a in CFG["accounts"]}
@@ -46,7 +47,34 @@ SKIP = {"node_modules", ".venv", "venv", "target", "dist", "build", "out", "__py
         ".next", ".cache", ".tox", "vendor", ".git"}
 SELF = shlex.quote(str(HERE / "hyperbeam"))
 MENU = "hyperbeam"          # name of the tmux session the menu runs in
-HINT = "M-[ M-] stack  M-y copy"     # the keys of hyperbeam.conf, shown in the menu and in the status bar
+# The keys of hyperbeam.conf (keep in sync with it). Shown in the menu's button bar and Settings tab and in the status bar.
+KEYS = [("M-Left/Right/Up/Down", "select pane"), ("M-z", "zoom / unzoom the pane"),
+        ("M-]", "next session in the stack"), ("M-[", "previous session in the stack"),
+        ("M-y", "copy pane scrollback (clipboard; outbox over SSH)")]
+USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select pane"), ("C-a H J K L", "resize pane"),
+             ("M-n / M-p", "next / previous window"), ("C-a w", "window tree"), ("C-a [", "copy mode (v select, y copy)"),
+             ("M-`", "mouse on/off"), ("C-a r", "reload tmux.conf")]
+HINT = "M-arrows pane  M-z zoom  M-[ M-] stack  M-y copy"
+
+
+def open_mode():
+    """"switch" (default) or "window"; read from config.toml each time so the Settings toggle takes effect at once."""
+    try:
+        m = tomllib.loads(CONFIG_FILE.read_text()).get("open_mode", "switch")
+    except (OSError, tomllib.TOMLDecodeError):
+        m = "switch"
+    return m if m in ("switch", "window") else "switch"
+
+
+def set_open_mode(mode):
+    """Write open_mode to config.toml, keeping the rest of the file (comments) as it is."""
+    text = CONFIG_FILE.read_text()
+    line = f'open_mode = "{mode}"'
+    if re.search(r"^open_mode\s*=.*$", text, flags=re.M):
+        text = re.sub(r"^open_mode\s*=.*$", line, text, flags=re.M)
+    else:
+        text = text.rstrip("\n") + f'\n# "switch": Open switches this client to the project. "window": a new kitty window per project (at the laptop).\n{line}\n'
+    CONFIG_FILE.write_text(text)
 
 
 def run(*a):
@@ -59,9 +87,8 @@ def tmux(*a, check=True):
 
 
 def sanitize(name):
-    """tmux session name of a project. The project called "hyperbeam" must not take the menu's session name."""
-    s = re.sub(r"[.:]", "_", name)
-    return "hyperbeam-project" if s == MENU else s
+    """tmux session name of a project. The project called "hyperbeam" is the menu session itself."""
+    return re.sub(r"[.:]", "_", name)
 
 
 def home_rel(p):
@@ -255,33 +282,58 @@ def send_line(target, text):
     tmux("send-keys", "-t", target, "Enter")
 
 
+def new_pane(args, cmd=None):
+    """Run a tmux command that creates a pane (new-session, split-window) and return the new pane's id."""
+    return tmux(*args, "-P", "-F", "#{pane_id}", *([cmd] if cmd else [])).stdout.strip()
+
+
+def ensure_menu():
+    """The `hyperbeam` session: menu on the left, Claude (in ~/projects/hyperbeam) top right, a shell bottom right.
+    Splits are percentages, so the layout scales when a client of another size attaches."""
+    if session_exists(MENU):
+        return
+    clean_server_env()
+    menu = new_pane(["new-session", "-d", "-s", MENU, "-n", "hyperbeam", "-x", "200", "-y", "50", "-c", str(HERE),
+                     "-e", "HB_PROJECT=hyperbeam", "-e", "HOST=0.0.0.0"],
+                    f"{SELF} _menu; echo; echo '[hyperbeam] menu exited, press Enter'; read")
+    claude = new_pane(["split-window", "-h", "-l", "45%", "-t", menu, "-c", str(HERE)])
+    shell = new_pane(["split-window", "-v", "-l", "40%", "-t", claude, "-c", str(HERE)])
+    send_line(claude, "claude")
+    tmux("select-pane", "-t", menu)
+    tag_session(MENU)
+
+
 def start_session(name, man, say=print, path=None, reason=None):
     """Create the project's session. Without a manifest (man is None), or if a service fails, or if `reason` is given
-    (Onboard), the claude window starts with the investigate prompt instead of plain `claude`."""
+    (Onboard), Claude starts with the investigate prompt instead of plain `claude`.
+    Window `work`: Claude on the left, a shell on the right (it runs the warnings, then `kk`); then one window per service."""
     sess = sanitize(name)
+    if sess == MENU:
+        return ensure_menu()
     path = manifest_path(man) if man else Path(path)
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
     env = session_env(man, name)
     clean_server_env()
     envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
-    tmux("new-session", "-d", "-s", sess, "-n", "claude", "-c", str(path), *envargs)
+    claude = new_pane(["new-session", "-d", "-s", sess, "-n", "work", "-x", "200", "-y", "50", "-c", str(path), *envargs])
+    shell = new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(path)])
+    tmux("select-pane", "-t", claude)
     tag_session(sess)
     services = man.get("service", []) if man else []
     if services:
-        send_line(f"{sess}:claude", "echo '[hyperbeam] starting services; Claude starts when they are done'")
-    tmux("new-window", "-t", f"{sess}:", "-n", "shell", "-c", str(path))
-    send_line(f"{sess}:shell", f"clear; {SELF} _warn {shlex.quote(str(path))}")
+        send_line(claude, "echo '[hyperbeam] starting services; Claude starts when they are done'")
     failures = []
     for svc in services:
         win = svc["name"]
-        tmux("new-window", "-t", f"{sess}:", "-n", win, "-c", str(path))
+        tmux("new-window", "-d", "-t", f"{sess}:", "-n", win, "-c", str(path))
         send_line(f"{sess}:{win}", f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
         say(f"{name}: started {win}, waiting...")
         result = wait_ready(sess, win, svc, man.get("port"))
         say(f"{name}: {win}: {result}")
         if result.startswith("WARNING"):
             failures.append(dict(name=win, result=result, tail=pane_tail(f"{sess}:{win}")))
+    send_line(shell, f"clear; {SELF} _warn {shlex.quote(str(path))}; {SELF} info {shlex.quote(name)}")
     if man is None:
         reason = reason or "no manifest"
     elif failures:
@@ -291,8 +343,8 @@ def start_session(name, man, say=print, path=None, reason=None):
         say(f"{name}: {reason}; Claude starts with the investigate prompt")
     else:
         cmd = claude_cmd()
-    send_line(f"{sess}:claude", cmd)
-    tmux("select-window", "-t", f"{sess}:claude")
+    send_line(claude, cmd)
+    tmux("select-window", "-t", f"{sess}:work")
     say(f"{name}: session ready" + (f" (PORT={man['port']})" if man and man.get("port") else ""))
 
 
@@ -321,8 +373,8 @@ def project_ports(man):
 def stop_project(name, man, say=print):
     """Run `stop` commands in reverse order, kill the session, confirm the ports are closed."""
     sess = sanitize(name)
-    if own_session() == sess:
-        raise RuntimeError(f"this menu is running inside {sess}; run Stop from another terminal")
+    if sess == MENU or own_session() == sess:
+        raise RuntimeError(f"{sess} is the menu session (the menu, Claude and a shell for hyperbeam itself); stop it with `tmux kill-session -t {sess}`")
     path = manifest_path(man) if man else None
     env = dict(os.environ, **session_env(man, name))
     for svc in reversed(man.get("service", []) if man else []):
@@ -364,20 +416,45 @@ def attach_here(sess):
 
 
 # ---------- the menu session, the stack, copy ----------
-def menu_client():
-    """The client that is looking at the menu session (the most recently active one), or ''."""
-    rows = [l.split(None, 1) for l in tmux("list-clients", "-t", f"={MENU}", "-F", "#{client_activity} #{client_name}",
+def menu_client(field="client_name"):
+    """The client that is looking at the menu session (the most recently active one): its name (tty) or another format field; '' if none."""
+    rows = [l.split(None, 1) for l in tmux("list-clients", "-t", f"={MENU}", "-F", "#{client_activity} #{" + field + "}",
                                           check=False).stdout.splitlines()]
     rows = [r for r in rows if len(r) == 2]
     return max(rows, key=lambda r: int(r[0]))[1] if rows else ""
 
 
+def display_env():
+    """Environment for a GUI program started from the tmux server (which may have been started over SSH): remove TMUX, find the Wayland socket."""
+    env = dict(os.environ)
+    env.pop("TMUX", None)
+    rt = env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not env.get("WAYLAND_DISPLAY") and not env.get("DISPLAY"):
+        socks = [x for x in sorted(Path(rt).glob("wayland-[0-9]*")) if not x.name.endswith(".lock")]
+        if socks:
+            env["WAYLAND_DISPLAY"] = socks[0].name
+    return env
+
+
+def spawn_kitty(sess):
+    """open_mode = "window": a new kitty window attached to the session. HB_KITTY_ARGS adds kitty options (used by tests)."""
+    subprocess.Popen(["kitty", "--title", f"hyperbeam: {sess}", *shlex.split(os.environ.get("HB_KITTY_ARGS", "")),
+                      "tmux", "attach", "-t", f"={sess}"],
+                     env=display_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def show_session(sess):
-    """Switch the client that is looking at the menu to `sess`."""
-    c = menu_client()
-    if not c:
+    """Show a session. switch mode (default), or window mode over SSH (no kitty to open): switch the client that is looking at the menu.
+    window mode at the laptop: a new kitty window. Returns what it did."""
+    pid = menu_client("client_pid")
+    if not pid:
         raise RuntimeError("no client is attached to the menu session")
-    tmux("switch-client", "-c", c, "-t", f"={sess}")
+    if open_mode() == "window" and not client_is_remote(pid):
+        spawn_kitty(sess)
+        return "new kitty window"
+    tmux("switch-client", "-c", menu_client(), "-t", f"={sess}")
+    return "switched"
 
 
 def source_conf():
@@ -482,9 +559,7 @@ def cmd_menu(_):
     """`hyperbeam` with no arguments: attach to the menu session (creating it if needed)."""
     if own_session() == MENU:
         return run_menu()
-    if not session_exists(MENU):
-        tmux("new-session", "-d", "-s", MENU, "-n", "menu", f"{SELF} _menu; echo; echo '[hyperbeam] menu exited, press Enter'; read")
-        tag_session(MENU)
+    ensure_menu()
     source_conf()
     return attach_here(MENU)
 
@@ -840,7 +915,10 @@ def cmd_stop(args):
     man = load_manifests().get(args.name)
     if man is None and not session_exists(sanitize(args.name)):
         sys.exit(f"hyperbeam: {args.name} has no manifest and is not running")
-    sys.exit(0 if stop_project(args.name, man) else 1)
+    try:
+        sys.exit(0 if stop_project(args.name, man) else 1)
+    except RuntimeError as e:
+        sys.exit(f"hyperbeam: {e}")
 
 
 def cmd_warn(args):
@@ -857,14 +935,11 @@ def cmd_warn(args):
         warns.append("no CLAUDE.md")
     for w in warns:
         print(f"\033[33mhyperbeam: warning: {w}\033[0m")
-    if not warns:
-        print("hyperbeam: no warnings")
-    print(f"PORT={os.environ.get('PORT', '-')}  dir={p}")
 
 
 # ---------- the menu ----------
 TABS = [("running", "Running"), ("recent", "Recent"), ("mine", "Mine"), ("others", "Others"),
-        ("unconfigured", "Not configured")]
+        ("unconfigured", "Not configured"), ("settings", "Settings")]
 
 
 class Confirm(ModalScreen):
@@ -909,7 +984,7 @@ class Menu(App):
     #keys { width: auto; height: 1; padding: 0 1; color: $text-muted; }
     #hint { height: 1; padding: 0 1; color: $text-muted; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"),
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("m", "mode", "Mode"),
                 Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit"),
                 Binding("left", "tab(-1)", "prev tab", show=False), Binding("right", "tab(1)", "next tab", show=False)]
 
@@ -927,7 +1002,7 @@ class Menu(App):
         yield Static("Loading projects...", id="notice", markup=False)
         with Horizontal(id="buttons"):
             for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("onboard", "Onboard (b)"),
-                               ("info", "Info (i)"), ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
+                               ("info", "Info (i)"), ("mode", f"Mode: {open_mode()} (m)"), ("refresh", "Refresh (r)"), ("quit", "Quit (q)")]:
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
@@ -986,10 +1061,40 @@ class Menu(App):
             return [p for p in P if p["owner"] == "mine"]
         if t == "others":
             return [p for p in P if p["owner"] != "mine"]
+        if t == "settings":
+            return []
         return [p for p in P if not p["manifest"]]
+
+    def render_settings(self):
+        ol = self.query_one("#list", OptionList)
+        ol.clear_options()
+        ol.add_option(Option(Text(f"  open mode: {open_mode()}   (Enter or Mode (m) toggles it)", style="bold"), id="open_mode"))
+        mode_help = {"switch": "Open switches this terminal to the project (also over SSH).",
+                     "window": "Open starts a new kitty window per project at the laptop (over SSH it switches)."}
+        ol.add_option(Option(Text("      " + mode_help[open_mode()], style="dim"), disabled=True))
+        for title, keys in (("hyperbeam keys (no prefix)", KEYS), ("your tmux keys (prefix is C-a)", USER_KEYS)):
+            ol.add_option(Option(Text(f"\n  {title}", style="bold cyan"), disabled=True))
+            for k, d in keys:
+                ol.add_option(Option(Text(f"    {k:<22}{d}"), disabled=True))
+        ol.add_option(Option(Text("\n  Mouse: click a pane to select it; drag to select text and copy it (Shift+drag: kitty's selection).", style="dim"), disabled=True))
+        ol.highlighted = 0
+
+    def toggle_mode(self):
+        set_open_mode("window" if open_mode() == "switch" else "switch")
+        self.query_one("#b-mode", Button).label = f"Mode: {open_mode()} (m)"
+        if self.tab == "settings":
+            self.render_settings()
+        self.say(f"open mode: {open_mode()} (saved in config.toml)")
+
+    def action_mode(self):
+        self.toggle_mode()
 
     def render_list(self):
         ol = self.query_one("#list", OptionList)
+        if self.tab == "settings":
+            self.render_settings()
+            self.show_detail()
+            return
         keep = self.current()
         ol.clear_options()
         rows = self.visible()
@@ -1015,7 +1120,7 @@ class Menu(App):
                   "others": sum(p["owner"] != "mine" for p in self.projects),
                   "unconfigured": sum(not p["manifest"] for p in self.projects)}
         for key, label in TABS:
-            self.query_one(f"#t-{key}", Tab).label = f"{label} ({counts[key]})"
+            self.query_one(f"#t-{key}", Tab).label = f"{label} ({counts[key]})" if key in counts else label
         self.show_detail()
 
     def current(self):
@@ -1054,6 +1159,8 @@ class Menu(App):
         self.show_detail()
 
     def on_option_list_option_selected(self, event):
+        if self.tab == "settings":
+            return self.toggle_mode() if event.option.id == "open_mode" else None
         self.action_open()
 
     def on_button_pressed(self, event):
@@ -1085,8 +1192,8 @@ class Menu(App):
             elif onboard:
                 investigate_window(name, p["path"], "Onboard requested; the session was already running")
             touch_opened(name)
-            show_session(sess)
-            self.say_from_thread(f"{name}: switched ({HINT})")
+            how = show_session(sess)
+            self.say_from_thread(f"{name}: {how} ({HINT})")
         except Exception as e:
             self.say_from_thread(f"{name}: ERROR {e}")
         finally:
