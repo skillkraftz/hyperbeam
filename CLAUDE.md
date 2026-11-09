@@ -27,9 +27,17 @@ without PATH. `config.toml` holds the GitHub accounts that count as "mine".
 - `hyperbeam scan`: table of every git repo under ~/projects (any depth, skipping node_modules, .venv, target, dist, build...) plus top-level folders without git.
 - `hyperbeam open NAME [-d]`: start the project's session if needed (no manifest: investigate prompt, see Open) and attach in this terminal (`-d`: don't attach).
 - `hyperbeam stop NAME`: the Stop action without the menu.
+- `hyperbeam info [NAME]` = `kk` (`ln -sfn ~/projects/hyperbeam/hyperbeam ~/.local/bin/kk`; the script checks its own name; no `kk`/`hb-info` existed before): the project's URLs and endpoints, discovered, plain text, one value per line (a label may follow after two spaces).
+  NAME defaults to $HB_PROJECT, which every session has. Sections, each skipped if it doesn't apply: Services (up/down), App (ports
+  listened on by processes inside the project's session), Tailscale (those ports if not loopback-only, docker published ports, supabase URLs),
+  Docker (containers matched by the compose `working_dir` label or the supabase CLI `workdir` label), Supabase (`supabase status -o json`,
+  URL values only, only when the project's supabase containers run; plus the linked project's dashboard URL), Vercel (project name from
+  `.vercel/project.json`/`repo.json`; the production URL needs `vercel login`, but the GitHub repo homepage often has it), Git (web URL, GitHub homepage via
+  `gh`), .env (URL-valued variables of `.env*` except examples; passwords masked unless the host is this machine), Extra (`[links]`).
+  The menu's Info (i) button opens the same text in a plain tmux window (Enter closes it), so mouse-drag copy works.
 - `hyperbeam list`: numbered running project sessions, most recent first, with port, up/down, the Tailscale URL (and the local URL at the
   laptop). A number switches (inside tmux) or attaches (outside); q quits (single keypress up to 9 sessions). Also the status view. The
-  session you are in is marked `(here)`. Only sessions with a manifest are listed.
+  session you are in is marked `(here)`. Every hyperbeam session is listed (tagged `@hb`, or with a manifest); without a manifest or port it shows `no port`.
 - `hyperbeam phone`: for SSH from the phone. Prints the same URL list, then attaches/switches to the most recently used running session
   (not the current one). If nothing runs it says so and points at `list` and the menu.
 
@@ -53,7 +61,7 @@ Arrows move the selection, left/right change tab, Enter or a click on a row open
   WAIT for approval before writing projects/<name>.toml, list project changes, not commit.
 - **Refresh (r)**, **Quit (q)**: Quit detaches the client; the menu keeps running in its session. Action results stay on screen until you press Refresh.
 
-`open` creates session `<name>` with `PORT`, `HB_PORT`, `HOST=0.0.0.0` and the manifest's `[env]` in its environment (no manifest: only HOST), and windows: `claude`, `shell` (prints warnings: no git, no remote,
+`open` creates session `<name>` with `HB_PROJECT=<name>`, `PORT`, `HB_PORT` (if the project has a port), `HOST=0.0.0.0` and the manifest's `[env]` in its environment (no manifest: only HOST), and windows: `claude`, `shell` (prints warnings: no git, no remote,
 uncommitted changes, no CLAUDE.md), then one window per service. A service starts only after the previous one is ready, and Claude starts in the `claude` window after the last one. The window output is the log.
 
 ## Stack, copy, mouse (hyperbeam.conf, no prefix)
@@ -68,7 +76,7 @@ uncommitted changes, no CLAUDE.md), then one window per service. A service start
 - Window positioning: GNOME/Wayland gives clients no way to place windows. A kitty started with `-o linux_display_server=x11` is an Xwayland window and can be moved with XMoveWindow (tested: lands on the far-left monitor, X focus unchanged). Not used by hyperbeam.
 
 ## Manifest format
-`projects/<name>.toml` in this repo (not in the project). Written by Claude through Onboard (there is no heuristic drafting). Ports start at 3100 and never repeat across manifests.
+`projects/<name>.toml` in this repo (not in the project). Written by Claude through Onboard (there is no heuristic drafting). `port` is optional: a project with nothing to serve has none, and then no PORT/HB_PORT is set. Ports start at 3100 and never repeat across manifests.
 
 ```toml
 path = "~/projects/plantlab"
@@ -88,6 +96,9 @@ ready_timeout = 60         # optional: give up waiting after N seconds (default 
 
 [env]                      # optional: extra session env, overrides the defaults (HOST=0.0.0.0)
 SOME_VAR = "value"
+
+[links]                    # optional: extras `kk` cannot discover; name = url
+docs = "https://example.com/docs"
 ```
 A service that exits before its port opens is reported as a warning and the next one still starts.
 
@@ -111,7 +122,13 @@ interfaces, so each manifest makes that so, never the project:
 A fake remote client: a private sshd (`sshd -f` with its own host key, authorized_keys, 127.0.0.1:<port>, run as yourself) and `ssh -tt ... tmux attach`.
 Drive clients through a pty, not by `tmux send-keys` (that bypasses the client). Never `pkill -f` a pattern that appears in your own command line. A Textual pilot script can import the file with `importlib` (`SourceFileLoader`) and click the widgets.
 
+## Environment
+`uv run --script` puts VIRTUAL_ENV, UV, UV_RUN_RECURSION_DEPTH and `~/.cache/uv/environments-*/bin` first in PATH into hyperbeam's environment, and a tmux server started by
+hyperbeam keeps it in its global environment, so every session inherited it (`python` was hyperbeam's). The script now strips those at startup, and `start_session`
+removes them from an already-running server's global environment. Verified on a server started with a fake VIRTUAL_ENV/UV: new sessions have none of them and `python` is /usr/bin/python.
+
 ## Gotchas
+- `supabase status` prints keys and secrets next to URLs; never print its raw output, only URL values (`-o json`, stdout only).
 - pnpm 12 installs dependencies by itself on `pnpm dev`. Opening a project whose node_modules is missing therefore modifies it.
 - `claude "prompt"` starts an interactive session with that first prompt (`claude --help`); `-n` names it, `-c` continues, `-r` resumes.
 - Textual parses `[x]` in labels as markup: write shortcuts as `Open (o)`.
