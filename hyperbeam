@@ -738,10 +738,110 @@ def onboarded_on(name, path):
         return ""
 
 
+# ---------- stale docs: do README.md / CLAUDE.md still match the project? (no tokens: three cheap checks) ----------
+DOC_FILES = ("README.md", "CLAUDE.md")
+GENERATED = ("node_modules", "dist", "build", ".venv", "venv", ".hyperbeam", ".next", "target", "__pycache__", ".git", "coverage")
+PM_BUILTINS = {"install", "i", "ci", "add", "remove", "rm", "update", "up", "upgrade", "exec", "dlx", "create", "init", "publish", "link", "unlink", "import",
+               "test", "start", "run", "store", "patch", "outdated", "audit", "why", "list", "ls", "env", "config", "setup", "self-update", "help", "version", "x", "cache",
+               "login", "logout", "pack", "prune", "rebuild", "restart", "stop", "view", "info", "fund", "doctor", "explain", "set", "get"}
+CMD_RE = re.compile(r"(?:^|[\s;&|(])(?:(?:npm|pnpm|yarn|bun)\s+run\s+([A-Za-z0-9:_.-]+)|(?:pnpm|yarn)\s+([A-Za-z][A-Za-z0-9:_-]*)|make\s+([A-Za-z][A-Za-z0-9_.-]*))")
+PATH_RE = re.compile(r"^(?:\./)?[A-Za-z0-9_][A-Za-z0-9_.@-]*(?:/[A-Za-z0-9_.@-]+)*/?$")
+DOC_EXT = (".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".toml", ".json", ".md", ".sh", ".yml", ".yaml", ".css", ".html")
+STALE_AGE_COMMITS = 5
+
+
+def stale_doc_items(path):
+    """[(doc, what)] for README.md and CLAUDE.md: commands they tell you to run that don't exist (`npm run X`, `pnpm X`, `make X`: X is not a script
+    or target), relative paths in backticks that aren't in the repo, and docs that were last updated 5+ commits (touching package.json, compose files,
+    pyproject, Makefile... the run-defining files) ago. Needs a git repo; nothing for a doc that isn't there."""
+    path = Path(path)
+    if not (path / ".git").exists():
+        return []
+    docs = [d for d in DOC_FILES if (path / d).is_file()]
+    if not docs:
+        return []
+    fp = fingerprint(path)
+    scripts = set(fp.get("package.json", {}).get("scripts", {}))
+    targets = set(fp.get("Makefile", {}).get("targets", []))
+    tracked = set(git_out(path, "ls-files").splitlines())
+    items = []
+    for d in docs:
+        text = (path / d).read_text(errors="replace")
+        fenced = re.findall(r"```[^\n]*\n(.*?)```", text, re.S)
+        inline = re.findall(r"`([^`\n]+)`", re.sub(r"```.*?```", "", text, flags=re.S))
+        seen = set()
+        for snippet in [*inline, *[l for blk in fenced for l in blk.splitlines()]]:
+            for m in CMD_RE.finditer(snippet):
+                run_name, pm_name, make_name = m.groups()
+                if run_name and "package.json" in fp and run_name not in scripts:
+                    what = f"'{snippet.strip()[:40]}' (no script {run_name})"
+                elif pm_name and "package.json" in fp and pm_name not in PM_BUILTINS and pm_name not in scripts:
+                    what = f"'{snippet.strip()[:40]}' (no script {pm_name})"
+                elif make_name and "Makefile" in fp and make_name not in targets:
+                    what = f"'make {make_name}' (no such target)"
+                else:
+                    continue
+                if what not in seen:
+                    seen.add(what)
+                    items.append((d, f"mentions {what}"))
+        for sp in inline:
+            sp = sp.strip()
+            if not PATH_RE.match(sp) or sp.startswith(("/", "~")) or sp.split("/")[0] in GENERATED or sp in seen:
+                continue
+            if "/" not in sp and not sp.lower().endswith(DOC_EXT):
+                continue
+            if sp.startswith(".") and "/" not in sp:
+                continue
+            q = sp[2:] if sp.startswith("./") else sp
+            if q in tracked or any(f.startswith(q.rstrip("/") + "/") for f in tracked) or (path / q).exists():
+                continue
+            seen.add(sp)
+            items.append((d, f"names {sp} (missing)"))
+    files = [f for f in fp if (path / f).exists()]
+    for d in docs:
+        last = git_out(path, "log", "-1", "--format=%H", "--", d)
+        if last and files:
+            n = git_out(path, "rev-list", "--count", f"{last}..HEAD", "--", *files)
+            if n.isdigit() and int(n) >= STALE_AGE_COMMITS:
+                items.append((d, f"was last updated {n} commits that changed how the project runs ago"))
+    return items
+
+
+def stale_doc_notes(name, path):
+    """One quiet note (the first three findings) when the docs look stale; [] otherwise. Never red."""
+    try:
+        items = stale_doc_items(path)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if not items:
+        return []
+    shown = "; ".join(f"{d} {w}" for d, w in items[:3]) + (f" (+{len(items) - 3} more)" if len(items) > 3 else "")
+    return [f"docs may be stale: {shown} (Onboard runs the alignment check)"]
+
+
+def write_wrapup_note(name, r):
+    """A wrap-up check that found something is kept as <project data>/notes/YYYY-MM-DD-wrapup.md (overwritten the same day): the findings, with
+    secrets as file, line and pattern only. A clean check writes nothing. -> the file or None."""
+    if wrapup_clean(r):
+        return None
+    try:
+        d = project_dir(name, r["path"]) / "notes"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{time.strftime('%Y-%m-%d')}-wrapup.md"
+        L = [f"# Wrap-up notes for {name}, {time.strftime('%Y-%m-%d %H:%M')}", "", f"branch: {branch_of(r['path'])}", ""]
+        for title, key in (("git", "git"), ("steno files (personal notes: never commit)", "steno"), ("secrets (file, line, pattern; never values)", "secrets")):
+            if r.get(key):
+                L += [f"## {title}"] + [f"- {x}" for x in r[key]] + [""]
+        f.write_text("\n".join(L))
+        return f
+    except OSError:
+        return None
+
+
 def recheck(name, path):
     """Refresh: run the git checks again and store the result, so a red dot clears when the problem is gone."""
     red, notes = git_red_notes(path, fetch=False, behind=False)
-    write_status(name, red, [*drift_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
+    write_status(name, red, [*drift_notes(name, path), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
 
 
 def claude_state(name):
@@ -1172,7 +1272,7 @@ def start_check(name, path, fetch=True):
     """(red, notes) on Open. Only red problems make Open offer Claude; a crash (saved layout not clean) is a note, like the git state."""
     red, notes = git_red_notes(path, fetch)
     crash = crash_note(name)
-    return red, drift_notes(name, path) + ([crash] if crash else []) + notes
+    return red, drift_notes(name, path) + stale_doc_notes(name, path) + ([crash] if crash else []) + notes
 
 
 # ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
@@ -1331,7 +1431,10 @@ def session_since(name):
 
 def check_project(name):
     p = project_path(name)
-    return wrapup_check(name, p, session_since(name)) if p else None
+    r = wrapup_check(name, p, session_since(name)) if p else None
+    if r:
+        write_wrapup_note(name, r)          # a check that found something is kept in .hyperbeam/notes, whatever the user picks next
+    return r
 
 
 def ask_tty(text):
@@ -2584,6 +2687,8 @@ def align_facts(path):
             for i, l in enumerate(f.read_text(errors="replace").splitlines(), 1):
                 if re.search(r"\b(not public|private repo|private repository|closed[- ]source|internal only|public repo|open[- ]source|is public|is private)\b", l, re.I):
                     claims.append(f"{fn}:{i}: {l.strip()[:140]}")
+    stale = stale_doc_items(path)
+    out.append("docs that may be stale (commands/paths that don't exist, docs older than the setup): " + ("; ".join(f"{d} {w}" for d, w in stale[:8]) or "none found"))
     out.append("lines that claim public/private" + (f" (real visibility: {vis})" if vis else "") + ": " + ("; ".join(claims[:6]) or "none"))
     return "\n".join(f"- {x}" for x in out)
 
@@ -3439,6 +3544,11 @@ def project_summary(name, path, st=None, prs=None):
     L += ["", f"onboarded: {when or ('never (no manifest)' if not man else 'not yet recorded')}"]
     drift = next((x for x in (notes if running else drift_notes(name, path)) if x.startswith("setup changed")), "")
     L += [f"drift: {drift if drift else 'none'}"] if man else []
+    stale = next((x for x in (notes if running else stale_doc_notes(name, path)) if x.startswith("docs may be stale")), "")
+    L += [f"docs: {stale if stale else 'look current'}"]
+    nd = project_dir(name, path) / "notes"
+    nf = sorted(nd.glob("*.md")) if nd.is_dir() else []
+    L += [f"notes folder (.hyperbeam/notes): {len(nf)} file{'s' * (len(nf) != 1)}" + (f", latest {nf[-1].name}" if nf else "")]
     return "\n".join(L)
 
 
