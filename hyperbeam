@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, asyncio, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
+import argparse, asyncio, hashlib, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1428,13 +1428,68 @@ def pid_alive(pid, word):
         return False
 
 
+def sidebar_menu_alive():
+    """Is a sidebar menu process (pid file written by run_menu) running?"""
+    for f in MENU_PIDS.glob("*"):
+        try:
+            if json.loads(f.read_text()).get("sidebar") and Path(f"/proc/{int(f.name)}").exists():
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def sidebar_healthy(grace=8):
+    """Both halves of an open sidebar window are there: the menu (left) and the tmux client (right). A window that was opened a moment ago
+    is given time to start; a menu between two restarts gets a few seconds."""
+    if time.time() - sidebar_read().get("started", 0) < grace:
+        return True
+    for _ in range(6):
+        if sidebar_client() and sidebar_menu_alive():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def close_sidebar(wait=3.0):
+    """Close the whole sidebar kitty window (both halves): remote control (close all its tabs), else SIGTERM to that kitty (its pid is checked
+    to be the sidebar's). The tmux sessions are not touched: the right client just detaches. Returns True if the window is gone."""
+    kp = sidebar_read().get("kitty_pid", 0)
+    if not pid_alive(kp, "hyperbeam-sidebar"):
+        return True
+    try:
+        kitten_sidebar("close-tab", "--match", "all", check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    end = time.time() + wait
+    while time.time() < end and pid_alive(kp, "hyperbeam-sidebar"):
+        time.sleep(0.2)
+    if pid_alive(kp, "hyperbeam-sidebar"):
+        os.kill(kp, signal.SIGTERM)
+        end = time.time() + wait
+        while time.time() < end and pid_alive(kp, "hyperbeam-sidebar"):
+            time.sleep(0.2)
+    return not pid_alive(kp, "hyperbeam-sidebar")
+
+
+def cmd_close_sidebar(_):
+    time.sleep(1)           # the menu that asked is inside the window: let it finish its last message
+    close_sidebar()
+
+
 def launch_sidebar():
-    """Open the sidebar kitty window (once: if one is open already, say so). The hyperbeam session is created first so both sides find it."""
+    """Open the sidebar kitty window (once: if one is open and whole, say so; a half-open one, menu without the right side or the reverse,
+    is closed and opened again). The hyperbeam session is created first so both sides find it."""
     kitty_guard()
     ensure_menu()
     source_conf()
+    repaired = False
     if pid_alive(sidebar_read().get("kitty_pid", 0), "hyperbeam-sidebar"):
-        return "the sidebar window is already open"
+        if sidebar_healthy():
+            return "the sidebar window is already open"
+        if not close_sidebar():
+            return "the sidebar window is half open and could not be closed: close it by hand, then press the hotkey again"
+        repaired = True
     f = STATE_DIR / "sidebar.session"
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(sidebar_session_file())
@@ -1442,8 +1497,8 @@ def launch_sidebar():
                              "-o", "allow_remote_control=socket-only", "-o", "enabled_layouts=splits,stack", "--listen-on", f"unix:{display_env()['XDG_RUNTIME_DIR']}/hyperbeam-sidebar",
                              "--session", str(f)],
                             env=display_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    sidebar_update(kitty_pid=proc.pid)
-    return "opened the sidebar window"
+    sidebar_update(kitty_pid=proc.pid, started=time.time(), tty="")
+    return "the sidebar window was half open: closed it and opened a new one" if repaired else "opened the sidebar window"
 
 
 SIDEBAR_SOCK = lambda: f"unix:{display_env()['XDG_RUNTIME_DIR']}/hyperbeam-sidebar"
@@ -1481,6 +1536,118 @@ def cmd_sidebar(a):
         tmux_msg(a.client, msg)
     else:
         print(msg)
+
+
+# ---------- the lab: agent testing runs as the user `hblab`, whose home is a disk image (see lab/setup.sh) ----------
+LAB_USER, LAB_HOME, LAB_DISPLAY = "hblab", Path("/srv/hblab"), ":99"
+LAB_SETUP = (f"The lab is not set up yet. Read {HERE}/lab/setup.sh, then run it once:  sudo bash {HERE}/lab/setup.sh\n"
+             "(it creates the user hblab, a 10G disk image mounted at /srv/hblab, and a sudo rule that lets you run commands as hblab only).")
+
+
+def lab_ready():
+    """None if the lab works, else the reason it doesn't (and what to do)."""
+    try:
+        pwd.getpwnam(LAB_USER)
+    except KeyError:
+        return LAB_SETUP
+    if not os.path.ismount(LAB_HOME):
+        return f"The lab user exists but {LAB_HOME} is not mounted. Try: sudo mount {LAB_HOME}  (or run {HERE}/lab/setup.sh again)."
+    if subprocess.run(["sudo", "-n", "-u", LAB_USER, "true"], capture_output=True, stdin=subprocess.DEVNULL).returncode:
+        return f"sudo may not run commands as {LAB_USER} without a password: run {HERE}/lab/setup.sh again (it writes /etc/sudoers.d/hyperbeam-lab)."
+    return None
+
+
+def lab_sudo(*args):
+    return ["sudo", "-n", "-H", "-u", LAB_USER, *args]
+
+
+def lab_pids():
+    """Pids of processes owned by hblab (chosen by owner, so nothing of the user's can be in the list)."""
+    uid, out = pwd.getpwnam(LAB_USER).pw_uid, []
+    for p in Path("/proc").iterdir():
+        try:
+            if p.name.isdigit() and p.stat().st_uid == uid:
+                out.append(int(p.name))
+        except OSError:
+            pass
+    return out
+
+
+def lab_xvfb():
+    """Make sure the lab's virtual display (Xvfb on :99, run as hblab, no network) is up. False if Xvfb isn't installed."""
+    sock = Path("/tmp/.X11-unix/X99")
+    if sock.exists():
+        return True
+    if not shutil.which("Xvfb"):
+        return False
+    subprocess.run(lab_sudo("setsid", "-f", "sh", "-c", f"exec Xvfb {LAB_DISPLAY} -screen 0 1280x800x24 -nolisten tcp >{LAB_HOME}/xvfb.log 2>&1"),
+                   stdin=subprocess.DEVNULL, capture_output=True)
+    for _ in range(25):
+        if sock.exists():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def cmd_lab(a):
+    """hyperbeam lab run|reset|status. The code goes in as a copy; everything runs as hblab (it can't signal the user's processes)."""
+    msg = lab_ready()
+    if msg:
+        print(msg)
+        return 2
+    if a.action == "status":
+        u = shutil.disk_usage(LAB_HOME)
+        img = Path("/var/lib/hyperbeam-lab.img")
+        print(f"lab: user {LAB_USER}, {LAB_HOME} mounted; disk {u.used / 2**30:.1f} of {u.total / 2**30:.1f} GB used"
+              + (f" (image file {img.stat().st_size / 2**30:.0f} GB)" if img.exists() else ""))
+        runs = sorted(p.name for p in (LAB_HOME / "run").iterdir()) if (LAB_HOME / "run").is_dir() else []
+        print(f"run directories: {', '.join(runs) or 'none'}")
+        print(f"virtual display {LAB_DISPLAY}: " + ("up" if Path("/tmp/.X11-unix/X99").exists() else "not running (starts with the next `lab run`)"))
+        ps = subprocess.run(["ps", "-u", LAB_USER, "-o", "pid,etime,args"], capture_output=True, text=True).stdout.strip()
+        print("processes:\n" + (ps if len(ps.splitlines()) > 1 else "  none"))
+        return 0
+    if a.action == "reset":
+        if not os.path.ismount(LAB_HOME):
+            print("refusing to wipe: the lab disk is not mounted")
+            return 1
+        for _ in range(3):
+            pids = lab_pids()
+            if not pids:
+                break
+            subprocess.run(lab_sudo("kill", "-KILL", *map(str, pids)), capture_output=True, stdin=subprocess.DEVNULL)
+            time.sleep(0.5)
+        subprocess.run(lab_sudo("sh", "-c", f"rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock; find {LAB_HOME} -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {{}} +"),
+                       capture_output=True, stdin=subprocess.DEVNULL)
+        print(f"lab reset: hblab's processes stopped, {LAB_HOME} emptied")
+        return 0
+    cmd = [c for c in a.cmd if c != "--"] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        print("usage: hyperbeam lab run [--dir DIR] [--name NAME] [--timeout SECONDS] [--] COMMAND...  (one argument = a shell command line)")
+        return 2
+    src = Path(a.dir or os.getcwd()).resolve()
+    if src in (Path("/"), Path.home()):
+        print(f"refusing to copy {src} into the lab: give the project or worktree directory")
+        return 2
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", a.name or src.name)
+    dest = f"{LAB_HOME}/run/{name}"
+    subprocess.run(lab_sudo("sh", "-c", 'mkdir -p -m700 "$1/rt" "$1/tmux" "$1/run" && rm -rf -- "$2" && mkdir -p "$2"', "_", str(LAB_HOME), dest), check=True, stdin=subprocess.DEVNULL)
+    tar = subprocess.Popen(["tar", "-C", str(src), "--exclude=.git", "--exclude=node_modules", "--exclude=__pycache__", "--exclude=.venv", "-cf", "-", "."],
+                           stdout=subprocess.PIPE)
+    subprocess.run(lab_sudo("tar", "-C", dest, "-xf", "-"), stdin=tar.stdout, check=True)
+    tar.wait()
+    env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+           "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt",
+           "HB_LAB": "1"}
+    if lab_xvfb():
+        env["DISPLAY"] = LAB_DISPLAY
+    else:
+        print("(lab: no virtual display: install xvfb; GUI tests will fail to open)", file=sys.stderr)
+    script = ('cd "$1" || exit 97; shift; t="$1"; shift; '
+              'if [ $# -eq 1 ]; then exec timeout -k 5 "$t" bash -c "$1"; else exec timeout -k 5 "$t" "$@"; fi')
+    r = subprocess.run(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "bash", "-c", script, "_", dest, str(a.timeout), *cmd))
+    if r.returncode == 124:
+        print(f"(lab: stopped after {a.timeout} s; raise it with --timeout)", file=sys.stderr)
+    return r.returncode
 
 
 def cmd_right(_):
@@ -2723,6 +2890,9 @@ class Menu(App):
                 stop_project(n, load_manifests().get(n), self.say_from_thread)
             journal_clear()
             self.say_from_thread("Done for now: all clean" + (f"; stopped {', '.join(running)}" if running else "") + ". Session record cleared.")
+            if os.environ.get("HB_SIDEBAR"):        # close the whole sidebar window (this menu is inside it: a detached helper does it)
+                subprocess.Popen([str(HERE / "hyperbeam"), "_close-sidebar"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
         except Exception as e:
             self.say_from_thread(f"Done for now: ERROR {e}")
         finally:
@@ -3001,6 +3171,17 @@ def main():
     mg = sub.add_parser("_migrate-config", help="copy an old repo config.toml's values to ~/.config/hyperbeam/config.toml (once)")
     mg.add_argument("legacy", nargs="?")
     mg.set_defaults(f=lambda a: print(f"wrote {CONFIG_FILE}" if migrate_config(a.legacy) else f"nothing to do ({CONFIG_FILE} exists or no old file)"))
+    lb = sub.add_parser("lab", help="agent testing as the user hblab on a disk image: run | reset | status (set up with lab/setup.sh)")
+    lsub = lb.add_subparsers(dest="action", required=True)
+    lr = lsub.add_parser("run", help="copy a directory into the lab and run a command there")
+    lr.add_argument("--dir", help="directory to copy (default: the current one)")
+    lr.add_argument("--name", help="name of the run directory (default: the directory's name)")
+    lr.add_argument("--timeout", type=int, default=600, help="seconds before the command is stopped (default 600)")
+    lr.add_argument("cmd", nargs=argparse.REMAINDER)
+    lsub.add_parser("reset", help="stop hblab's processes and empty the lab disk")
+    lsub.add_parser("status", help="disk use, run directories, processes")
+    lb.set_defaults(f=cmd_lab)
+    sub.add_parser("_close-sidebar").set_defaults(f=cmd_close_sidebar)
     sb = sub.add_parser("sidebar", help="hide / show the sidebar (the same as M-s)")
     sb.add_argument("client", nargs="?")
     sb.set_defaults(f=cmd_sidebar)

@@ -12,6 +12,7 @@ socket) reaches another one; TMUX_TMPDIR and `env -u TMUX` do not help while $TM
 import json
 import os
 import re
+import shlex
 import sys
 
 KILL = r"(?:kill-server|kill-session|kill-window|kill-pane|killw|killp)"
@@ -98,8 +99,84 @@ RULES = [
 ]
 
 
+KILLERS = {"kill", "pkill", "killall"}
+WRAPPERS = {"sudo", "env", "nohup", "exec", "time", "command", "xargs", "timeout", "setsid", "stdbuf", "nice", "ionice", "builtin"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+
+
+def split_commands(cmd):
+    """Tokens of each simple command of a command line (split at ; & | newline); None if it can't be parsed (heredoc, odd quoting)."""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n")
+        lex.whitespace, lex.whitespace_split = " \t\r", True
+        toks = list(lex)
+    except ValueError:
+        return None
+    out, cur = [], []
+    for t in toks:
+        if set(t) <= set(";&|\n"):
+            out.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    return out + [cur]
+
+
+def is_lab_run(toks):
+    toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
+    return len(toks) >= 3 and os.path.basename(toks[0]) == "hyperbeam" and toks[1:3] == ["lab", "run"]
+
+
+def outside_lab(cmd):
+    """The command line without its `hyperbeam lab run ...` parts: those run as the user hblab, in the lab, and may do anything (with no
+    command substitution anywhere in the line, which would run as the user first)."""
+    cmds = split_commands(cmd)
+    if cmds is None or "$(" in cmd or "`" in cmd or "<(" in cmd:
+        return cmd
+    return "\n".join(" ".join(c) for c in cmds if c and not is_lab_run(c))
+
+
+def runs_killer(toks):
+    for i, t in enumerate(toks):
+        if t in WRAPPERS or t.startswith("-") or t.isdigit() or re.fullmatch(r"\w+=.*", t):
+            continue
+        b = os.path.basename(t)
+        if b in KILLERS:
+            return True
+        if b in SHELLS and "-c" in toks[i + 1:]:                       # bash -c 'kill 1'
+            inner = toks[toks.index("-c", i) + 1:][:1]
+            return bool(inner) and kill_anywhere(inner[0])
+        return False
+    return False
+
+
+def kill_anywhere(cmd):
+    cmds = split_commands(cmd)
+    if cmds is None:
+        return bool(re.search(r"(?<![\w-])(?:kill|pkill|killall)(?![\w-])", cmd))
+    return any(runs_killer(c) for c in cmds)
+
+
+def kill_outside_lab(cmd):
+    """Any kill, pkill or killall that does not run through `hyperbeam lab run` (hblab cannot signal the user's processes, you can)."""
+    if ("$(" in cmd or "`" in cmd or "<(" in cmd) and re.search(r"(?<![\w-])(?:kill|pkill|killall)(?![\w-])", cmd):
+        return True                     # a substitution runs as the user, even inside quotes or a lab command's arguments
+    return kill_anywhere(cmd)
+
+
+# The rules: (name, test, message shown to Claude). Anything that matches none is allowed.
+RULES = RULES + [
+    ("kill-outside-lab", kill_outside_lab,
+     "BLOCKED by hyperbeam: kill, pkill and killall are not allowed here: they run as the user and can take down live sessions (a `pkill -f` once "
+     "killed the whole tmux server). Run tests and anything that needs a kill in the lab: `hyperbeam lab run <command>` runs it as the user "
+     "hblab, which cannot signal the user's processes (`hyperbeam lab status` shows whether the lab is set up). To stop your own test, give the "
+     "lab command a `--timeout`."),
+]
+
+
 def check(cmd):
-    """The message of the first rule the command breaks, else None."""
+    """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at."""
+    cmd = outside_lab(cmd)
     for name, test, message in RULES:
         if test(cmd):
             return message
