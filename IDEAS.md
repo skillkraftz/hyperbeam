@@ -7,3 +7,4 @@
 - Wrap-up notes into .hyperbeam/notes.
 - Polish phase.
 - Prompt files as skills, exportable to claude.ai.
+- Daily lab digest -> tool proposals at Done; TOOLS.md.

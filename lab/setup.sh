@@ -13,8 +13,10 @@ SUDOERS=/etc/sudoers.d/hyperbeam-lab
 
 # 1. The virtual display for GUI tests (Xvfb), only if missing.
 command -v Xvfb >/dev/null || apt-get install -y xvfb
+# rsync keeps one synced copy of each project in the lab (hyperbeam lab run).
+command -v rsync >/dev/null || apt-get install -y rsync
 
-# 2. The disk image: a fixed-size file (space reserved now, so tests can never fill your disk), formatted ext4.
+# 2. The disk image (to change the size later: sudo bash lab/remove.sh, then sudo bash lab/setup.sh NEWSIZE; the lab's contents are rebuilt by the next runs): a fixed-size file (space reserved now, so tests can never fill your disk), formatted ext4.
 if [ ! -e "$IMG" ]; then
   fallocate -l "$SIZE" "$IMG" || truncate -s "$SIZE" "$IMG"
   mkfs.ext4 -q -F -L hblab "$IMG"
@@ -35,9 +37,28 @@ mountpoint -q "$MNT" || mount "$MNT"
 id hblab >/dev/null 2>&1 || useradd --system --user-group --home-dir "$MNT" --no-create-home --shell /bin/bash hblab
 chown hblab:hblab "$MNT"; chmod 750 "$MNT"
 
+# 4b. GPU: the DRI nodes (/dev/dri/*) belong to the groups video and render, so hblab joins them if they exist. The NVIDIA nodes (/dev/nvidia*)
+#     are world-writable here already, so CUDA works for hblab without any group; nvidia-smi sees every process's VRAM, and the card is shared
+#     with your desktop, so GPU runs compete with your work. Docker stays out: the docker group is root, so hblab is kept out of it.
+for g in video render; do
+  if getent group "$g" >/dev/null && ! id -nG hblab | tr ' ' '\n' | grep -qx "$g"; then usermod -aG "$g" hblab; fi
+done
+id -nG hblab | tr ' ' '\n' | grep -qx docker && gpasswd -d hblab docker >/dev/null
+if command -v nvidia-smi >/dev/null; then
+  echo "note: GPU: hblab is in $(id -nG hblab | sed 's/^hblab //') ; /dev/nvidia* mode: $(stat -c %a /dev/nvidia0 2>/dev/null || echo none)."
+  echo "      A GPU run shares the card and its VRAM with your desktop (Kdenlive, ...). stenographr's tests are offline (fake nvidia-smi); its [gpu] extra"
+  echo "      downloads ~1.6 GB of CUDA wheels into the lab disk, so only run real GPU transcription in the lab on purpose."
+fi
+
 # 5. uv for hblab (it can't read your ~/.local/bin): a copy in /usr/local/bin, only if there isn't one.
 if [ ! -e /usr/local/bin/uv ] && [ -x "$(getent passwd "$WHO" | cut -d: -f6)/.local/bin/uv" ]; then
   install -m755 "$(getent passwd "$WHO" | cut -d: -f6)/.local/bin/uv" /usr/local/bin/uv && touch /etc/hyperbeam-lab.uv
+fi
+
+# 5b. pnpm for hblab (yours is in ~/.npm-global, unreadable to it): a corepack shim in /usr/local/bin, only if there is no pnpm there.
+#     hyperbeam lab run sets COREPACK_HOME to the lab disk; the first `pnpm` downloads it once.
+if ! command -v pnpm >/dev/null && command -v corepack >/dev/null && [ ! -e /usr/local/bin/pnpm ]; then
+  corepack enable pnpm --install-directory /usr/local/bin && touch /etc/hyperbeam-lab.pnpm
 fi
 
 # 6. sudo rule: you may run commands as hblab (and only as hblab, never as root), without a password. Checked with visudo before it is installed.

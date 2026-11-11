@@ -1,6 +1,11 @@
 # Design decisions (newest first)
 Date, decision, why, what was rejected. Seeded from the merged PRs and git history on 2026-11-11; add new entries at the top, in the PR that makes the decision.
 
+## 2026-11-11 Align projects to the system; the lab keeps synced copies and a run log (PR #19)
+- **Decision:** projects follow RULES.md; a difference is allowed only as an approved entry in the project's `## Exceptions to hyperbeam rules`. Onboard runs the manifest step and then ALIGN.md (compare docs with the rules and the real repo, propose, wait, then change on a branch). All agent testing, including unit and headless browser suites, runs in the lab. Docker-based tests are not run there (docker group = root) and are listed as exceptions. The lab keeps one rsync-synced copy per project and its dependency caches; every `lab run` is logged (`--why`) to `lab-runs.jsonl`.
+- **Why:** projects drift from the docs (a CLAUDE.md saying a public repo isn't public) and from each other; a lab that reinstalls everything each run is too slow to use for all testing; the log is the base for turning repeated lab work into small tools.
+- **Rejected:** letting each project override the rules silently; Docker in the lab (root-equivalent); a network namespace for ports (needs privileges: `unshare -n` is denied), so the lab uses a port convention instead; copying `.git` and secrets into the lab.
+
 ## 2026-11-11 The repo is the memory; Copy context; opusplan (PR #18)
 - **Decision:** each project's CLAUDE.md describes how it works now and `docs/DECISIONS.md` records design decisions; both change in the same PR as the code. `hyperbeam context` (and the Copy context button) puts RULES.md, CLAUDE.md, DECISIONS.md, README, manifest and recent history on the clipboard for a web chat. The default Claude model is `opusplan` (Opus plans, Sonnet implements, one session). A worktree's `hyperbeam` script may only be started through `hyperbeam lab run`.
 - **Why:** decisions lived in chat histories, so every new chat started blind. One session per project avoids re-explaining between a planning chat and an implementation chat. Running a worktree script as the user migrated the live state folder (PR #17).

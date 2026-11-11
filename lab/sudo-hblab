@@ -1,0 +1,5 @@
+#!/bin/sh
+# rsync's remote shell for `hyperbeam lab run`: rsync calls it as `sudo-hblab HOST COMMAND...`; drop HOST and run COMMAND as hblab (so the
+# synced copy is written by hblab and the user's files are only read). Not for anything else.
+shift
+exec sudo -n -H -u hblab "$@"
