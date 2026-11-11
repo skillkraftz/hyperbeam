@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, threading, time, tomllib
+import argparse, asyncio, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -83,13 +83,13 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "switch", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7}
-CHOICES = {"open_mode": ["switch", "window"], "claude_model": ["sonnet", "opus", "haiku", "fable"],
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7}
+CHOICES = {"open_mode": ["sidebar", "switch", "window"], "claude_model": ["sonnet", "opus", "haiku", "fable"],
            "claude_effort": ["low", "medium", "high", "xhigh", "max"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
-CONFIG_NOTES = {"open_mode": '"switch": Open switches this terminal to the project (also over SSH). "window": a new kitty window per project at the laptop.',
+CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
                 "claude_model": "model for every Claude hyperbeam starts (claude --model): sonnet, opus, haiku, fable",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
-                "menu_width": "columns of the menu column in the hyperbeam session",
+                "menu_width": "columns of the menu sidebar (takes effect when the sidebar window is opened again)",
                 "recent_days": "a project opened within this many days is 'recent' (bold white in the menu)"}
 
 
@@ -373,13 +373,14 @@ def wrapup_prompt(results, sess):
 
 
 def find_claude_pane(sess):
-    """The pane for Claude: the one running claude; else the left pane of window `work` in a project session, or the top-right pane (index 1,
-    next to the menu) of the hyperbeam session. Never the menu pane: text sent to it would be keystrokes for the menu."""
-    rows = [l.split("\t") for l in tmux("list-panes", "-s", "-t", f"={sess}", "-F", "#{pane_id}\t#{pane_current_command}\t#{window_name}\t#{pane_index}",
+    """The pane for Claude: the one running claude; else the left pane of window `work` in a project session, or the first non-menu pane of
+    the hyperbeam session's home window. Never the menu pane: text sent to it would be keystrokes for the menu."""
+    rows = [l.split("\t") for l in tmux("list-panes", "-s", "-t", f"={sess}", "-F",
+                                        "#{pane_id}\t#{pane_current_command}\t#{window_name}\t#{pane_index}\t#{pane_start_command}",
                                         check=False).stdout.splitlines()]
     if sess == MENU:
-        rows = [r for r in rows if r[2] == "hyperbeam"]
-        return (next((r[0] for r in rows if r[1] == "claude"), None) or next((r[0] for r in rows if r[3] == "1"), None))
+        rows = [r for r in rows if r[2] in ("home", "hyperbeam") and "_menu" not in r[4]]      # "hyperbeam" = the window of the old layout
+        return next((r[0] for r in rows if r[1] == "claude"), None) or (rows[0][0] if rows else None)
     return (next((r[0] for r in rows if r[1] == "claude"), None)
             or next((r[0] for r in rows if r[2] == "work"), None) or (rows[0][0] if rows else None))
 
@@ -532,7 +533,7 @@ def guard_command():
 def install_hooks(settings=None):
     """Merge hyperbeam's hooks into the user's Claude settings; nothing else is changed. Idempotent: ours are recognised by HOOK_MARKS and replaced
     in place (PR #10's older ones too; ones no longer wanted are removed). A backup of the file is kept next to it once. Returns the events changed."""
-    f = Path(settings or Path.home() / ".claude/settings.json")
+    f = Path(settings or os.environ.get("HB_SETTINGS") or Path.home() / ".claude/settings.json")
     data = json.loads(f.read_text()) if f.exists() else {}
     before = json.dumps(data, sort_keys=True)
     bak = f.with_name(f.name + ".hyperbeam-backup")
@@ -938,19 +939,22 @@ def new_pane(args, cmd=None):
     return tmux(*args, "-P", "-F", "#{pane_id}", *([cmd] if cmd else [])).stdout.strip()
 
 
+def menu_cmd():
+    return f"{SELF} _menu; echo; echo '[hyperbeam] menu exited, press Enter'; read"
+
+
 def ensure_menu():
-    """The `hyperbeam` session: the menu as a thin left column (menu_width columns, kept by the menu itself when a client of another size
-    attaches), Claude (in ~/projects/hyperbeam) top right, a shell bottom right."""
+    """The `hyperbeam` session, two windows: `home` (Claude in ~/projects/hyperbeam on the left, a shell on the right; what the sidebar shows
+    on its right) and `menu` (the menu, for SSH and the switch/window modes)."""
     if session_exists(MENU):
         return
     clean_server_env()
-    menu = new_pane(["new-session", "-d", "-s", MENU, "-n", "hyperbeam", "-x", "200", "-y", "50", "-c", str(HERE),
-                     "-e", "HB_PROJECT=hyperbeam", "-e", "HOST=0.0.0.0"],
-                    f"{SELF} _menu; echo; echo '[hyperbeam] menu exited, press Enter'; read")
-    claude = new_pane(["split-window", "-h", "-l", str(max(20, 200 - cfg_get("menu_width") - 1)), "-t", menu, "-c", str(HERE)])
-    shell = new_pane(["split-window", "-v", "-l", "40%", "-t", claude, "-c", str(HERE)])
+    claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(HERE),
+                       "-e", "HB_PROJECT=hyperbeam", "-e", "HOST=0.0.0.0"])
+    new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(HERE)])
     send_line(claude, claude_base())
-    tmux("select-pane", "-t", menu)
+    tmux("select-pane", "-t", claude)
+    new_pane(["new-window", "-d", "-t", f"={MENU}:", "-n", "menu", "-c", str(HERE)], menu_cmd())
     tag_session(MENU)
 
 
@@ -1155,26 +1159,124 @@ def display_env():
     return env
 
 
-def spawn_kitty(sess):
+def kitty_guard():
     if os.environ.get("HB_CONFIG") and not os.environ.get("HB_KITTY_ARGS"):      # a test config: never pop a window on the user's screens
         raise RuntimeError("test configuration (HB_CONFIG) in use: refusing to open a real window")
+
+
+def spawn_kitty(sess):
     """open_mode = "window": a new kitty window attached to the session. HB_KITTY_ARGS adds kitty options (used by tests)."""
+    kitty_guard()
     subprocess.Popen(["kitty", "--title", f"hyperbeam: {sess}", *shlex.split(os.environ.get("HB_KITTY_ARGS", "")),
                       "tmux", "attach", "-t", f"={sess}"],
                      env=display_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+# ---------- the sidebar: one kitty window, the menu on the left, a tmux client on the right ----------
+SIDEBAR_FILE = STATE_DIR / "sidebar.json"
+
+
+def sidebar_read():
+    try:
+        return json.loads(SIDEBAR_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def sidebar_update(**kv):
+    d = {**sidebar_read(), **kv}
+    SIDEBAR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SIDEBAR_FILE.write_text(json.dumps(d))
+
+
+def sidebar_client():
+    """The tmux client of the sidebar's right side (its tty, recorded by `hyperbeam _right` before it execs `tmux attach`), '' if it isn't attached."""
+    tty = sidebar_read().get("tty")
+    return tty if tty and tty in tmux("list-clients", "-F", "#{client_tty}", check=False).stdout.split() else ""
+
+
+def home_target(client):
+    """Where a client goes when it goes to the hyperbeam session: the sidebar's right client sees `home` (Claude and a shell), others the menu."""
+    return f"={MENU}:{'home' if client and client == sidebar_read().get('tty') else 'menu'}"
+
+
+def sidebar_session_file(cols=170, rows=48):
+    """A kitty session: one OS window, `splits` layout, the menu on the left (menu_width columns; --bias is the percentage the new right window takes),
+    the tmux client (`hyperbeam _right`) on the right. The menu runs in a loop: exit code 0 (Quit) ends it, anything else (a restart signal
+    from `hyperbeam update`, a crash) starts it again."""
+    w = cfg_get("menu_width")
+    bias = round(100 * (cols - w - 1) / (cols - 1))
+    loop = f"while :; do {SELF} _menu; [ $? -eq 0 ] && break; sleep 1; done"
+    return "\n".join([
+        "new_os_window", "os_window_class hyperbeam-sidebar", f"os_window_size {cols}c {rows}c", "layout splits",
+        shlex.join(["launch", "--title", "menu", "--env", "HB_SIDEBAR=1", "sh", "-c", loop]), "focus",
+        shlex.join(["launch", "--location=vsplit", f"--bias={bias}", "--title", "main", str(HERE / "hyperbeam"), "_right"]), ""])
+
+
+def sidebar_possible():
+    """Sidebar mode applies at the desktop only: not over SSH, and there must be a screen to open on."""
+    if open_mode() != "sidebar" or os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY") or os.environ.get("TMUX"):
+        return False
+    env = display_env()
+    return bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")) and (not sys.stdin.isatty() or bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")))
+
+
+def pid_alive(pid, word):
+    try:
+        return word in Path(f"/proc/{pid}/cmdline").read_text()
+    except (OSError, ValueError):
+        return False
+
+
+def launch_sidebar():
+    """Open the sidebar kitty window (once: if one is open already, say so). The hyperbeam session is created first so both sides find it."""
+    kitty_guard()
+    ensure_menu()
+    source_conf()
+    if pid_alive(sidebar_read().get("kitty_pid", 0), "hyperbeam-sidebar"):
+        return "the sidebar window is already open"
+    f = STATE_DIR / "sidebar.session"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(sidebar_session_file())
+    proc = subprocess.Popen(["kitty", "--class", "hyperbeam-sidebar", "--title", "hyperbeam", *shlex.split(os.environ.get("HB_KITTY_ARGS", "")),
+                             "--session", str(f)],
+                            env=display_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    sidebar_update(kitty_pid=proc.pid)
+    return "opened the sidebar window"
+
+
+def cmd_right(_):
+    """The right side of the sidebar: record this terminal's tty, so the menu can switch-client exactly this client, then become `tmux attach`."""
+    ensure_menu()
+    source_conf()
+    sidebar_update(tty=os.ttyname(0), right_pid=os.getpid())
+    tmux("select-window", "-t", f"={MENU}:home", check=False)
+    os.execvp("tmux", ["tmux", "attach", "-t", f"={MENU}"])
+
+
+def cmd_home(a):
+    """M-h: this client goes to the hyperbeam session (the sidebar's right side to `home`, anything else to the menu window)."""
+    tmux("switch-client", "-c", a.client, "-t", home_target(a.client))
+
+
 def show_session(sess):
-    """Show a session. switch mode (default), or window mode over SSH (no kitty to open): switch the client that is looking at the menu.
-    window mode at the laptop: a new kitty window. Returns what it did."""
+    """Show a session. Sidebar menu: switch the sidebar's right client. Otherwise switch the client that is looking at the menu session
+    (switch mode, and over SSH), or in window mode at the laptop open a new kitty window. Returns what it did."""
+    if os.environ.get("HB_SIDEBAR"):
+        c = sidebar_client()
+        if not c:
+            raise RuntimeError("the sidebar's main area is not attached (close this window and press the hotkey again)")
+        tmux("switch-client", "-c", c, "-t", home_target(c) if sess == MENU else f"={sess}")
+        return "switched the main area"
     pid = menu_client("client_pid")
     if not pid:
         raise RuntimeError("no client is attached to the menu session")
     if open_mode() == "window" and not client_is_remote(pid):
         spawn_kitty(sess)
         return "new kitty window"
-    tmux("switch-client", "-c", menu_client(), "-t", f"={sess}")
+    c = menu_client()
+    tmux("switch-client", "-c", c, "-t", home_target(c) if sess == MENU else f"={sess}")
     return "switched"
 
 
@@ -1238,7 +1340,7 @@ def cmd_stack(a):
         return tmux_msg(a.client, "stack: only one session")
     step = 1 if a.direction == "next" else -1
     i = (names.index(a.session) + step) % len(names) if a.session in names else (0 if step > 0 else -1)
-    tmux("switch-client", "-c", a.client, "-t", f"={names[i]}")
+    tmux("switch-client", "-c", a.client, "-t", home_target(a.client) if names[i] == MENU else f"={names[i]}")
     tmux_msg(a.client, f"stack {names.index(names[i]) + 1}/{len(names)}: {names[i]}")
 
 
@@ -1277,11 +1379,14 @@ def cmd_clip(a):
 
 
 def cmd_menu(_):
-    """`hyperbeam` with no arguments: attach to the menu session (creating it if needed)."""
-    if own_session() == MENU:
-        return run_menu()
+    """`hyperbeam` with no arguments. Desktop, open_mode sidebar: open the sidebar window and return (the old hotkey, `kitty hyperbeam`, leaves
+    its own window to close). Otherwise attach to the hyperbeam session's menu window, creating the session if needed."""
+    if sidebar_possible():
+        print(launch_sidebar())
+        return 0
     ensure_menu()
     source_conf()
+    tmux("select-window", "-t", f"={MENU}:menu", check=False)
     return attach_here(MENU)
 
 
@@ -1794,10 +1899,12 @@ def clip(text, width):
     return text if len(text) <= width else text[:max(0, width - 1)] + "…"
 
 
-def row_text(p, st, width):
+def row_text(p, st, width, note=""):
     """One list row: dot, name (clipped with … so the dot and port always fit), port right-aligned. `width` is the room for the row."""
     port = str(p["port"]) if p.get("port") else ("-" if p["manifest"] else "unset")
     pstyle = ORANGE if not p["manifest"] else "dim" if not p.get("port") else "cyan"
+    if note:                    # the hyperbeam row: "branch" (not on main) or "behind" (origin/main is ahead)
+        port, pstyle = note, "yellow"
     room = max(4, width - 2 - 1 - len(port))
     t = Text(no_wrap=True, overflow="crop")
     t.append("● " if st else "  ", style=DOT.get(st[0], "") if st else "")
@@ -1857,7 +1964,7 @@ class SettingsScreen(ModalScreen):
         lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
         lines += [f"  {k}\n      {d}" for k, d in KEYS]
         lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, b onboard, i info, r refresh, q quit (detach)"]
+        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, i info, r refresh, q quit"]
         return "\n".join(lines)
 
     def on_mount(self):
@@ -1872,11 +1979,9 @@ class SettingsScreen(ModalScreen):
         vals = CHOICES[key]
         cur = cfg_get(key)
         i = vals.index(cur) if cur in vals else 0
-        new = vals[(i + 1) % 2] if len(vals) == 2 else vals[max(0, min(len(vals) - 1, i + step))]      # a toggle flips; a number clamps
+        new = vals[(i + 1) % len(vals)] if len(vals) == 2 or key == "open_mode" else vals[max(0, min(len(vals) - 1, i + step))]      # a toggle flips; a number clamps
         if new != cur:
             set_config(key, new)
-            if key == "menu_width":
-                self.app.fit_pane(force=True)
             self.app.refresh_list()
         self.show()
 
@@ -1909,21 +2014,22 @@ class Menu(App):
     #why { height: 1; padding: 0 1; color: $text-muted; }
     #notice { height: 2; padding: 0 1; }
     #buttons { layout: grid; grid-size: 4; grid-gutter: 0 1; height: auto; }
-    .fix #buttons { grid-size: 5; }
+    #buttons { grid-size: 5; }
+    .fix #buttons { grid-size: 6; }
     .narrow #buttons { grid-size: 2; }
-    .narrow.fix #buttons { grid-size: 3; }
+    .narrow.fix #buttons { grid-size: 2; }
     #b-fix { display: none; }
     .fix #b-fix { display: block; }
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"),
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"),
                 Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
         self.projects, self.busy, self.status = [], set(), {}
         self.keep_notice = False        # True after an action: the refresh then leaves its result message on screen
-        self.last_narrow, self.auto_zoom = None, False
+        self.repo = ("", "")            # (short, long) note on the hyperbeam row: on a branch / origin/main is ahead
         self.recheck_next = False       # Refresh: run the red checks again
 
     def compose(self) -> ComposeResult:
@@ -1932,7 +2038,7 @@ class Menu(App):
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("fix", "Fix (f)")]:
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("fix", "Fix (f)")]:
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
@@ -1942,7 +2048,9 @@ class Menu(App):
         self.action_refresh()
         self.set_interval(3, self.poll_running)
         self.set_interval(5, self.poll_status)
-        self.set_interval(2, self.fit_pane)
+        self.set_interval(600, self.fetch_repo)
+        asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, lambda: self.exit(return_code=75))      # `hyperbeam update`: restart me
+        self.fetch_repo()
         self.set_interval(300, self.save_layouts)
         journal_start()
         touch_opened("hyperbeam")       # the hyperbeam session is home: recent (bold) and part of the session record
@@ -1950,33 +2058,17 @@ class Menu(App):
     def on_resize(self, event):
         self.set_class(event.size.width < 50, "narrow")
         self.call_after_refresh(self.refresh_list)
-        self.fit_pane()
 
-    # --- the menu pane inside the hyperbeam session: thin column on a wide client, the whole screen on a narrow one ---
-    def fit_pane(self, force=False):
-        pane = os.environ.get("TMUX_PANE")
-        if pane:
-            self.run_worker(lambda: self._fit(pane, force), thread=True, group="fit")
+    def fetch_repo(self):
+        """The hyperbeam row's note: on a branch / origin/main ahead. Fetches (short, quiet) every 10 minutes."""
+        def work():
+            git_fetch(HERE)
+            self.call_from_thread(self.set_repo)
+        self.run_worker(work, thread=True, group="repo")
 
-    def _fit(self, pane, force):
-        v = tmux("display-message", "-p", "-t", pane, "#{window_width} #{window_zoomed_flag} #{pane_width}", check=False).stdout.split()
-        if len(v) != 3:
-            return
-        ww, zoomed, pw = int(v[0]), v[1] == "1", int(v[2])
-        want = cfg_get("menu_width")
-        narrow = ww < 2 * want + 10
-        if narrow != self.last_narrow or force:
-            self.last_narrow = narrow
-            if narrow and not zoomed:
-                tmux("resize-pane", "-Z", "-t", pane, check=False)      # phone: the menu takes the screen; M-z shows the rest
-                self.auto_zoom = True
-            elif not narrow:
-                if zoomed and self.auto_zoom:
-                    tmux("resize-pane", "-Z", "-t", pane, check=False)
-                    zoomed = False
-                self.auto_zoom = False
-        if not narrow and not zoomed and pw != want:
-            tmux("resize-pane", "-t", pane, "-x", str(want), check=False)
+    def set_repo(self):
+        self.repo = repo_note()
+        self.refresh_list()
 
     # --- data ---
     def action_refresh(self):
@@ -2052,7 +2144,8 @@ class Menu(App):
         rows = self.ordered()
         width = max(20, self.size.width - 2 - 1)    # the option's own padding, the 1-column scrollbar
         for p in rows:
-            ol.add_option(Option(row_text(p, self.status.get(p["name"]) if p["running"] else None, width), id=p["name"]))
+            note = self.repo[0] if p["name"] == "hyperbeam" else ""
+            ol.add_option(Option(row_text(p, self.status.get(p["name"]) if p["running"] else None, width, note), id=p["name"]))
         if rows:
             names = [p["name"] for p in rows]
             ol.highlighted = names.index(keep["name"]) if keep and keep["name"] in names else 0
@@ -2071,6 +2164,8 @@ class Menu(App):
         self.set_class(bool(st and st[0] == "red"), "fix")          # a red project gets a Fix button
         if st:
             why = f"[{st[0]}] {st[1]}"
+        elif p and p["name"] == "hyperbeam" and self.repo[1]:
+            why = self.repo[1]
         elif p and not p["manifest"]:
             why = "no manifest: Open starts Claude to set it up"
         w = self.query_one("#why", Static).size.width or 40
@@ -2098,7 +2193,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "onboard", "info", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "onboard", "info", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -2261,18 +2356,177 @@ class Menu(App):
             return self.say("Nothing selected.")
         win = f"info-{sanitize(p['name'])}"
         tmux("kill-window", "-t", f"={MENU}:={win}", check=False)
-        tmux("new-window", "-t", f"{MENU}:", "-n", win,
+        side = sidebar_client() if os.environ.get("HB_SIDEBAR") else ""
+        tmux("new-window", *(["-d"] if side else []), "-t", f"{MENU}:", "-n", win,
              f"{SELF} info {shlex.quote(p['name'])}; echo; read -r -p '[Enter closes this window] '")
+        if side:                    # the sidebar's right client looks at `home`: show the info window there
+            tmux("switch-client", "-c", side, "-t", f"={MENU}:={win}", check=False)
+
+    def action_update(self):
+        """A popup on the client that shows the main area runs `hyperbeam update` (it restarts this menu at the end, so it must not run here)."""
+        c = sidebar_client() if os.environ.get("HB_SIDEBAR") else menu_client()
+        if not c:
+            return self.say("No tmux client to show the update on: run `hyperbeam update` in a terminal.")
+        subprocess.Popen(["tmux", "display-popup", "-c", c, "-E", "-w", "90%", "-h", "80%", "-T", " hyperbeam update ",
+                          f"{SELF} update; echo; read -r -p '[Enter closes] '"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.say("Update running in a popup...")
 
     def action_quit(self):
-        """Quit detaches the client; the menu keeps running in its tmux session."""
+        """In the sidebar Quit ends the menu (its window closes with it). In tmux it detaches the client; the menu keeps running there."""
+        if os.environ.get("HB_SIDEBAR"):
+            return self.exit()
         c = menu_client()
         if c:
             tmux("detach-client", "-t", c, check=False)
 
 
+MENU_PIDS = STATE_DIR / "menus"
+
+
 def run_menu():
-    Menu().run()
+    """The menu process. It records itself (pid file) so `hyperbeam update` can restart it, and restarts on SIGUSR1 (exit code 75)."""
+    MENU_PIDS.mkdir(parents=True, exist_ok=True)
+    f = MENU_PIDS / str(os.getpid())
+    f.write_text(json.dumps({"home": str(HERE), "sidebar": bool(os.environ.get("HB_SIDEBAR"))}))
+    app = Menu()
+    try:
+        app.run()
+    finally:
+        f.unlink(missing_ok=True)
+    return app.return_code or 0
+
+
+# ---------- update / try ----------
+def repo_state():
+    """(branch, commits origin/main is ahead) of the hyperbeam checkout, from what was last fetched (no network)."""
+    br = git_out(HERE, "rev-parse", "--abbrev-ref", "HEAD")
+    behind = git_out(HERE, "rev-list", "--count", "HEAD..origin/main") if br == "main" else ""
+    return br, int(behind) if behind.isdigit() else 0
+
+
+def repo_note():
+    """('branch'|'behind'|'', long text) for the hyperbeam row."""
+    br, behind = repo_state()
+    if br and br != "main":
+        return "branch", f"on branch {br}: `hyperbeam update` goes back to main"
+    if behind:
+        return "behind", f"origin/main is {behind} commit{'s' * (behind > 1)} ahead: press Update"
+    return "", ""
+
+
+def restart_menus(say=print):
+    """Restart the menu processes without touching a project session. Sidebar menus: SIGUSR1 (they exit 75, their loop starts a new one).
+    The in-tmux menu: its pane is respawned; the old layout (menu, Claude, shell in one window) gets a `menu` window and loses its menu pane."""
+    n = 0
+    for f in sorted(MENU_PIDS.glob("*")):
+        try:
+            info = json.loads(f.read_text())
+            pid = int(f.name)
+        except (OSError, ValueError):
+            continue
+        if not pid_alive(pid, "_menu"):
+            f.unlink(missing_ok=True)
+        elif info.get("sidebar") and info.get("home") == str(HERE):
+            os.kill(pid, signal.SIGUSR1)
+            n += 1
+    if n:
+        say(f"menu: restarted {n} sidebar menu process{'es' * (n > 1)}")
+    if not session_exists(MENU):
+        return
+    own = os.environ.get("TMUX_PANE", "")
+    rows = [l.split("\t") for l in tmux("list-panes", "-s", "-t", f"={MENU}", "-F", "#{pane_id}\t#{window_name}\t#{pane_start_command}\t#{window_id}",
+                                        check=False).stdout.splitlines()]
+    menus = [r for r in rows if len(r) == 4 and "_menu" in r[2] and "sh -c" not in r[2]]
+    if not any(r[1] == "menu" for r in rows):
+        tmux("new-window", "-d", "-t", f"={MENU}:", "-n", "menu", "-c", str(HERE), menu_cmd(), check=False)
+        for pane, win, _, wid in menus:
+            if pane != own and sum(1 for r in rows if r[3] == wid) > 1:
+                tmux("kill-pane", "-t", pane, check=False)
+                tmux("rename-window", "-t", wid, "home", check=False)
+        say("menu: old single-window layout converted (new `menu` window; the old window is now `home`)")
+    else:
+        for pane, win, _, _ in menus:
+            if pane != own:
+                tmux("respawn-pane", "-k", "-t", pane, menu_cmd(), check=False)
+                say("menu: in-tmux menu restarted")
+
+
+def claude_panes():
+    """Every Claude pane in a hyperbeam session: [(pane id, session, project, cwd, state)]; state is waiting (idle, blue), working or ''."""
+    out = []
+    fmt = "#{pane_id}\t#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{@hb}"
+    for l in tmux("list-panes", "-a", "-F", fmt, check=False).stdout.splitlines():
+        pane, sess, cmd, path, hb = (l.split("\t") + [""] * 5)[:5]
+        if cmd == "claude" and hb == "1":
+            proj = session_project(sess)
+            out.append((pane, sess, proj, path, claude_state(proj)[0]))
+    return out
+
+
+def restart_claude(pane, path):
+    """Restart Claude in a pane with --continue: the pane gets a fresh shell in its directory, then the command is typed."""
+    tmux("respawn-pane", "-k", "-t", pane, "-c", path, check=False)
+    send_line(pane, f"{claude_base()} --continue || {claude_base()}")
+
+
+def do_update(branch=None, yes=False):
+    """`hyperbeam update` (main) / `hyperbeam try BRANCH`: switch the hyperbeam checkout, then (with the new code) `_update-finish`."""
+    repo = HERE
+    if git_out(repo, "status", "--porcelain", "--untracked-files=no"):
+        print(f"{repo} has uncommitted changes: commit or stash them first (nothing was changed)")
+        return 1
+    old, oldb = git_out(repo, "rev-parse", "--short", "HEAD"), git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git_fetch(repo)
+    target = branch or "main"
+    if target != oldb:
+        r = subprocess.run(["git", "-C", str(repo), "checkout", "-q", target], capture_output=True, text=True)
+        if r.returncode:
+            print(f"cannot check out {target}: {r.stderr.strip()}")
+            return 1
+    if git_out(repo, "rev-parse", "--verify", "-q", f"origin/{target}"):
+        r = subprocess.run(["git", "-C", str(repo), "merge", "--ff-only", "-q", f"origin/{target}"], capture_output=True, text=True)
+        if r.returncode:
+            print(f"{target} has local commits that are not on origin/{target}; not merged: {r.stderr.strip()}")
+    new, newb = git_out(repo, "rev-parse", "--short", "HEAD"), git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    print(f"hyperbeam: {oldb} {old} -> {newb} {new}" + ("" if old != new or oldb != newb else "  (already up to date)"))
+    if old != new:
+        print(git_out(repo, "log", "--oneline", "-15", f"{old}..{new}") or git_out(repo, "log", "--oneline", "-5", new))
+    sys.stdout.flush()
+    return subprocess.run([str(repo / "hyperbeam"), "_update-finish"] + (["--yes"] if yes else [])).returncode
+
+
+def cmd_update_finish(a):
+    """The steps after the checkout, run by the new code: hooks, tmux config, menus, Claude panes."""
+    print("hooks: " + (", ".join(install_hooks()) and "updated" or "already current"))
+    if tmux("source-file", "-q", str(HERE / "hyperbeam.conf"), check=False).returncode == 0 and tmux("has-session", check=False).returncode == 0:
+        print("tmux: hyperbeam.conf reloaded")
+    else:
+        print("tmux: no server running, nothing to reload")
+    if session_exists(MENU):
+        for sess in stack():
+            tag_session(sess)       # refresh the key hints in the status bars
+    restart_menus()
+    own = os.environ.get("TMUX_PANE", "")
+    panes = claude_panes()
+    if not panes:
+        return 0
+    print(f"\nClaude panes still running from before the update ({len(panes)}; they keep the old hooks and settings until restarted):")
+    for pane, sess, proj, path, state in panes:
+        print(f"  {proj:<22} {'idle (blue)' if state == 'waiting' else 'working' if state == 'working' else 'unknown':<12} {pane}{'  (this one: not touched)' if pane == own else ''}")
+    idle = [x for x in panes if x[4] == "waiting" and x[0] != own]
+    if not idle:
+        return 0
+    ok = a.yes
+    if not ok and sys.stdin.isatty():
+        ok = input(f"Restart the {len(idle)} idle one(s) with --continue? [y/N] ").strip().lower() == "y"
+    if ok:
+        for pane, sess, proj, path, _ in idle:
+            restart_claude(pane, path)
+            print(f"  restarted {proj}")
+    else:
+        print("  not restarted (restart working ones yourself when they finish)")
+    return 0
 
 
 def main():
@@ -2293,6 +2547,20 @@ def main():
     i.add_argument("project", nargs="?")
     i.set_defaults(f=cmd_info)
     sub.add_parser("_menu").set_defaults(f=lambda _: run_menu())
+    sub.add_parser("_right", help="the sidebar's right side: record this tty, exec tmux attach").set_defaults(f=cmd_right)
+    hm = sub.add_parser("_home")
+    hm.add_argument("client")
+    hm.set_defaults(f=cmd_home)
+    up = sub.add_parser("update", help="pull main, reinstall hooks, reload tmux, restart the menu, offer to restart idle Claude panes")
+    up.add_argument("--yes", action="store_true", help="restart the idle Claude panes without asking")
+    up.set_defaults(f=lambda a: do_update(None, a.yes))
+    tr = sub.add_parser("try", help="like update, but check out BRANCH in the hyperbeam checkout (`hyperbeam update` returns to main)")
+    tr.add_argument("branch")
+    tr.add_argument("--yes", action="store_true")
+    tr.set_defaults(f=lambda a: do_update(a.branch, a.yes))
+    uf = sub.add_parser("_update-finish")
+    uf.add_argument("--yes", action="store_true")
+    uf.set_defaults(f=cmd_update_finish)
     st = sub.add_parser("_stack")
     st.add_argument("direction", choices=["next", "prev"])
     st.add_argument("client")
