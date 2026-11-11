@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, asyncio, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
+import argparse, asyncio, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -83,13 +83,14 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7}
-CHOICES = {"open_mode": ["sidebar", "switch", "window"], "claude_model": ["sonnet", "opus", "haiku", "fable"],
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask"}
+CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["sonnet", "opus", "haiku", "fable"],
            "claude_effort": ["low", "medium", "high", "xhigh", "max"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
                 "claude_model": "model for every Claude hyperbeam starts (claude --model): sonnet, opus, haiku, fable",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
                 "menu_width": "columns of the menu sidebar (takes effect when the sidebar window is opened again)",
+                "on_problem": '"ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.',
                 "recent_days": "a project opened within this many days is 'recent' (bold white in the menu)"}
 
 
@@ -99,7 +100,7 @@ def cfg_get(key):
         v = load_cfg().get(key, DEFAULTS[key])
     except Exception:
         v = DEFAULTS[key]
-    return v if type(v) is type(DEFAULTS[key]) and (key not in ("claude_model", "claude_effort", "open_mode") or v in CHOICES[key]) else DEFAULTS[key]
+    return v if type(v) is type(DEFAULTS[key]) and (key not in ("claude_model", "claude_effort", "open_mode", "on_problem") or v in CHOICES[key]) else DEFAULTS[key]
 
 
 def set_config(key, value):
@@ -324,12 +325,46 @@ def clean_server_env():
             tmux("set-environment", "-g", "PATH", new, check=False)
 
 
+# the status segment: red while the session option @hb_alert is set (a red problem), else a quiet yellow one for @hb_note
+ALERT = "#{?@hb_alert,#[fg=white]#[bg=red]#[bold] #{@hb_alert} #[default] ,#{?@hb_note,#[fg=black]#[bg=yellow] #{@hb_note} #[default] ,}}"
+
+
 def tag_session(sess):
-    """Mark a session as one of hyperbeam's (the stack keys use the mark) and put the key hints in its status bar."""
+    """Mark a session as one of hyperbeam's (the stack keys use the mark) and put the red alert segment and the key hints in its status bar."""
     tmux("set-option", "-t", sess, "@hb", "1")
     base = tmux("show-options", "-gv", "status-right", check=False).stdout.strip()
-    tmux("set-option", "-t", sess, "status-right-length", "120")
-    tmux("set-option", "-t", sess, "status-right", f"#[fg=#888888]{HINT} #[default]{base}")
+    tmux("set-option", "-t", sess, "status-right-length", "200")
+    tmux("set-option", "-t", sess, "status-right", f"{ALERT}#[fg=#888888]{HINT} #[default]{base}")
+
+
+def alert_text(findings, notes=()):
+    """Status-bar texts: (red text with the command, quiet note text). Each is the first item, how many more."""
+    def one(items, prefix, tail=""):
+        if not items:
+            return ""
+        first = clip(items[0].replace("#", ""), 40)
+        return f"{prefix}{first}{f' (+{len(items) - 1})' if len(items) > 1 else ''}{tail}"
+    return one(findings, "⚠ ", ": hyperbeam fix"), one(notes, "note: ")
+
+
+def sync_alert(name, findings, notes=()):
+    """Set or clear the project's status segments: red for problems, yellow for notes (cheap when nothing changed)."""
+    sess = sanitize(name)
+    red, note = alert_text(findings, notes)
+    cur = tmux("show-options", "-t", sess, "-v", "@hb_alert", check=False)
+    if cur.returncode != 0 and not session_exists(sess):
+        return
+    curn = tmux("show-options", "-t", sess, "-v", "@hb_note", check=False).stdout.strip()
+    if cur.stdout.strip() == red and curn == note:
+        return
+    if (red or note) and "@hb_alert" not in tmux("show-options", "-t", sess, "-v", "status-right", check=False).stdout:
+        tag_session(sess)                     # a session made before this version: add the segment
+    for opt, text in (("@hb_alert", red), ("@hb_note", note)):
+        if text:
+            tmux("set-option", "-t", sess, opt, text, check=False)
+        else:
+            tmux("set-option", "-t", sess, "-u", opt, check=False)
+    tmux("refresh-client", "-S", check=False)
 
 
 def pane_tail(target, n=50):
@@ -437,27 +472,30 @@ def status_dir(kind):
     return STATE_DIR / kind
 
 
-def write_status(name, findings):
+def write_status(name, findings, notes=()):
+    """findings = the red ones (merge/rebase with conflicts, secrets in commits); notes = the quiet git state (uncommitted, unpushed, ...)."""
     d = status_dir("status")
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"{name}.json").write_text(json.dumps({"findings": findings, "time": time.time()}))
+    (d / f"{name}.json").write_text(json.dumps({"v": 2, "findings": list(findings), "notes": list(notes), "time": time.time()}))
 
 
 def read_status(name):
     try:
-        return json.loads((status_dir("status") / f"{name}.json").read_text())
+        d = json.loads((status_dir("status") / f"{name}.json").read_text())
     except (OSError, ValueError):
         return {}
+    return d if d.get("v") == 2 else {}         # an older file mixed notes into the findings: ignore it until the next check
 
 
 def clear_status(name):
     (status_dir("status") / f"{name}.json").unlink(missing_ok=True)
     (status_dir("claude") / name).unlink(missing_ok=True)
+    (status_dir("auto") / name).unlink(missing_ok=True)
 
 
 def recheck(name, path):
     """Refresh: run the git checks again and store the result, so a red dot clears when the problem is gone."""
-    write_status(name, git_problems(path, fetch=False, behind=False))
+    write_status(name, *git_red_notes(path, fetch=False, behind=False))
 
 
 def claude_state(name):
@@ -471,6 +509,11 @@ def claude_state(name):
         return "", ""
     kind, _, reason = txt.partition(" ")
     return (kind, reason) if kind in ("waiting", "working") else ("", "")
+
+
+def note_findings(name):
+    """The quiet notes of a project (stored by the start check / Refresh / the menu's minute check). They never change the dot."""
+    return read_status(name).get("notes", [])
 
 
 def red_findings(name, man):
@@ -492,12 +535,118 @@ def fix_project(name, man, path):
     return findings
 
 
+def fix_by_name(name):
+    """The Fix button's work for a project given by name (`hyperbeam fix`, the popup). Returns the findings."""
+    man = load_manifests().get(name)
+    path = manifest_path(man) if man else next((r["path"] for r in scan() if r["name"] == name), None)
+    if path is None:
+        raise RuntimeError(f"no project called {name}")
+    return fix_project(name, man, path)
+
+
+def cmd_fix(a):
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam fix: no project (run it in a project session, or give a name)")
+    try:
+        found = fix_by_name(name)
+    except RuntimeError as e:
+        print(f"{name}: {e}")
+        return 1
+    print(f"{name}: sent RECOVER.md and {len(found)} problem{'s' * (len(found) > 1)} to Claude:")
+    print("\n".join(f"  - {f}" for f in found))
+    return 0
+
+
+def cmd_entered(a):
+    """tmux hook (client-attached, client-session-changed): a client entered a session. A hyperbeam session with red problems announces
+    them: the status segment is refreshed, then on_problem decides: "ask" a popup on that client, "auto" Claude is sent RECOVER.md once per
+    set of problems (a hash of them is kept in state/auto)."""
+    sess = a.session
+    if tmux("show-options", "-t", sess, "-v", "@hb", check=False).stdout.strip() != "1":
+        return 0
+    name = session_project(sess)
+    findings = red_findings(name, load_manifests().get(name))
+    sync_alert(name, findings, note_findings(name))
+    auto = status_dir("auto") / name
+    if not findings:
+        auto.unlink(missing_ok=True)
+        return 0
+    if cfg_get("on_problem") == "auto":
+        h = hashlib.sha1("\n".join(findings).encode()).hexdigest()[:12]
+        if auto.exists() and auto.read_text() == h:
+            return 0
+        auto.parent.mkdir(parents=True, exist_ok=True)
+        auto.write_text(h)
+        try:
+            fix_by_name(name)
+            msg = f"{name}: problems found, Claude was sent RECOVER.md"
+        except RuntimeError as e:
+            msg = f"{name}: problems found, could not start Claude: {e}"
+        tmux("display-message", "-c", a.client, msg, check=False)
+        return 0
+    tmux("display-popup", "-c", a.client, "-E", "-w", "74", "-h", str(min(22, 9 + len(findings))), "-T", f" {name}: problems ",
+         f"{SELF} _problem {shlex.quote(name)}", check=False)
+    return 0
+
+
+class Problem(App):
+    """The popup shown on entry: the problems, and two buttons. Exit code 1 = Fix with Claude, 0 = Later."""
+    CSS = """
+    Screen { background: $surface; padding: 0 1; }
+    #head { color: red; text-style: bold; height: 1; }
+    #list { height: 1fr; }
+    #buttons { height: 1; }
+    #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 10; }
+    """
+    BINDINGS = [Binding("f", "fix", "Fix"), Binding("enter", "fix", "Fix"), Binding("l", "later", "Later"), Binding("escape", "later", "Later"),
+                Binding("q", "later", "Later")]
+
+    def __init__(self, name, findings):
+        super().__init__()
+        self.pname, self.findings = name, findings
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"{self.pname} needs attention", id="head", markup=False)
+        yield Static("\n".join(f"- {f}" for f in self.findings), id="list", markup=False)
+        with Horizontal(id="buttons"):
+            for bid, label in (("fix", "Fix with Claude (f)"), ("later", "Later (l)")):
+                b = Button(label, id=bid)
+                b.can_focus = False
+                yield b
+
+    def on_button_pressed(self, event):
+        self.exit(return_code=1 if event.button.id == "fix" else 0)
+
+    def action_fix(self):
+        self.exit(return_code=1)
+
+    def action_later(self):
+        self.exit(return_code=0)
+
+
+def cmd_problem(a):
+    findings = red_findings(a.project, load_manifests().get(a.project))
+    if not findings:
+        return 0
+    app = Problem(a.project, findings)
+    app.run()
+    if app.return_code == 1:
+        try:
+            fix_by_name(a.project)
+            tmux("display-message", f"{a.project}: Claude was sent RECOVER.md and the problems", check=False)
+        except RuntimeError as e:
+            tmux("display-message", f"{a.project}: {e}", check=False)
+    return 0
+
+
 def project_status(name, man):
     """(colour, reason) of a running project, None if it isn't running. Priority red > blue (Claude waits) > cyan (Claude works) > green."""
     sess = sanitize(name)
     if not session_exists(sess):
         return None
     red = red_findings(name, man)
+    sync_alert(name, red, note_findings(name))
     if red:
         return "red", "; ".join(red)
     kind, reason = claude_state(name)
@@ -736,14 +885,38 @@ def crash_note(name):
     return ""
 
 
+def commit_secrets(path):
+    """Obvious secrets in commits that are on no remote yet (the last 50): file, line, pattern, commit; never a value."""
+    if not git_out(path, "rev-parse", "--git-dir"):
+        return []
+    log = git_out(path, "log", "--no-merges", "-p", "-U0", "--no-color", "--no-ext-diff", "-n", "50", "--format=@@commit%h", "HEAD", "--not", "--remotes")
+    out, seen = [], set()
+    for fname, ln, pat, commit in scan_diff(log):
+        if (fname, ln, pat) not in seen:
+            seen.add((fname, ln, pat))
+            out.append(f"secret in commit {commit}: {fname}:{ln} {pat}")
+    return out
+
+
+def git_red_notes(path, fetch=False, behind=True):
+    """(red, notes) of a repo. Red is rare: a merge/rebase/cherry-pick/revert stuck with conflicts, or secrets in commits. Everything else
+    git_problems finds (uncommitted, unpushed, stash, behind, detached HEAD, a merge without conflicts) is a quiet note."""
+    path = Path(path)
+    conflicts = git_out(path, "diff", "--name-only", "--diff-filter=U").splitlines() if git_out(path, "rev-parse", "--git-dir") else []
+    red, notes = [], []
+    for p in git_problems(path, fetch, behind):
+        if conflicts and p.endswith(" in progress"):
+            red.append(f"{p} with conflicts ({len(conflicts)} file{'s' * (len(conflicts) != 1)})")
+        else:
+            notes.append(p)
+    return red + commit_secrets(path), notes
+
+
 def start_check(name, path, fetch=True):
-    """(problems, notes) on Open. Problems: git state. A crash with clean git is a note; with git problems it is added to them."""
-    problems = git_problems(path, fetch)
-    note = crash_note(name)
-    if note and problems:
-        problems.insert(0, note)
-        note = ""
-    return problems, [note] if note else []
+    """(red, notes) on Open. Only red problems make Open offer Claude; a crash (saved layout not clean) is a note, like the git state."""
+    red, notes = git_red_notes(path, fetch)
+    crash = crash_note(name)
+    return red, ([crash] if crash else []) + notes
 
 
 # ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
@@ -1047,7 +1220,7 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     elif failures:
         reason = reason or "a service failed to start"
     cont = bool(restore) and plan is not None and any(p[1] == "claude" for p in plan)
-    write_status(name, findings=list(findings))
+    write_status(name, list(findings), list(notes))
     if reason:
         inject_prompt(first_claude, investigate_prompt(name, path, sess, reason, failures, findings), [HERE])
         say(f"{name}: {reason}; Claude starts with the investigate prompt")
@@ -1240,6 +1413,7 @@ def launch_sidebar():
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(sidebar_session_file())
     proc = subprocess.Popen(["kitty", "--class", "hyperbeam-sidebar", "--title", "hyperbeam", *shlex.split(os.environ.get("HB_KITTY_ARGS", "")),
+                             "-o", "allow_remote_control=socket-only", "--listen-on", f"unix:{display_env()['XDG_RUNTIME_DIR']}/hyperbeam-sidebar",
                              "--session", str(f)],
                             env=display_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     sidebar_update(kitty_pid=proc.pid)
@@ -1670,7 +1844,10 @@ def service_states(sess, man, host_ports):
     return out
 
 
-def project_info(name, rows=None, footer=True):
+RED_ANSI, RESET_ANSI = "\x1b[31;1m", "\x1b[0m"
+
+
+def project_info(name, rows=None, footer=True, alert=True):
     """The text `kk` prints. Discovery only; each source is skipped silently if it does not apply. `rows`: a scan() result to reuse."""
     from concurrent.futures import ThreadPoolExecutor
     mans = load_manifests()
@@ -1705,6 +1882,11 @@ def project_info(name, rows=None, footer=True):
     L.append(f"{name}   {home_rel(path)}   session: {sess if running else '(not running)'}")
     st = project_status(name, man)
     L.append(f"status: [{st[0]}] {st[1]}" if st else "status: not running")
+    if alert and st and st[0] == "red":              # problems first, in red, with the fix command
+        L[:0] = [RED_ANSI + "PROBLEMS" + RESET_ANSI] + [RED_ANSI + f"  - {f}" + RESET_ANSI for f in red_findings(name, man)] + \
+                [RED_ANSI + f"  fix: hyperbeam fix{'' if os.environ.get('HB_PROJECT') == name else ' ' + name}" + RESET_ANSI, ""]
+    if running:
+        section("Notes (quiet: they do not affect the dot; the wrap-up check at Stop/Done deals with them)", note_findings(name))
     states = service_states(sess, man, ports)
     section("Services", [f"{n:<12} {st:<7} {d}" for n, st, d in states])
     section("App", [f"http://localhost:{p}  {proc}" + ("  (this machine only)" if lo else "") for p, (proc, lo) in sorted(ports.items())])
@@ -1739,9 +1921,13 @@ def menu_overview():
     for name in open_names:
         st = project_status(name, mans.get(name)) or ("none", "not running")
         items.append((["red", "blue", "cyan", "green", "none"].index(st[0]), name, st))
-    L = ["hyperbeam: open projects", ""]
+    L = []
+    reds = [(n, st) for _, n, st in sorted(items) if st[0] == "red"]
+    if reds:
+        L += [RED_ANSI + "PROBLEMS" + RESET_ANSI] + [RED_ANSI + f"  {n}: {st[1]}  ->  hyperbeam fix {n}" + RESET_ANSI for n, st in reds] + [""]
+    L += ["hyperbeam: open projects", ""]
     for _, name, st in sorted(items):
-        L += [f"[{st[0]}] {name}: {st[1]}", "", project_info(name, rows, footer=False), "", DIVIDER, ""]
+        L += [f"[{st[0]}] {name}: {st[1]}", "", project_info(name, rows, footer=False, alert=False), "", DIVIDER, ""]
     if not items:
         L += ["(no project is open)", ""]
     notes = [(n, crash_note(n)) for n in sorted(mans) if crash_note(n)]
@@ -1899,16 +2085,43 @@ def clip(text, width):
     return text if len(text) <= width else text[:max(0, width - 1)] + "…"
 
 
+def branch_of(path):
+    """Branch of a checkout, read from .git/HEAD (no git process): the name, a 6-character hash when HEAD is detached, "-" without git."""
+    try:
+        g = Path(path) / ".git"
+        if g.is_file():
+            g = Path(os.path.join(path, g.read_text().split(":", 1)[1].strip()))
+        head = (g / "HEAD").read_text().strip()
+    except (OSError, IndexError):
+        return "-"
+    if head.startswith("ref: refs/heads/"):
+        return head[16:]
+    return head[:6] if re.fullmatch(r"[0-9a-f]{40,64}", head) else "-"
+
+
+def fit_row(name, branch, avail):
+    """Name and branch within `avail` columns: the branch is shortened first (down to 6 characters, ending in …), then the name."""
+    if len(name) + len(branch) <= avail:
+        return name, branch
+    keep = min(len(branch), max(6, avail - len(name)))
+    branch = clip(branch, keep)
+    return clip(name, max(1, avail - len(branch))), branch
+
+
 def row_text(p, st, width, note=""):
-    """One list row: dot, name (clipped with … so the dot and port always fit), port right-aligned. `width` is the room for the row."""
+    """One list row: dot, project, branch, port. The dot and the port are never cut; the branch gives way first, then the name.
+    `width` is the room for the row."""
     port = str(p["port"]) if p.get("port") else ("-" if p["manifest"] else "unset")
     pstyle = ORANGE if not p["manifest"] else "dim" if not p.get("port") else "cyan"
-    if note:                    # the hyperbeam row: "branch" (not on main) or "behind" (origin/main is ahead)
+    if note:                    # the hyperbeam row when origin/main is ahead: "behind"
         port, pstyle = note, "yellow"
-    room = max(4, width - 2 - 1 - len(port))
+    branch = p.get("branch", "-")
+    avail = max(4, width - 2 - len(port) - 2)           # dot, port and the two spaces around the branch
+    name, branch = fit_row(p["name"], branch, avail)
     t = Text(no_wrap=True, overflow="crop")
     t.append("● " if st else "  ", style=DOT.get(st[0], "") if st else "")
-    t.append(clip(p["name"], room).ljust(room), style="bold white" if p["recent"] else "grey54")
+    t.append(name.ljust(avail - len(branch)), style="bold white" if p["recent"] else "grey54")
+    t.append(" " + branch, style="dim" if branch in ("-", "main", "master") else "yellow")
     t.append(" " + port, style=pstyle)
     return t
 
@@ -1939,10 +2152,11 @@ class SettingsScreen(ModalScreen):
     SettingsScreen .srow.sel Static { background: $accent 40%; }
     SettingsScreen .srow Button { height: 1 !important; border: none !important; min-width: 5; width: 5; margin-left: 1; }
     SettingsScreen #sheet { height: 1fr; margin-top: 1; }
+    SettingsScreen #wnote { height: 1; color: $text-muted; }
     SettingsScreen #close { height: 1 !important; border: none !important; }
     """
     LABELS = [("open_mode", "open mode"), ("claude_model", "claude model"), ("claude_effort", "claude effort"),
-              ("menu_width", "menu width"), ("recent_days", "recent (days)")]
+              ("menu_width", "menu width"), ("recent_days", "recent (days)"), ("on_problem", "on problem")]
 
     def __init__(self):
         super().__init__()
@@ -1958,7 +2172,13 @@ class SettingsScreen(ModalScreen):
                     yield Button("+", id=f"p-{key}")
             with VerticalScroll(id="sheet"):
                 yield Static(self.cheat(), markup=False)
+            yield Static(self.width_note(), id="wnote", markup=False)
             yield Button("Close (esc)", id="close")
+
+    @staticmethod
+    def width_note():
+        live = os.environ.get("HB_SIDEBAR") and os.environ.get("KITTY_LISTEN_ON")
+        return "menu width: applies at once in this sidebar window" if live else "menu width: applies when the sidebar window is opened again"
 
     def cheat(self):
         lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
@@ -1982,6 +2202,8 @@ class SettingsScreen(ModalScreen):
         new = vals[(i + 1) % len(vals)] if len(vals) == 2 or key == "open_mode" else vals[max(0, min(len(vals) - 1, i + step))]      # a toggle flips; a number clamps
         if new != cur:
             set_config(key, new)
+            if key == "menu_width":
+                self.app.fit_width()
             self.app.refresh_list()
         self.show()
 
@@ -2049,8 +2271,11 @@ class Menu(App):
         self.set_interval(3, self.poll_running)
         self.set_interval(5, self.poll_status)
         self.set_interval(600, self.fetch_repo)
+        self.set_interval(60, self.recheck_running)
+        self.set_timer(2, self.recheck_running)
         asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, lambda: self.exit(return_code=75))      # `hyperbeam update`: restart me
         self.fetch_repo()
+        self.set_timer(1.0, self.fit_width)
         self.set_interval(300, self.save_layouts)
         journal_start()
         touch_opened("hyperbeam")       # the hyperbeam session is home: recent (bold) and part of the session record
@@ -2058,6 +2283,29 @@ class Menu(App):
     def on_resize(self, event):
         self.set_class(event.size.width < 50, "narrow")
         self.call_after_refresh(self.refresh_list)
+
+    def recheck_running(self):
+        """Git notes and the red git checks of running projects, again (the stored result is what the dot, kk and the status segment read)."""
+        def work():
+            st = self.compute_status(self.projects, True)
+            self.call_from_thread(self.set_status, st)
+        self.run_worker(work, thread=True, group="recheck")
+
+    def fit_width(self, tries=4):
+        """Sidebar: make this window `menu_width` columns wide through kitty remote control (this kitty only: the sidebar was started with
+        allow_remote_control=socket-only and --listen-on, which puts KITTY_LISTEN_ON in our environment). resize-window moves the split by a
+        number of cells, so we measure our own width and correct it a few times."""
+        if not (os.environ.get("HB_SIDEBAR") and os.environ.get("KITTY_LISTEN_ON")) or tries <= 0:
+            return
+        delta = cfg_get("menu_width") - self.size.width
+        if not delta:
+            return
+
+        def work():
+            subprocess.run(["kitten", "@", "resize-window", "--self", "--axis", "horizontal", "--increment", str(delta)],
+                           capture_output=True, timeout=5)
+            self.call_from_thread(lambda: self.set_timer(0.6, lambda: self.fit_width(tries - 1)))
+        self.run_worker(work, thread=True, group="width")
 
     def fetch_repo(self):
         """The hyperbeam row's note: on a branch / origin/main ahead. Fetches (short, quiet) every 10 minutes."""
@@ -2120,6 +2368,10 @@ class Menu(App):
                 if (p["manifest"], p["port"]) != now:
                     p["manifest"], p["port"] = now
                     changed = True
+            for p in self.projects:                             # a branch switched since the last look
+                b = branch_of(p["path"])
+                if p.get("branch") != b:
+                    changed = True
             st = self.compute_status(self.projects)
             if st != self.status or changed:
                 self.call_from_thread(self.set_status, st)
@@ -2144,7 +2396,8 @@ class Menu(App):
         rows = self.ordered()
         width = max(20, self.size.width - 2 - 1)    # the option's own padding, the 1-column scrollbar
         for p in rows:
-            note = self.repo[0] if p["name"] == "hyperbeam" else ""
+            p["branch"] = branch_of(p["path"])
+            note = self.repo[0] if p["name"] == "hyperbeam" and self.repo[0] == "behind" else ""
             ol.add_option(Option(row_text(p, self.status.get(p["name"]) if p["running"] else None, width, note), id=p["name"]))
         if rows:
             names = [p["name"] for p in rows]
@@ -2547,6 +2800,16 @@ def main():
     i.add_argument("project", nargs="?")
     i.set_defaults(f=cmd_info)
     sub.add_parser("_menu").set_defaults(f=lambda _: run_menu())
+    fx = sub.add_parser("fix", help="send RECOVER.md and the problems to the project's Claude (the Fix button); default project $HB_PROJECT")
+    fx.add_argument("project", nargs="?")
+    fx.set_defaults(f=cmd_fix)
+    en = sub.add_parser("_entered")
+    en.add_argument("client")
+    en.add_argument("session")
+    en.set_defaults(f=cmd_entered)
+    pr = sub.add_parser("_problem")
+    pr.add_argument("project")
+    pr.set_defaults(f=cmd_problem)
     sub.add_parser("_right", help="the sidebar's right side: record this tty, exec tmux attach").set_defaults(f=cmd_right)
     hm = sub.add_parser("_home")
     hm.add_argument("client")
