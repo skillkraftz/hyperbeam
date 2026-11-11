@@ -6,3 +6,4 @@
 - README-staleness check.
 - Wrap-up notes into .hyperbeam/notes.
 - Polish phase.
+- Prompt files as skills, exportable to claude.ai.
