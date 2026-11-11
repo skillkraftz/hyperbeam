@@ -30,6 +30,13 @@ so you know which ports are taken.
 - Check it: curl the port, run the test command, read the window output. If the status below lists a failure, find its cause first.
 - Leave what you started running if it works; stop what does not.
 
+## 2b. Wire in the shared rules, then wait
+hyperbeam keeps one rules file for every project: `.hyperbeam/RULES.md` (`.hyperbeam` is a symlink in the project to its hyperbeam data folder; git ignores it
+globally). Check that `.hyperbeam/RULES.md` is readable. Then propose adding the line `@.hyperbeam/RULES.md` to the project's CLAUDE.md (create the file if
+there is none; do not write it yet). Read RULES.md against the project's CLAUDE.md and list every conflict (for example a different branch or PR workflow,
+testing, or secrets rule) in one line each, and say which side you would keep. Show this with the manifest in step 3 and **wait for approval**; editing the project's
+CLAUDE.md is a project change, so it stays uncommitted unless the user says otherwise. Claude Code may ask the user once to approve the import (the file is outside the project folder).
+
 ## 3. Propose the manifest, then wait
 Show the user the full `projects/<name>.toml` you propose (format in CLAUDE.md: `port` only if something serves, ordered services, `ready_port`, `stop` for every backing
 service, `[env]` if needed; no URLs: `kk` discovers links itself, `[links]` is only for extras it cannot find) with one line per service saying what you checked. **Then stop and wait for the user to approve.**

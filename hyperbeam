@@ -65,10 +65,12 @@ def migrate_config(legacy=None):
 
 migrate_config()
 CFG = load_cfg()
-ROOT = Path(os.path.expanduser(CFG.get("projects_dir", "~/projects")))
+ROOT = Path(os.path.expanduser(os.environ.get("HB_PROJECTS_DIR") or CFG.get("projects_dir", "~/projects")))
 MANIFESTS = Path(os.environ.get("HB_MANIFESTS", HERE / "projects"))   # (override is for tests)
 ACCOUNTS = {a.lower() for a in CFG["accounts"]}
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "hyperbeam"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "hyperbeam"     # global files; per project: DATA_DIR/projects/<name>-<hash>/
+STATE_DIR = DATA_DIR
+OLD_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "hyperbeam"   # before the foundation PR; migrated once
 SKIP = {"node_modules", ".venv", "venv", "target", "dist", "build", "out", "__pycache__",
         ".next", ".cache", ".tox", "vendor", ".git"}
 SELF = shlex.quote(str(HERE / "hyperbeam"))
@@ -186,6 +188,120 @@ def load_manifests():
 
 def running_sessions():
     return set(tmux("list-sessions", "-F", "#{session_name}", check=False).stdout.split())
+
+
+# ---------- per-project data: DATA_DIR/projects/<name>-<6 hex of the absolute path>/ , linked into the project as .hyperbeam ----------
+_PATHS = {}
+
+
+def known_path(name):
+    """The project's folder: manifest, hyperbeam itself, ROOT/name (nested names use _ for /), else a scan; ROOT/name if nothing matches."""
+    if name in _PATHS:
+        return _PATHS[name]
+    man = load_manifests().get(name)
+    if man:
+        p = manifest_path(man)
+    elif name == "hyperbeam":
+        p = HERE
+    else:
+        p = next((c for c in (ROOT / name, ROOT / name.replace("_", "/")) if c.is_dir()), None)
+        if p is None:
+            row = next((r for r in scan() if r["name"] == name), None) if ROOT.is_dir() else None
+            p = row["path"] if row else ROOT / name
+    _PATHS[name] = p
+    return p
+
+
+def project_dir(name, path=None, create=True):
+    """Everything hyperbeam keeps for one project. The hash of the absolute path keeps two same-named projects in different folders apart."""
+    p = Path(path) if path else known_path(name)
+    d = DATA_DIR / "projects" / f"{name}-{hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:6]}"
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+GIT_IGNORE_LINE = ".hyperbeam"
+
+
+def ensure_git_ignore():
+    f = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "git" / "ignore"
+    try:
+        have = f.read_text().splitlines() if f.exists() else []
+        if GIT_IGNORE_LINE not in (x.strip() for x in have):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            with f.open("a") as fh:
+                fh.write(("" if not have or f.read_text().endswith("\n") else "\n") + GIT_IGNORE_LINE + "\n")
+    except OSError:
+        pass
+
+
+def link_force(link, target):
+    """Make `link` a symlink to `target` (recreated if missing or pointing elsewhere); a real file or folder there is left alone."""
+    if link.is_symlink():
+        if os.readlink(link) == str(target):
+            return True
+        link.unlink()
+    elif link.exists():
+        return False
+    link.symlink_to(target)
+    return True
+
+
+def ensure_link(name, path=None):
+    """On Open: <project>/.hyperbeam -> the project's data folder (made again if deleted; the data was never inside the project),
+    RULES.md in that folder -> the one in the hyperbeam repo."""
+    p = Path(path) if path else known_path(name)
+    if not p.is_dir():
+        return None
+    d = project_dir(name, p)
+    link_force(d / "RULES.md", HERE / "RULES.md")
+    (d / "notes").mkdir(exist_ok=True)
+    ensure_git_ignore()
+    try:
+        link_force(p / ".hyperbeam", d)
+    except OSError:
+        pass
+    return d
+
+
+# ---------- migration: ~/.local/state/hyperbeam -> ~/.local/share/hyperbeam (per project folders) ----------
+PER_PROJECT = {"layouts": "layout.json", "status": "status.json", "claude": "claude", "auto": "auto", "waiting": "waiting", "startcheck": "startcheck.txt"}
+
+
+def migrate_state(old=None):
+    """Copy the old state folder into the new layout, check every file arrived, then remove the old folder. Nothing already in the new
+    place is overwritten. Returns (files copied, problems); the old folder is kept if there are any problems."""
+    old = Path(old) if old else OLD_STATE_DIR
+    if not old.is_dir() or old.resolve() == DATA_DIR.resolve():
+        return 0, []
+    pairs = []
+    for f in sorted(x for x in old.rglob("*") if x.is_file() or x.is_symlink()):
+        rel = f.relative_to(old)
+        kind = rel.parts[0]
+        if kind in PER_PROJECT and len(rel.parts) == 2:
+            name = f.name[:-len(f.suffix)] if kind in ("layouts", "status", "startcheck") else f.name
+            dst = project_dir(name) / PER_PROJECT[kind]
+        elif kind == "prompts" and len(rel.parts) == 2:
+            m = re.match(r"^(.*)-\d{8}-\d{6}\.md$", f.name)
+            dst = project_dir(m.group(1) if m else "unsorted") / "prompts" / f.name
+        else:
+            dst = DATA_DIR / rel
+        pairs.append((f, dst))
+    done, bad = 0, []
+    for src, dst in pairs:
+        try:
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst, follow_symlinks=False)
+                done += 1
+            if not (dst.exists() or dst.is_symlink()):
+                bad.append(str(src))
+        except OSError as e:
+            bad.append(f"{src}: {e}")
+    if not bad:
+        shutil.rmtree(old)
+    return done, bad
 
 
 # ---------- state (last opened) ----------
@@ -374,7 +490,7 @@ def pane_tail(target, n=50):
 
 
 def write_prompt(sess, text):
-    d = STATE_DIR / "prompts"
+    d = project_dir(session_project(sess)) / "prompts"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{sess}-{time.strftime('%Y%m%d-%H%M%S')}.md"
     f.write_text(text)
@@ -469,29 +585,27 @@ def send_line(target, text):
 
 
 # ---------- status dots: red (service down, start-check findings, crash), blue (Claude waits for the user), green ----------
-def status_dir(kind):
-    return STATE_DIR / kind
+def pfile(name, kind):
+    """A per-project state file: status.json, claude (the hooks' state), auto (hash of the problems RECOVER.md was sent for), layout.json."""
+    return project_dir(name) / kind
 
 
 def write_status(name, findings, notes=()):
     """findings = the red ones (merge/rebase with conflicts, secrets in commits); notes = the quiet git state (uncommitted, unpushed, ...)."""
-    d = status_dir("status")
-    d.mkdir(parents=True, exist_ok=True)
-    (d / f"{name}.json").write_text(json.dumps({"v": 2, "findings": list(findings), "notes": list(notes), "time": time.time()}))
+    pfile(name, "status.json").write_text(json.dumps({"v": 2, "findings": list(findings), "notes": list(notes), "time": time.time()}))
 
 
 def read_status(name):
     try:
-        d = json.loads((status_dir("status") / f"{name}.json").read_text())
+        d = json.loads(pfile(name, "status.json").read_text())
     except (OSError, ValueError):
         return {}
     return d if d.get("v") == 2 else {}         # an older file mixed notes into the findings: ignore it until the next check
 
 
 def clear_status(name):
-    (status_dir("status") / f"{name}.json").unlink(missing_ok=True)
-    (status_dir("claude") / name).unlink(missing_ok=True)
-    (status_dir("auto") / name).unlink(missing_ok=True)
+    for k in ("status.json", "claude", "auto"):
+        pfile(name, k).unlink(missing_ok=True)
 
 
 def recheck(name, path):
@@ -502,7 +616,7 @@ def recheck(name, path):
 def claude_state(name):
     """('waiting', reason) / ('working', '') from the hooks' state file; ('', '') if none or if no Claude runs in the session any more."""
     try:
-        txt = (status_dir("claude") / name).read_text().strip()
+        txt = pfile(name, "claude").read_text().strip()
     except OSError:
         return "", ""
     pane = find_claude_pane(sanitize(name))
@@ -569,7 +683,7 @@ def cmd_entered(a):
     name = session_project(sess)
     findings = red_findings(name, load_manifests().get(name))
     sync_alert(name, findings, note_findings(name))
-    auto = status_dir("auto") / name
+    auto = pfile(name, "auto")
     if not findings:
         auto.unlink(missing_ok=True)
         return 0
@@ -671,8 +785,7 @@ GUARD_MATCHER = "Bash"
 
 
 def hook_command(state):
-    d = '"${XDG_STATE_HOME:-$HOME/.local/state}/hyperbeam/claude"'
-    return f'[ -n "$HB_PROJECT" ] && {{ mkdir -p {d}; echo "{state}" > {d}/"$HB_PROJECT"; }}; exit 0'
+    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ] && echo "{state}" > "$HB_STATE/claude"; exit 0'
 
 
 def guard_command():
@@ -718,12 +831,12 @@ def install_hooks(settings=None):
     return [] if json.dumps(data, sort_keys=True) == before else sorted({e for e, _, _ in want})
 
 
-# ---------- layouts (saved under ~/.local/state/hyperbeam/layouts/<project>.json) ----------
+# ---------- layouts (saved to the project data folder, layout.json) ----------
 SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
 
 
 def layout_file(name):
-    return STATE_DIR / "layouts" / f"{name}.json"
+    return pfile(name, "layout.json")
 
 
 def load_layout(name):
@@ -1093,6 +1206,7 @@ def open_project(name, path, man, ask, say, onboard=False):
     """Everything Open does before showing the session: the session if it isn't running (asking about the saved layout and,
     if the start check found something, about Claude), or the investigate window on Onboard."""
     sess = sanitize(name)
+    ensure_link(name, path)
     if sess == MENU:
         return ensure_menu()
     if session_exists(sess):
@@ -1146,7 +1260,7 @@ def ensure_menu():
         return
     clean_server_env()
     claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(HERE),
-                       "-e", "HB_PROJECT=hyperbeam", "-e", "HOST=0.0.0.0"])
+                       "-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', HERE)}", "-e", "HOST=0.0.0.0"])
     publish_claude_pane(MENU, claude)
     new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(HERE)])
     send_line(claude, f"export HB_CLAUDE_PANE={claude}; " + claude_base())
@@ -1201,6 +1315,8 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
     env = session_env(man, name)
+    ensure_link(name, path)
+    env["HB_STATE"] = str(project_dir(name, path))
     clean_server_env()
     envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
     plan = None
@@ -1236,10 +1352,9 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     if shell:
         ff = ""
         if findings or notes:
-            d = STATE_DIR / "startcheck"
-            d.mkdir(parents=True, exist_ok=True)
-            (d / f"{sess}.txt").write_text("\n".join([*findings, *[f"note: {n}" for n in notes]]) + "\n")
-            ff = f" --findings {shlex.quote(str(d / (sess + '.txt')))}"
+            sc = pfile(name, "startcheck.txt")
+            sc.write_text("\n".join([*findings, *[f"note: {n}" for n in notes]]) + "\n")
+            ff = f" --findings {shlex.quote(str(sc))}"
         send_line(shell, f"clear; {SELF} _warn {shlex.quote(str(path))}{ff}; {SELF} info {shlex.quote(name)}")
     if man is None:
         reason = reason or "no manifest"
@@ -1600,7 +1715,9 @@ def cmd_lab(a):
         img = Path("/var/lib/hyperbeam-lab.img")
         print(f"lab: user {LAB_USER}, {LAB_HOME} mounted; disk {u.used / 2**30:.1f} of {u.total / 2**30:.1f} GB used"
               + (f" (image file {img.stat().st_size / 2**30:.0f} GB)" if img.exists() else ""))
-        runs = sorted(p.name for p in (LAB_HOME / "run").iterdir()) if (LAB_HOME / "run").is_dir() else []
+        # /srv/hblab is hblab's (mode 750): list it as hblab, and say so instead of crashing if that fails
+        ls = subprocess.run(lab_sudo("ls", "-1", str(LAB_HOME / "run")), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        runs = sorted(ls.stdout.split()) if ls.returncode == 0 else []
         print(f"run directories: {', '.join(runs) or 'none'}")
         print(f"virtual display {LAB_DISPLAY}: " + ("up" if Path("/tmp/.X11-unix/X99").exists() else "not running (starts with the next `lab run`)"))
         ps = subprocess.run(["ps", "-u", LAB_USER, "-o", "pid,etime,args"], capture_output=True, text=True).stdout.strip()
@@ -3181,6 +3298,9 @@ def main():
     lsub.add_parser("reset", help="stop hblab's processes and empty the lab disk")
     lsub.add_parser("status", help="disk use, run directories, processes")
     lb.set_defaults(f=cmd_lab)
+    ms = sub.add_parser("_migrate-state", help="copy ~/.local/state/hyperbeam into the per-project layout under ~/.local/share/hyperbeam (also runs by itself)")
+    ms.add_argument("old", nargs="?")
+    ms.set_defaults(f=lambda a: print("migrated %d files%s" % ((lambda r: (r[0], f"; problems: {r[1]}" if r[1] else "; old folder removed"))(migrate_state(a.old)))))
     sub.add_parser("_close-sidebar").set_defaults(f=cmd_close_sidebar)
     sb = sub.add_parser("sidebar", help="hide / show the sidebar (the same as M-s)")
     sb.add_argument("client", nargs="?")
@@ -3189,6 +3309,18 @@ def main():
     sv.add_argument("session", nargs="?")
     sv.set_defaults(f=cmd_save)
     argv = sys.argv[1:]
+    if argv and argv[0] not in sub.choices and ("/" in argv[0] or argv[0] in (".", "~")) and Path(argv[0]).expanduser().is_dir():
+        # `hyperbeam <dir>`: that folder's projects for this run (the sidebar and its menu inherit it through the environment)
+        global ROOT
+        ROOT = Path(argv[0]).expanduser().resolve()
+        os.environ["HB_PROJECTS_DIR"] = str(ROOT)
+        argv = argv[1:]
+    try:
+        _done, _bad = migrate_state() if (not argv or argv[0] != "lab") else (0, [])      # `lab` commands run as the user: never touch state
+        if _bad:
+            print("hyperbeam: could not migrate the old state folder; it was left in place:\n  " + "\n  ".join(_bad[:5]), file=sys.stderr)
+    except OSError as e:
+        print(f"hyperbeam: state migration failed: {e}", file=sys.stderr)
     if Path(sys.argv[0]).name == "kk":      # ~/.local/bin/kk is a symlink to this script
         argv = ["info", *argv]
     a = ap.parse_args(argv)
