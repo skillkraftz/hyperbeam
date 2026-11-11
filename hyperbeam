@@ -37,8 +37,34 @@ def clean_path(path, venv=""):
 
 strip_uv_env()
 HERE = Path(os.path.realpath(__file__)).parent
-CONFIG_FILE = Path(os.environ.get("HB_CONFIG", HERE / "config.toml"))   # (override is for tests)
-CFG = tomllib.loads(CONFIG_FILE.read_text())
+DEFAULT_FILE = HERE / "config.default.toml"      # in the repo: defaults, never written by hyperbeam
+CONFIG_FILE = Path(os.environ.get("HB_CONFIG", Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hyperbeam" / "config.toml"))   # the user's settings (HB_CONFIG is for tests)
+
+
+def read_toml(f):
+    try:
+        return tomllib.loads(Path(f).read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def load_cfg():
+    """The defaults file overlaid with the user's file."""
+    return {**read_toml(DEFAULT_FILE), **read_toml(CONFIG_FILE)}
+
+
+def migrate_config(legacy=None):
+    """Once: if the user has no settings file yet but the repo still has an old config.toml, copy its values over (the repo file is left alone)."""
+    legacy = Path(legacy or HERE / "config.toml")
+    if CONFIG_FILE.exists() or not legacy.exists():
+        return False
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text("# hyperbeam settings: overrides config.default.toml in the repo. The Settings screen writes this file.\n" + legacy.read_text())
+    return True
+
+
+migrate_config()
+CFG = load_cfg()
 ROOT = Path(os.path.expanduser(CFG.get("projects_dir", "~/projects")))
 MANIFESTS = Path(os.environ.get("HB_MANIFESTS", HERE / "projects"))   # (override is for tests)
 ACCOUNTS = {a.lower() for a in CFG["accounts"]}
@@ -49,12 +75,12 @@ SELF = shlex.quote(str(HERE / "hyperbeam"))
 MENU = "hyperbeam"          # name of the tmux session the menu runs in
 # The keys of hyperbeam.conf (keep in sync with it). Shown in the menu's button bar and Settings tab and in the status bar.
 KEYS = [("M-Left/Right/Up/Down", "select pane"), ("M-z", "zoom / unzoom the pane"),
-        ("M-]", "next session in the stack"), ("M-[", "previous session in the stack"),
+        ("M-h", "back to the hyperbeam session (menu), from anywhere"), ("M-]", "next session in the stack"), ("M-[", "previous session in the stack"),
         ("M-y", "copy pane scrollback (clipboard; outbox over SSH)")]
 USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select pane"), ("C-a H J K L", "resize pane"),
              ("M-n / M-p", "next / previous window"), ("C-a w", "window tree"), ("C-a [", "copy mode (v select, y copy)"),
              ("M-`", "mouse on/off"), ("C-a r", "reload tmux.conf")]
-HINT = "M-arrows pane  M-z zoom  M-[ M-] stack  M-y copy"
+HINT = "M-arrows pane  M-z zoom  M-h menu  M-[ M-] stack  M-y copy"
 
 
 DEFAULTS = {"open_mode": "switch", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7}
@@ -70,15 +96,16 @@ CONFIG_NOTES = {"open_mode": '"switch": Open switches this terminal to the proje
 def cfg_get(key):
     """A setting from config.toml, read each time so the Settings screen takes effect at once; default if missing or invalid."""
     try:
-        v = tomllib.loads(CONFIG_FILE.read_text()).get(key, DEFAULTS[key])
-    except (OSError, tomllib.TOMLDecodeError):
+        v = load_cfg().get(key, DEFAULTS[key])
+    except Exception:
         v = DEFAULTS[key]
     return v if type(v) is type(DEFAULTS[key]) and (key not in ("claude_model", "claude_effort", "open_mode") or v in CHOICES[key]) else DEFAULTS[key]
 
 
 def set_config(key, value):
-    """Write a setting to config.toml, keeping the rest of the file (comments) as it is."""
-    text = CONFIG_FILE.read_text()
+    """Write a setting to the user's config file (created if missing), keeping the rest of the file (comments) as it is."""
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    text = CONFIG_FILE.read_text() if CONFIG_FILE.exists() else "# hyperbeam settings: overrides config.default.toml in the repo. The Settings screen writes this file.\n"
     line = f"{key} = " + (json.dumps(value) if isinstance(value, str) else str(value))
     if re.search(rf"^{key}\s*=.*$", text, flags=re.M):
         text = re.sub(rf"^{key}\s*=.*$", line, text, flags=re.M)
@@ -480,15 +507,16 @@ def project_status(name, man):
     return "green", "running, services up" if man and man.get("service") else "running"
 
 
-HOOK_MARKS = ("hyperbeam/waiting", "hyperbeam/claude")     # the second is current; the first is what PR #10 installed
-# event -> (matcher, state written). Plain shell, no Python: fast; nothing happens outside hyperbeam sessions (no $HB_PROJECT).
-HOOK_CMDS = {
-    "Stop": ("", "waiting finished responding"),
-    "Notification": ("", "waiting needs your input or permission"),
-    "PreToolUse": ("AskUserQuestion|ExitPlanMode", "waiting asks you a question"),
-    "PostToolUse": ("", "working"),
-    "UserPromptSubmit": ("", "working"),
-}
+HOOK_MARKS = ("hyperbeam/waiting", "hyperbeam/claude", "hyperbeam-guard")     # how our hooks are recognised (the first is PR #10's)
+# (event, matcher, state written). Plain shell, no Python: fast; nothing happens outside hyperbeam sessions (no $HB_PROJECT).
+HOOK_CMDS = [
+    ("Stop", "", "waiting finished responding"),
+    ("Notification", "", "waiting needs your input or permission"),
+    ("PreToolUse", "AskUserQuestion|ExitPlanMode", "waiting asks you a question"),
+    ("PostToolUse", "", "working"),
+    ("UserPromptSubmit", "", "working"),
+]
+GUARD_MATCHER = "Bash"
 
 
 def hook_command(state):
@@ -496,37 +524,47 @@ def hook_command(state):
     return f'[ -n "$HB_PROJECT" ] && {{ mkdir -p {d}; echo "{state}" > {d}/"$HB_PROJECT"; }}; exit 0'
 
 
+def guard_command():
+    """The guard (guard.py next to this script): nothing outside hyperbeam sessions; otherwise a small stdlib Python reads the tool call."""
+    return f': hyperbeam-guard; [ -n "$HB_PROJECT" ] || exit 0; exec /usr/bin/python3 {shlex.quote(str(HERE / "guard.py"))}'
+
+
 def install_hooks(settings=None):
-    """Merge hyperbeam's hooks into the user's Claude settings; nothing else is changed. Idempotent (ours are recognised by the state path
-    in the command; PR #10's older ones are replaced). A backup of the file is kept next to it once."""
+    """Merge hyperbeam's hooks into the user's Claude settings; nothing else is changed. Idempotent: ours are recognised by HOOK_MARKS and replaced
+    in place (PR #10's older ones too; ones no longer wanted are removed). A backup of the file is kept next to it once. Returns the events changed."""
     f = Path(settings or Path.home() / ".claude/settings.json")
     data = json.loads(f.read_text()) if f.exists() else {}
+    before = json.dumps(data, sort_keys=True)
     bak = f.with_name(f.name + ".hyperbeam-backup")
     if f.exists() and not bak.exists():
         bak.write_text(f.read_text())
     hooks = data.setdefault("hooks", {})
-    changed = []
-    for event, (matcher, state) in HOOK_CMDS.items():
+    want = [(e, m, hook_command(st)) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command())]
+    is_guard = lambda c: "hyperbeam-guard" in c
+    claimed = set()
+    for event, matcher, cmd in want:
         groups = hooks.setdefault(event, [])
-        entry = {"type": "command", "command": hook_command(state), "timeout": 5}
-        done = False
-        for g in list(groups):
-            for i, h in enumerate(g.get("hooks", [])):
-                if any(m in h.get("command", "") for m in HOOK_MARKS):
-                    if h != entry or g.get("matcher", "") != matcher:
-                        g["hooks"][i] = entry
-                        if matcher:
-                            g["matcher"] = matcher
-                        else:
-                            g.pop("matcher", None)
-                        changed.append(event)
-                    done = True
-        if not done:
+        entry = {"type": "command", "command": cmd, "timeout": 5}
+        for gi, g in enumerate(groups):
+            hit = [i for i, h in enumerate(g.get("hooks", [])) if (event, gi, i) not in claimed and any(m in h.get("command", "") for m in HOOK_MARKS)
+                   and is_guard(h["command"]) == is_guard(cmd)]
+            if hit:
+                g["hooks"][hit[0]] = entry
+                g["matcher"] = matcher
+                if not matcher:
+                    g.pop("matcher")
+                claimed.add((event, gi, hit[0]))
+                break
+        else:
             groups.append({**({"matcher": matcher} if matcher else {}), "hooks": [entry]})
-            changed.append(event)
+            claimed.add((event, len(groups) - 1, 0))
+    for event, groups in list(hooks.items()):              # ours that are no longer wanted
+        for gi, g in enumerate(groups):
+            g["hooks"] = [h for i, h in enumerate(g.get("hooks", [])) if (event, gi, i) in claimed or not any(m in h.get("command", "") for m in HOOK_MARKS)]
+        hooks[event] = [g for g in groups if g.get("hooks")]
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(data, indent=2) + "\n")
-    return changed
+    return [] if json.dumps(data, sort_keys=True) == before else sorted({e for e, _, _ in want})
 
 
 # ---------- layouts (saved under ~/.local/state/hyperbeam/layouts/<project>.json) ----------
@@ -2283,9 +2321,12 @@ def main():
     wc.add_argument("--all", action="store_true", help="scan every tracked file too (pattern testing; counts only with --counts)")
     wc.add_argument("--counts", action="store_true")
     wc.set_defaults(f=cmd_wrapup)
-    hk = sub.add_parser("_hooks", help="merge hyperbeam's Claude hooks (waiting state) into ~/.claude/settings.json")
+    hk = sub.add_parser("_hooks", help="merge hyperbeam's Claude hooks (waiting state, the Bash guard) into ~/.claude/settings.json")
     hk.add_argument("--settings")
     hk.set_defaults(f=lambda a: print("hooks updated: " + (", ".join(install_hooks(a.settings)) or "already installed")))
+    mg = sub.add_parser("_migrate-config", help="copy an old repo config.toml's values to ~/.config/hyperbeam/config.toml (once)")
+    mg.add_argument("legacy", nargs="?")
+    mg.set_defaults(f=lambda a: print(f"wrote {CONFIG_FILE}" if migrate_config(a.legacy) else f"nothing to do ({CONFIG_FILE} exists or no old file)"))
     sv = sub.add_parser("_save")
     sv.add_argument("session", nargs="?")
     sv.set_defaults(f=cmd_save)
