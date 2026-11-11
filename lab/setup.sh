@@ -55,11 +55,9 @@ if [ ! -e /usr/local/bin/uv ] && [ -x "$(getent passwd "$WHO" | cut -d: -f6)/.lo
   install -m755 "$(getent passwd "$WHO" | cut -d: -f6)/.local/bin/uv" /usr/local/bin/uv && touch /etc/hyperbeam-lab.uv
 fi
 
-# 5b. pnpm for hblab (yours is in ~/.npm-global, unreadable to it): a corepack shim in /usr/local/bin, only if there is no pnpm there.
-#     hyperbeam lab run sets COREPACK_HOME to the lab disk; the first `pnpm` downloads it once.
-if ! command -v pnpm >/dev/null && command -v corepack >/dev/null && [ ! -e /usr/local/bin/pnpm ]; then
-  corepack enable pnpm --install-directory /usr/local/bin && touch /etc/hyperbeam-lab.pnpm
-fi
+# 5b. pnpm: `hyperbeam lab run` installs it once with npm into the lab disk (/srv/hblab/cache/tools). The corepack shim an earlier version of this script
+#     made can't run pnpm 12 (corepack 0.24 looks for bin/pnpm.cjs, which pnpm 12 doesn't ship): remove it, only if this script made it.
+if [ -e /etc/hyperbeam-lab.pnpm ]; then rm -f /usr/local/bin/pnpm /etc/hyperbeam-lab.pnpm; fi
 
 # 6. sudo rule: you may run commands as hblab (and only as hblab, never as root), without a password. Checked with visudo before it is installed.
 tmp="$(mktemp)"; echo "$WHO ALL=(hblab) NOPASSWD: ALL" > "$tmp"

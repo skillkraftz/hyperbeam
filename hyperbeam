@@ -1664,6 +1664,10 @@ LAB_SETUP = (f"The lab is not set up yet. Read {HERE}/lab/setup.sh, then run it 
              "(it creates the user hblab, a 10G disk image mounted at /srv/hblab, and a sudo rule that lets you run commands as hblab only).")
 
 
+LAB_RUN_USAGE = ("usage: hyperbeam lab run [--dir DIR] [--name NAME] [--why TEXT] [--fresh] [--timeout SECONDS] [--] COMMAND...\n"
+                 "options go before the command; one argument = a shell command line, several = argv.\n\n"
+                 "example:  hyperbeam lab run --why \"unit tests\" --timeout 300 -- uv run pytest -q")
+LAB_TOOLS = "/srv/hblab/cache/tools"       # pnpm lives here: npm-installed into the lab disk (corepack 0.24 can't run pnpm 12)
 LAB_SYNC_EXCLUDE = [".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "target", ".pytest_cache", ".hyperbeam",
                     "steno-*.txt", ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*"]
 LAB_PORTS = (39000, 39999)          # the lab shares the machine's network: its servers use these (or port 0), never the projects' 3100+
@@ -1797,9 +1801,21 @@ def cmd_lab(a):
                        capture_output=True, stdin=subprocess.DEVNULL)
         print(f"lab reset: hblab's processes stopped, " + (f"{LAB_HOME} emptied" if a.all else "runtime files removed; synced projects and caches kept (--all wipes them too)"))
         return 0
-    cmd = [c for c in a.cmd if c != "--"] if a.cmd[:1] == ["--"] else a.cmd
+    explicit = a.cmd[:1] == ["--"]
+    cmd = a.cmd[1:] if explicit else a.cmd
     if not cmd:
-        print("usage: hyperbeam lab run [--dir DIR] [--name NAME] [--timeout SECONDS] [--] COMMAND...  (one argument = a shell command line)")
+        print(LAB_RUN_USAGE)
+        return 2
+    # Options go before the command (or before `--`). argparse hands everything after the command to it, so a misplaced option would run as part of the
+    # command. After `--` only the two names no real command uses are refused; a single-argument shell line is never scanned.
+    stray = [c for c in cmd[1:] if (c.split("=")[0] in ("--why", "--fresh") or (not explicit and c.split("=")[0] in ("--timeout", "--dir", "--name")))] if len(cmd) > 1 else []
+    if stray:
+        i = cmd.index(stray[0], 1)
+        took = 2 if stray[0] != "--fresh" and "=" not in stray[0] and i + 1 < len(cmd) else 1       # the option and its value
+        opt = shlex.join(cmd[i:i + took])
+        print(f"hyperbeam lab run: {stray[0].split('=')[0]} comes after the command, so it would be passed to the command. Put the options before it:\n\n"
+              f"  hyperbeam lab run {opt} -- {shlex.join(cmd[:i] + cmd[i + took:])}\n\n"
+              f"(if the command itself needs {stray[0].split('=')[0]}, give it as one quoted shell line: hyperbeam lab run -- {shlex.quote(' '.join(cmd))})", file=sys.stderr)
         return 2
     src = Path(a.dir or os.getcwd()).resolve()
     if src in (Path("/"), Path.home()):
@@ -1809,6 +1825,10 @@ def cmd_lab(a):
     dest = f"{LAB_HOME}/projects/{name}"
     subprocess.run(lab_sudo("sh", "-c", 'mkdir -p -m700 "$1/rt" "$1/tmux" "$1/cache" && if [ -n "$3" ]; then rm -rf -- "$2"; fi; mkdir -p -m750 "$2"',
                             "_", str(LAB_HOME), dest, "fresh" if a.fresh else ""), check=True, stdin=subprocess.DEVNULL)
+    if subprocess.run(lab_sudo("test", "-x", f"{LAB_TOOLS}/node_modules/.bin/pnpm"), stdin=subprocess.DEVNULL).returncode:      # once: pnpm for the lab
+        print("(lab: installing pnpm once into the lab disk...)", file=sys.stderr)
+        subprocess.run(lab_sudo("env", "-i", f"HOME={LAB_HOME}", "PATH=/usr/local/bin:/usr/bin:/bin", f"npm_config_cache={LAB_HOME}/cache/npm", "sh", "-c",
+                                f'mkdir -p {LAB_TOOLS} && npm install --silent --no-audit --no-fund --prefix {LAB_TOOLS} pnpm'), stdin=subprocess.DEVNULL, capture_output=True)
     # One synced copy per project: rsync (as hblab) from the worktree or checkout. What the lab built there (node_modules, .venv, ...) is excluded from
     # the sync, so it is neither copied from you nor deleted: only the first run installs. Secrets and personal files are never copied.
     ex = [f"--exclude={x}" for x in LAB_SYNC_EXCLUDE]
@@ -1818,7 +1838,7 @@ def cmd_lab(a):
         print(f"lab: copying {src} failed:\n{sync.stderr.strip()[-400:]}", file=sys.stderr)
         return 1
     cache = f"{LAB_HOME}/cache"
-    env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_TOOLS}/node_modules/.bin:{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
            "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt",
            "HB_LAB": "1", "XDG_CACHE_HOME": cache, "npm_config_cache": f"{cache}/npm", "npm_config_store_dir": f"{cache}/pnpm-store",
            "PNPM_HOME": f"{cache}/pnpm", "COREPACK_HOME": f"{cache}/corepack", "UV_CACHE_DIR": f"{cache}/uv", "PIP_CACHE_DIR": f"{cache}/pip",
@@ -2138,9 +2158,8 @@ def context_bundle(name, path=None):
     return "\n".join(out) + "\n"
 
 
-def copy_context(name, remote):
-    """The bundle to the clipboard (local) or the outbox (remote). -> 'copied N lines' / 'saved N lines: path'."""
-    text = context_bundle(name)
+def deliver_text(text, label, remote):
+    """Text to the clipboard (local) or the outbox (remote). -> 'copied N lines' / 'saved N lines: path'."""
     n = len(text.splitlines())
     if not remote:
         try:
@@ -2152,10 +2171,180 @@ def copy_context(name, remote):
         why = ""
     d = STATE_DIR / "outbox"
     d.mkdir(parents=True, exist_ok=True)
-    f = d / f"{name}-context-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    f = d / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
     f.write_text(text)
     f.chmod(0o600)
     return f"{why}saved {n} lines: {home_rel(f)}"
+
+
+def copy_context(name, remote):
+    return deliver_text(context_bundle(name), f"{name}-context", remote)
+
+
+# ---------- Copy report: Claude's last message of the project's session ----------
+def last_assistant_message(f):
+    """The text of Claude's last reply in a conversation file: the last assistant record that has text (tool calls and thinking left out),
+    joined with the text records right before it that belong to the same API message (Claude Code writes one record per content block)."""
+    recs = []
+    for line in Path(f).read_text(errors="replace").splitlines():
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("type") != "assistant" or o.get("isSidechain") or o.get("isMeta"):
+            continue
+        m = o.get("message") or {}
+        c = m.get("content")
+        texts = [b.get("text", "") for b in (c if isinstance(c, list) else [{"type": "text", "text": c or ""}]) if b.get("type") == "text"]
+        t = "\n\n".join(x.strip() for x in texts if x.strip())
+        recs.append((m.get("id"), t))
+    texts = [(i, t) for i, t in recs if t]
+    if not texts:
+        return ""
+    last_id = texts[-1][0]
+    same = [t for i, t in texts if i == last_id] if last_id else [texts[-1][1]]
+    return "\n\n".join(same).strip() + "\n"
+
+
+def report_text(name):
+    """Claude's last message in the project's Claude pane (HB_CLAUDE_PANE of its session, else the pane running claude). -> text or raises."""
+    sess = sanitize(name)
+    if not session_exists(sess):
+        raise RuntimeError(f"{name} is not running: no Claude session to read")
+    pane = tmux("show-environment", "-t", f"={sess}", "HB_CLAUDE_PANE", check=False).stdout.strip().partition("=")[2] or find_claude_pane(sess)
+    f = claude_session_file(pane) if pane else None
+    if not f:
+        raise RuntimeError(f"no Claude is running in {name}'s Claude pane")
+    text = last_assistant_message(f)
+    if not text:
+        raise RuntimeError("Claude has not written a message yet")
+    return text
+
+
+def cmd_report(a):
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam report: no project (run it in a project session, or give a name)")
+    try:
+        text = report_text(name)
+    except RuntimeError as e:
+        sys.exit(f"hyperbeam report: {e}")
+    if a.print:
+        print(text, end="")
+        return 0
+    print(f"{name}: {deliver_text(text, name + '-report', is_remote())}")
+    return 0
+
+
+# ---------- open pull requests of the user, through gh (cached; never called from the menu's UI thread) ----------
+PR_TTL = 300
+
+
+def github_slug(path):
+    """owner/repo of a project's origin if it is on GitHub (github.com or a github-<account> ssh alias), else None."""
+    url = git_out(path, "config", "--get", "remote.origin.url") if (Path(path) / ".git").exists() else ""      # as written, not after url.*.insteadOf
+    m = re.match(r"^(?:git@|ssh://git@|https://)(github\.com|github-[\w.-]+)[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url.strip())
+    return f"{m.group(2)}/{m.group(3)}" if m else None
+
+
+_GH = {"accounts": None}
+
+
+def gh_account(owner):
+    """The logged-in gh account for a repo owner (same name), else None: that account's token is used for the call (GH_TOKEN), never printed."""
+    if _GH["accounts"] is None:
+        r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True) if shutil.which("gh") else None
+        _GH["accounts"] = re.findall(r"Logged in to github\.com account (\S+)", (r.stdout + r.stderr) if r else "")
+    return next((a for a in _GH["accounts"] if a.lower() == owner.lower()), None)
+
+
+def gh_run(slug, *args, timeout=30):
+    """`gh ARGS -R slug` as the account that owns the repo. -> (returncode, stdout, stderr)."""
+    acct = gh_account(slug.split("/")[0])
+    if not acct:
+        return 1, "", f"no gh login for {slug.split('/')[0]} (run: gh auth login)"
+    if acct not in _GH:
+        _GH[acct] = subprocess.run(["gh", "auth", "token", "--user", acct], capture_output=True, text=True).stdout.strip()
+    env = dict(os.environ, GH_TOKEN=_GH[acct], GH_PROMPT_DISABLED="1")
+    try:
+        r = subprocess.run(["gh", *args, "-R", slug], capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 1, "", "gh timed out"
+    return r.returncode, r.stdout, r.stderr
+
+
+def pr_cache_file(name, path):
+    return project_dir(name, path) / "prs.json"
+
+
+def cached_prs(name, path):
+    """What the cache says: (list of PR dicts or None if never fetched, age in seconds, error text)."""
+    try:
+        d = json.loads(pr_cache_file(name, path).read_text())
+        return d.get("prs"), time.time() - d.get("time", 0), d.get("error", "")
+    except (OSError, ValueError):
+        return None, 1e9, ""
+
+
+def open_prs(name, path, force=False):
+    """Open PRs opened by the user (newest first): [{number, title, url, branch}]. Cached for PR_TTL seconds per project, errors too."""
+    slug = github_slug(path)
+    if not slug:
+        return []
+    prs, age, err = cached_prs(name, path)
+    if not force and age < PR_TTL and (prs is not None or err):
+        return prs or []
+    rc, out, e = gh_run(slug, "pr", "list", "--author", "@me", "--state", "open", "--json", "number,title,url,headRefName")
+    try:
+        prs = sorted(({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", "")} for x in json.loads(out)),
+                     key=lambda x: -x["number"]) if rc == 0 else None
+    except (ValueError, KeyError, TypeError):
+        prs, e = None, "unreadable gh output"
+    try:
+        pr_cache_file(name, path).write_text(json.dumps({"time": time.time(), "prs": prs, "error": "" if prs is not None else (e or "gh failed").strip()[:200]}))
+    except OSError:
+        pass
+    return prs or []
+
+
+def default_branch(path):
+    ref = git_out(path, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
+    return ref.split("/", 1)[1] if "/" in ref else "main"
+
+
+def merge_pr(name, path, pr, say=print):
+    """Merge PR `pr` (a dict from open_prs) with a merge commit and delete the branch; retry once if GitHub says the base branch was modified.
+    Then the local checkout: uncommitted tracked work -> leave it and say so; else check out the default branch and pull. -> (ok, message lines)."""
+    slug = github_slug(path)
+    if not slug:
+        return False, ["no GitHub remote"]
+    for attempt in (1, 2):
+        rc, out, err = gh_run(slug, "pr", "merge", str(pr["number"]), "--merge", "--delete-branch")
+        if rc == 0:
+            break
+        if attempt == 1 and "base branch was modified" in (out + err).lower():
+            say("base branch was modified, retrying once...")
+            time.sleep(2)
+            continue
+        return False, [f"merge failed: {(err or out).strip().splitlines()[-1] if (err or out).strip() else 'gh error'}"]
+    msgs = [f"merged PR #{pr['number']} on GitHub"]
+    path = Path(path)
+    if git_out(path, "status", "--porcelain", "--untracked-files=no"):
+        msgs.append(f"local checkout has uncommitted changes: left as it is on {branch_of(path)} (commit or stash, then `git checkout {default_branch(path)} && git pull`)")
+        return True, msgs
+    base = default_branch(path)
+    co = subprocess.run(["git", "-C", str(path), "checkout", "-q", base], capture_output=True, text=True)
+    if co.returncode:
+        msgs.append(f"could not check out {base}: {co.stderr.strip()[:120]}")
+        return True, msgs
+    pull = subprocess.run(["git", "-C", str(path), "pull", "-q", "--ff-only"], capture_output=True, text=True, timeout=60,
+                          env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5"))
+    msgs.append(f"local: on {base}" + ("" if pull.returncode == 0 else f", pull failed: {pull.stderr.strip()[:120]}"))
+    if pr.get("branch") and pr["branch"] != base:
+        subprocess.run(["git", "-C", str(path), "branch", "-d", pr["branch"]], capture_output=True)
+    return True, msgs
+
+
 
 
 def cmd_context(a):
@@ -2529,6 +2718,7 @@ def project_info(name, rows=None, footer=True, alert=True):
     section("Vercel", [f"project {n}  (production URL: needs `vercel login`)" for n in vp])
     web = git_web_url(path)
     section("Git", [f"{web}  repo" if web else "", f"{homepage}  homepage (GitHub)" if homepage else ""])
+    section("Pull requests (yours, open)", [f"#{x['number']}  {x['title']}  {x['url']}" for x in open_prs(name, path)])
     section(".env", [f"{u}  {k} ({f})" for k, u, f in env_urls(path)])
     section("Extra ([links])", [f"{u}  {k}" for k, u in ((man or {}).get("links") or {}).items()])
     if footer:
@@ -2748,7 +2938,7 @@ def row_text(p, st, width, note=""):
     t = Text(no_wrap=True, overflow="crop")
     t.append("● " if st else "  ", style=DOT.get(st[0], "") if st else "")
     t.append(name.ljust(avail - len(branch)), style="bold white" if p["recent"] else "grey54")
-    t.append(" " + branch, style="dim" if branch in ("-", "main", "master") else "yellow")
+    t.append(" " + branch, style="magenta" if p.get("prs") else "dim" if branch in ("-", "main", "master") else "yellow")   # magenta: an open PR of yours
     t.append(" " + port, style=pstyle)
     return t
 
@@ -2811,7 +3001,7 @@ class SettingsScreen(ModalScreen):
         lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
         lines += [f"  {k}\n      {d}" for k, d in KEYS]
         lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, c copy context, i info, r refresh, q quit"]
+        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, c copy context, p copy report, m merge PR, i info, r refresh, q quit"]
         return "\n".join(lines)
 
     def on_mount(self):
@@ -2870,10 +3060,12 @@ class Menu(App):
     .narrow.fix #buttons { grid-size: 2; }
     #b-fix { display: none; }
     .fix #b-fix { display: block; }
+    #b-merge { display: none; }
+    .pr #b-merge { display: block; }
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
     BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"), Binding("h", "hide", "Hide sidebar"),
-                Binding("b", "onboard", "Onboard"), Binding("c", "context", "Copy context"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
+                Binding("b", "onboard", "Onboard"), Binding("c", "context", "Copy context"), Binding("p", "report", "Copy report"), Binding("m", "merge", "Merge PR"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
@@ -2888,7 +3080,7 @@ class Menu(App):
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("onboard", "Onboard (b)"), ("context", "Copy context (c)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("onboard", "Onboard (b)"), ("context", "Copy context (c)"), ("report", "Copy report (p)"), ("merge", "Merge (m)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
                 if bid == "hide" and not os.environ.get("HB_SIDEBAR"):
                     continue
                 button = Button(label, id=f"b-{bid}")
@@ -2902,6 +3094,8 @@ class Menu(App):
         self.set_interval(5, self.poll_status)
         self.set_interval(600, self.fetch_repo)
         self.set_interval(60, self.recheck_running)
+        self.set_interval(60, self.poll_prs)
+        self.set_timer(3, self.poll_prs)
         self.set_timer(2, self.recheck_running)
         asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, lambda: self.exit(return_code=75))      # `hyperbeam update`: restart me
         self.fetch_repo()
@@ -2974,6 +3168,9 @@ class Menu(App):
         return {r["name"]: project_status(r["name"], mans.get(r["name"])) for r in rows if r["running"]}
 
     def apply(self, rows, status):
+        old = {p["name"]: p.get("prs") for p in self.projects}
+        for r in rows:
+            r["prs"] = old.get(r["name"])
         self.projects, self.status = rows, status
         self.refresh_list()
         if not self.keep_notice:
@@ -3006,6 +3203,27 @@ class Menu(App):
             if st != self.status or changed:
                 self.call_from_thread(self.set_status, st)
         self.run_worker(work, thread=True, group="status")
+
+    def poll_prs(self):
+        """Open PRs of yours per project, from the cache (disk) and, where it is older than PR_TTL, from gh: in a worker thread, one project at a time."""
+        def work():
+            changed = False
+            for p in list(self.projects):
+                try:
+                    if p.get("slug", 0) == 0:
+                        p["slug"] = github_slug(p["path"])
+                    if not p["slug"]:
+                        continue
+                    prs, age, err = cached_prs(p["name"], p["path"])
+                    if age >= PR_TTL:
+                        prs = open_prs(p["name"], p["path"], force=True)
+                except Exception:
+                    continue
+                if (prs or None) != (p.get("prs") or None):
+                    p["prs"], changed = prs or None, True
+            if changed:
+                self.call_from_thread(self.refresh_list)
+        self.run_worker(work, thread=True, group="prs", exclusive=True)
 
     def set_status(self, st):
         self.status = st
@@ -3045,7 +3263,11 @@ class Menu(App):
         p, why = self.current(), ""
         st = self.status.get(p["name"]) if p and p["running"] else None
         self.set_class(bool(st and st[0] == "red"), "fix")          # a red project gets a Fix button
-        if st:
+        self.set_class(bool(p and p.get("prs")), "pr")              # a project with an open PR gets a Merge button
+        if p and p.get("prs") and not (st and st[0] == "red"):
+            pr = p["prs"][0]
+            why = f"PR #{pr['number']}: {pr['title']}" + (f"  (+{len(p['prs']) - 1} more)" if len(p["prs"]) > 1 else "")
+        elif st:
             why = f"[{st[0]}] {st[1]}"
         elif p and p["name"] == "hyperbeam" and self.repo[1]:
             why = self.repo[1]
@@ -3076,7 +3298,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "info", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -3249,6 +3471,49 @@ class Menu(App):
             except Exception as e:
                 self.say_from_thread(f"{name}: context failed: {e}")
         self.run_worker(work, thread=True)
+
+    def action_report(self):
+        """Copy Claude's last message of the selected project's session (the PR report): clipboard at the laptop, outbox over SSH."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        name = p["name"]
+
+        def work():
+            remote = False if os.environ.get("HB_SIDEBAR") else client_is_remote(menu_client("client_pid") or "0")
+            try:
+                self.say_from_thread(f"{name}: report {deliver_text(report_text(name), name + '-report', remote)}")
+            except Exception as e:
+                self.say_from_thread(f"{name}: no report: {e}")
+        self.run_worker(work, thread=True)
+
+    def action_merge(self):
+        """Merge the selected project's open PR (the newest of yours) after a confirmation; then the local checkout, the badge, and for hyperbeam itself an update."""
+        p = self.current()
+        if not p or not p.get("prs"):
+            return self.say("No open PR of yours for the selected project.")
+        if p["name"] in self.busy:
+            return self.say(f"{p['name']} is busy.")
+        self.busy.add(p["name"])
+        self.run_worker(lambda: self._merge(p, p["prs"][0]), thread=True)
+
+    def _merge(self, p, pr):
+        name = p["name"]
+        try:
+            if not self.ask(f"Merge PR #{pr['number']} in {name}?\n\n{pr['title']}\n\nA merge commit; the branch is deleted on GitHub. Nothing is merged without Yes."):
+                return self.say_from_thread(f"{name}: merge cancelled")
+            self.say_from_thread(f"{name}: merging PR #{pr['number']}...")
+            ok, msgs = merge_pr(name, p["path"], pr, self.say_from_thread)
+            prs = open_prs(name, p["path"], force=True)
+            p["prs"] = prs or None
+            self.call_from_thread(self.refresh_list)
+            self.say_from_thread(f"{name}: " + "; ".join(msgs))
+            if ok and name == "hyperbeam" and any(m.startswith("local: on") and "failed" not in m for m in msgs):
+                self.call_from_thread(self.action_update)          # the menu restarts itself: this runs in a popup
+        except Exception as e:
+            self.say_from_thread(f"{name}: merge ERROR {e}")
+        finally:
+            self.busy.discard(name)
 
     def action_info(self):
         """The same text as `kk`, in a plain tmux window (so mouse-drag copy works), closed with Enter."""
@@ -3513,6 +3778,10 @@ def main():
     af = sub.add_parser("align-facts", help="the facts ALIGN.md compares a project's docs against (visibility, docs layout, tests, ignores)")
     af.add_argument("path", nargs="?")
     af.set_defaults(f=cmd_align_facts)
+    rp = sub.add_parser("report", help="copy Claude's last message of a project's session (the PR report) to the clipboard; default project $HB_PROJECT")
+    rp.add_argument("project", nargs="?")
+    rp.add_argument("--print", action="store_true")
+    rp.set_defaults(f=cmd_report)
     cx = sub.add_parser("context", help="copy a context bundle (RULES, CLAUDE.md, DECISIONS, README, manifest, recent history) to paste into a chat; default project $HB_PROJECT")
     cx.add_argument("project", nargs="?")
     cx.add_argument("--print", action="store_true", help="print it instead of copying")

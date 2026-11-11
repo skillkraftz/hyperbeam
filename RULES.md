@@ -25,3 +25,4 @@
 - Exceptions to these rules are allowed only in the project's CLAUDE.md, in a section `## Exceptions to
   hyperbeam rules` that lists each exception and why, approved by the user. Otherwise the project follows
   this file; if the project's CLAUDE.md disagrees, the project is brought in line (see ALIGN.md).
+- Manual test checklists use real, runnable commands. No placeholders (no `...`, no `<name>`).
