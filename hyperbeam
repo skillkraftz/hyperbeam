@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, asyncio, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
+import argparse, asyncio, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib, types
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1799,6 +1799,7 @@ LAB_SETUP = (f"The lab is not set up yet. Read {HERE}/lab/setup.sh, then run it 
              "(it creates the user hblab, a 10G disk image mounted at /srv/hblab, and a sudo rule that lets you run commands as hblab only).")
 
 
+TOOLS_SRC = Path(os.environ.get("HB_TOOLS_SRC") or HERE / "tools")       # the tools folder (HB_TOOLS_SRC: tests)
 LAB_RUN_USAGE = ("usage: hyperbeam lab run [--dir DIR] [--name NAME] [--why TEXT] [--fresh] [--timeout SECONDS] [--] COMMAND...\n"
                  "options go before the command; one argument = a shell command line, several = argv.\n\n"
                  "example:  hyperbeam lab run --why \"unit tests\" --timeout 300 -- uv run pytest -q")
@@ -1960,6 +1961,206 @@ def fmt_age(sec):
     return f"{sec}s" if sec < 60 else f"{sec // 60}m{sec % 60:02d}s" if sec < 3600 else f"{sec // 3600}h{sec % 3600 // 60:02d}m"
 
 
+# ---------- lab digest: what the day's lab runs show (plain script, no tokens) ----------
+KILLED = lambda rc: rc < 0 or rc in (137, 143)        # stopped by a signal (a reset, a timeout kill): not a test result
+TRIVIAL_MIN_SECONDS = 30                              # a repeated command is only worth a tool if it cost this much in total
+
+
+def norm_command(cmd):
+    """A command with what changes between runs stripped: a leading `cd X &&`, `2>&1`, `| tail/head`, paths, ids, long numbers."""
+    c = " ".join(str(cmd).split())
+    c = re.sub(r"^(?:cd \S+ && )+", "", c)
+    c = re.sub(r"\s*2>&1", "", c)
+    c = re.sub(r"\s*\|\s*(?:tail|head)(?: -\w+)*(?: \d+)?\s*$", "", c)
+    out = []
+    for t in c.split(" "):
+        if "/" in t or re.search(r"\.(?:py|js|ts|tsx|jsx|mjs|toml|json|md|txt|sh|log|csv|yml|yaml)$", t):
+            t = "<path>"
+        elif re.fullmatch(r"[0-9a-f]{7,}", t):
+            t = "<id>"
+        elif re.fullmatch(r"\d{3,}", t):
+            t = "<n>"
+        if not (out and out[-1] == t == "<path>"):
+            out.append(t)
+    return " ".join(out)
+
+
+def read_lab_runs(since=None):
+    """The run log (lab-runs.jsonl) as a list of dicts, oldest first; `since` = 'YYYY-MM-DD' keeps runs from that day on."""
+    try:
+        runs = [json.loads(l) for l in LAB_LOG().read_text().splitlines() if l.strip()]
+    except (OSError, ValueError):
+        return []
+    return [r for r in runs if not since or r["time"][:10] >= since]
+
+
+def lab_digest(runs):
+    """-> dict: per-project totals, flaky commands, slowest, repeated commands and sequences, and the tool candidates among them. Runs of the tools'
+    own tests ('tool test: ...') are not work and are left out."""
+    runs = [r for r in runs if not (r.get("why") or "").startswith("tool test:")]
+    for r in runs:
+        r["_n"] = norm_command(r["command"])
+    proj = {}
+    for r in runs:
+        d = proj.setdefault(r["project"], dict(runs=0, seconds=0.0, failed=0, killed=0))
+        d["runs"] += 1
+        d["seconds"] += r["seconds"]
+        d["failed"] += r["exit"] > 0 and not KILLED(r["exit"])
+        d["killed"] += KILLED(r["exit"])
+    groups = {}
+    for r in runs:
+        groups.setdefault((r["project"], r["_n"]), []).append(r)
+    flaky = []
+    for (pj, n), rs in groups.items():
+        for day in sorted({x["time"][:10] for x in rs}):
+            d = [x for x in rs if x["time"][:10] == day]
+            seen_fail = False
+            for x in d:
+                if x["exit"] > 0 and not KILLED(x["exit"]):
+                    seen_fail = True
+                elif x["exit"] == 0 and seen_fail:
+                    flaky.append(dict(project=pj, command=n, day=day, failed=sum(1 for y in d if y["exit"] > 0 and not KILLED(y["exit"])), passed=sum(1 for y in d if y["exit"] == 0)))
+                    break
+    slow = sorted(({"project": pj, "command": n, "max": max(x["seconds"] for x in rs), "count": len(rs), "total": sum(x["seconds"] for x in rs)} for (pj, n), rs in groups.items()),
+                  key=lambda d: -d["max"])[:5]
+    repeated = sorted(({"project": pj, "command": n, "count": len(rs), "total": sum(x["seconds"] for x in rs),
+                        "failed": sum(1 for x in rs if x["exit"] > 0 and not KILLED(x["exit"]))} for (pj, n), rs in groups.items() if len(rs) >= 3), key=lambda d: -d["total"])
+    seqs = {}
+    for pj in {r["project"] for r in runs}:
+        rs = sorted((r for r in runs if r["project"] == pj), key=lambda r: r["time"])
+        sessions, cur = [], []
+        for r in rs:                                    # a new session after a 20 minute gap
+            if cur and time.mktime(time.strptime(r["time"], "%Y-%m-%dT%H:%M:%S")) - time.mktime(time.strptime(cur[-1]["time"], "%Y-%m-%dT%H:%M:%S")) > 1200:
+                sessions.append(cur)
+                cur = []
+            cur.append(r)
+        sessions.append(cur)
+        for n in (3, 2):
+            for sess in sessions:
+                for i in range(len(sess) - n + 1):
+                    win = sess[i:i + n]
+                    key = (pj, tuple(x["_n"] for x in win))
+                    if len(set(key[1])) > 1:
+                        e = seqs.setdefault(key, dict(count=0, total=0.0))
+                        e["count"] += 1
+                        e["total"] += sum(x["seconds"] for x in win)
+    sequences = [dict(project=k[0], commands=list(k[1]), **v) for k, v in seqs.items() if v["count"] >= 3]
+    sequences = [q for q in sequences if not any(len(o["commands"]) > len(q["commands"]) and o["project"] == q["project"] and o["count"] == q["count"]
+                                                 and any(o["commands"][i:i + len(q["commands"])] == q["commands"] for i in range(len(o["commands"]))) for o in sequences)]
+    sequences.sort(key=lambda d: -d["total"])
+    cands = [dict(kind="command", project=r["project"], what=r["command"], count=r["count"], total=r["total"]) for r in repeated if r["total"] >= TRIVIAL_MIN_SECONDS] + \
+            [dict(kind="sequence", project=q["project"], what=" -> ".join(q["commands"]), count=q["count"], total=q["total"]) for q in sequences if q["total"] >= TRIVIAL_MIN_SECONDS]
+    return dict(runs=len(runs), seconds=sum(r["seconds"] for r in runs), projects=proj, flaky=flaky, slow=slow, repeated=repeated, sequences=sequences, candidates=cands)
+
+
+def mins(sec):
+    return f"{sec / 60:.1f} min" if sec >= 60 else f"{sec:.0f} s"
+
+
+def format_digest(d, tool_notes=(), title="Lab digest"):
+    if not d["runs"]:
+        return f"{title}: no lab runs logged."
+    L = [f"{title}: {d['runs']} runs, {mins(d['seconds'])}", "", "per project"]
+    for pj, v in sorted(d["projects"].items(), key=lambda kv: -kv[1]["seconds"]):
+        L.append(f"  {pj:<16} {v['runs']:>3} runs  {mins(v['seconds']):>9}  {v['failed']} failed" + (f", {v['killed']} killed (stopped by a signal)" if v["killed"] else ""))
+    L += ["", "flaky (the same command failed, then passed, the same day)"] + ([f"  {x['project']}: {x['command'][:90]}  ({x['failed']} failed, {x['passed']} passed, {x['day']})" for x in d["flaky"]] or ["  none"])
+    L += ["", "slowest"] + [f"  {mins(x['max']):>9}  {x['project']}: {x['command'][:80]}  ({x['count']}x, {mins(x['total'])} total)" for x in d["slow"]]
+    L += ["", "tool candidates (repeated work that cost real time)"]
+    L += [f"  {c['count']}x  {mins(c['total']):>9}  {c['project']}: {c['what'][:100]}  [{c['kind']}]" for c in d["candidates"]] or ["  none"]
+    if tool_notes:
+        L += ["", "tools"] + [f"  {n}" for n in tool_notes]
+    return "\n".join(L)
+
+
+def digest_summary(d, tool_notes=()):
+    """A few lines for Done."""
+    if not d["runs"]:
+        return "Lab: no runs logged."
+    top = d["candidates"][0] if d["candidates"] else None
+    L = [f"Lab: {d['runs']} runs, {mins(d['seconds'])}, {sum(v['failed'] for v in d['projects'].values())} failed, {len(d['flaky'])} flaky",
+         f"Tool candidates: {len(d['candidates'])}" + (f" (top: {top['count']}x {top['what'][:50]}, {mins(top['total'])})" if top else "")]
+    L += [f"Tool note: {n}" for n in tool_notes]
+    return "\n".join(L)
+
+
+def tool_names():
+    t = TOOLS_SRC
+    return [x.name for x in sorted(t.iterdir()) if x.is_dir() and (x / x.name).exists()] if t.is_dir() else []
+
+
+def run_tool_tests(names=None):
+    """Run each tool's test (tools/NAME/test) in the lab. -> [(name, ok, last output line)]. Needs the lab; ([] and no error) without tools."""
+    out = []
+    for n in names or tool_names():
+        if not (TOOLS_SRC / n / "test").exists():
+            out.append((n, False, "no test file (tools/%s/test)" % n))
+            continue
+        ns = types.SimpleNamespace(action="run", dir=str(TOOLS_SRC), name="hyperbeam-tools", why=f"tool test: {n}", fresh=False, timeout=180, cmd=["--", "bash", f"{n}/test"], quiet=True)
+        rc = cmd_lab(ns)
+        tail = (read_lab_runs()[-1:] or [{"tail": []}])[0]["tail"]
+        out.append((n, rc == 0, (tail[-1] if tail else "")[:100]))
+    return out
+
+
+def tool_test_notes():
+    """Notes for the digest: a failing tool test (or a lab that is not there to run them)."""
+    if not tool_names():
+        return []
+    if lab_ready():
+        return ["tool tests not run: the lab is not ready"]
+    return [f"tool {n}: its test FAILS ({tail})" for n, ok, tail in run_tool_tests() if not ok]
+
+
+def cmd_lab_digest(a):
+    since = a.since or (time.strftime("%Y-%m-%d") if a.today else None)
+    d = lab_digest(read_lab_runs(since))
+    print(format_digest(d, tool_test_notes() if not a.no_tests else (), "Lab digest" + (f" since {since}" if since else "")))
+    return 0
+
+
+def offered_digest(d):
+    """True once per day per set of candidates: Done offers the tool proposal once, not at every press."""
+    f = DATA_DIR / "digest-offered.json"
+    key = hashlib.sha1(json.dumps([(c["project"], c["what"]) for c in d["candidates"]]).encode()).hexdigest()[:10]
+    try:
+        old = json.loads(f.read_text())
+    except (OSError, ValueError):
+        old = {}
+    if old.get("date") == time.strftime("%Y-%m-%d") and old.get("key") == key:
+        return True
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"date": time.strftime("%Y-%m-%d"), "key": key}))
+    except OSError:
+        pass
+    return False
+
+
+def tools_prompt(d, notes):
+    """TOOLS_PROPOSE.md plus the digest, for the hyperbeam session's Claude."""
+    return write_prompt(MENU, (HERE / "TOOLS_PROPOSE.md").read_text() + "\n\n---\n\n" + format_digest(d, notes, "Lab digest (today)") + "\n")
+
+
+def cmd_tool(a):
+    """hyperbeam tool NAME [ARGS]: a tool of tools/ in the lab, in the current project's synced copy. --list prints TOOLS.md. --test [NAME] runs tests."""
+    if a.list:
+        print((HERE / "TOOLS.md").read_text() if (HERE / "TOOLS.md").is_file() else "no TOOLS.md")
+        return 0
+    if a.test:
+        res = run_tool_tests([a.name] if a.name else None)
+        for n, ok, tail in res:
+            print(f"{'PASS' if ok else 'FAIL'} {n}" + ("" if ok else f"  {tail}"))
+        return 0 if all(ok for _, ok, _ in res) else 1
+    if not a.name:
+        print("usage: hyperbeam tool NAME [ARGS...]   (hyperbeam tool --list shows the tools, hyperbeam tool --test [NAME] runs their tests)")
+        return 2
+    if a.name not in tool_names():
+        print(f"hyperbeam tool: no tool called {a.name}. Tools: {', '.join(tool_names()) or 'none yet'}  (hyperbeam tool --list)")
+        return 2
+    ns = types.SimpleNamespace(action="run", dir=a.dir, name=None, why=f"tool {a.name}", fresh=False, timeout=a.timeout, cmd=["--", f"{LAB_HOME}/tools/{a.name}/{a.name}", *a.args])
+    return cmd_lab(ns)
+
+
 def lab_ready():
     """None if the lab works, else the reason it doesn't (and what to do)."""
     try:
@@ -2009,6 +2210,8 @@ def cmd_lab(a):
     """hyperbeam lab run|reset|status. The code goes in as a copy; everything runs as hblab (it can't signal the user's processes)."""
     if a.action == "log":
         return cmd_lab_log(a)
+    if a.action == "digest":
+        return cmd_lab_digest(a)
     msg = lab_ready()
     if msg:
         print(msg)
@@ -2101,12 +2304,14 @@ def cmd_lab(a):
     if sync.returncode:
         print(f"lab: copying {src} failed:\n{sync.stderr.strip()[-400:]}", file=sys.stderr)
         return 1
+    if (TOOLS_SRC).is_dir():                   # tools/ goes in with every run: `hyperbeam tool NAME` (or $HB_TOOLS/NAME/NAME) works in the lab
+        subprocess.run(["rsync", "-a", "--delete", "-e", str(HERE / "lab/sudo-hblab"), f"{TOOLS_SRC}/", f"lab:{LAB_HOME}/tools/"], capture_output=True, stdin=subprocess.DEVNULL)
     cache = f"{LAB_HOME}/cache"
     rid = uuid.uuid4().hex[:8]
     env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_TOOLS}/node_modules/.bin:{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
            "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux/{rid}", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt/{rid}",
            "HB_RUN_ID": rid, "HB_RUN_PROJECT": name, "HB_RUN_WHY": a.why or "", "HB_RUN_CWD": str(src), "HB_RUN_CMD": cmd[0] if len(cmd) == 1 else shlex.join(cmd),
-           "HB_LAB": "1", "XDG_CACHE_HOME": cache, "npm_config_cache": f"{cache}/npm", "npm_config_store_dir": f"{cache}/pnpm-store",
+           "HB_LAB": "1", "HB_TOOLS": f"{LAB_HOME}/tools", "XDG_CACHE_HOME": cache, "npm_config_cache": f"{cache}/npm", "npm_config_store_dir": f"{cache}/pnpm-store",
            "PNPM_HOME": f"{cache}/pnpm", "COREPACK_HOME": f"{cache}/corepack", "UV_CACHE_DIR": f"{cache}/uv", "PIP_CACHE_DIR": f"{cache}/pip",
            "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/playwright", "LAB_PORT_MIN": str(LAB_PORTS[0]), "LAB_PORT_MAX": str(LAB_PORTS[1]), "HB_LAB_PROJECT": name}
     if lab_xvfb():
@@ -2125,11 +2330,13 @@ def cmd_lab(a):
     t0, tail = time.time(), []
     p = subprocess.Popen(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "setsid", "-w", "bash", "-c", script, "_", dest, str(a.timeout), *cmd),
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         for line in p.stdout:
-            sys.stdout.buffer.write(line)
-            sys.stdout.buffer.flush()
+            if not getattr(a, "quiet", False):
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
             tail = (tail + [line.decode(errors="replace").rstrip("\n")])[-20:]
         rc = p.wait()
     finally:                                      # also when you press Ctrl-C: what this run left behind is stopped, its record and dirs removed
@@ -2458,28 +2665,83 @@ def copy_context(name, remote):
 
 
 # ---------- Copy report: Claude's last message of the project's session ----------
+def _user_text(o):
+    """The text of a user record, or None if it is a tool result (those are not prompts)."""
+    c = (o.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        if any(b.get("type") == "tool_result" for b in c):
+            return None
+        return "\n".join(b.get("text", "") for b in c if b.get("type") == "text")
+    return None
+
+
+NOT_PROMPT = ("<task-notification", "<system-reminder", "[SYSTEM NOTIFICATION", "<command-", "<local-command", "Caveat:", "[Usage limit", "This session is being continued")
+
+
+def is_human_prompt(o):
+    """Is this conversation-file record something the user typed? Claude Code marks the source of a user record: `origin.kind` is "human" for the
+    user, "task-notification" for a finished background task or monitor, "auto-continuation" after a usage limit; records with `isMeta` or
+    `isCompactSummary`, tool results and sidechains are never prompts. Files written without `origin` fall back to the text: notices start with
+    known tags."""
+    if o.get("type") != "user" or o.get("isSidechain") or o.get("isMeta") or o.get("isCompactSummary"):
+        return False
+    t = _user_text(o)
+    if t is None or not t.strip():
+        return False
+    if "origin" in o:
+        return (o["origin"] or {}).get("kind") == "human"
+    return not t.lstrip().startswith(NOT_PROMPT)
+
+
 def last_assistant_message(f):
-    """The text of Claude's last reply in a conversation file: the last assistant record that has text (tool calls and thinking left out),
-    joined with the text records right before it that belong to the same API message (Claude Code writes one record per content block)."""
+    """Claude's final text answer in the user's last real prompt's turn (the PR report), not a reply to a notice that arrived after it.
+    After the last human prompt the assistant's messages are looked at in order (one API message = the records sharing its id; thinking and tool calls
+    are left out). A notice (a finished background task, a monitor) is not a prompt: a reply to it - text, short or after no work, written once
+    the notice arrived - is skipped, so the real report stays the answer. If every answer would be skipped, the last text is used."""
     recs = []
     for line in Path(f).read_text(errors="replace").splitlines():
         try:
             o = json.loads(line)
         except ValueError:
             continue
-        if o.get("type") != "assistant" or o.get("isSidechain") or o.get("isMeta"):
+        if o.get("type") in ("user", "assistant") and not o.get("isSidechain"):
+            recs.append(o)
+    start = max((i for i, o in enumerate(recs) if is_human_prompt(o)), default=-1) + 1
+    msgs, order = {}, []                    # assistant messages by id, in order: {id: [text, has_tool, after_notice, worked_since_notice]}
+    after_notice = worked = False
+    for o in recs[start:]:
+        if o["type"] == "user":
+            if _user_text(o) is not None and not o.get("isMeta"):         # not a tool result, not the user: a notice
+                after_notice, worked = True, False
             continue
         m = o.get("message") or {}
         c = m.get("content")
-        texts = [b.get("text", "") for b in (c if isinstance(c, list) else [{"type": "text", "text": c or ""}]) if b.get("type") == "text"]
-        t = "\n\n".join(x.strip() for x in texts if x.strip())
-        recs.append((m.get("id"), t))
-    texts = [(i, t) for i, t in recs if t]
+        blocks = c if isinstance(c, list) else [{"type": "text", "text": c or ""}]
+        key = m.get("id") or f"anon{len(order)}"
+        if key not in msgs:
+            msgs[key] = {"text": [], "tool": False, "notice": after_notice, "worked": worked}
+            order.append(key)
+        for b in blocks:
+            if b.get("type") == "tool_use":
+                msgs[key]["tool"] = True
+                if after_notice:
+                    worked = True
+            elif b.get("type") == "text" and b.get("text", "").strip():
+                msgs[key]["text"].append(b["text"].strip())
+        msgs[key]["worked"] = worked
+    texts = [msgs[k] for k in order if msgs[k]["text"]]
     if not texts:
         return ""
-    last_id = texts[-1][0]
-    same = [t for i, t in texts if i == last_id] if last_id else [texts[-1][1]]
-    return "\n\n".join(same).strip() + "\n"
+    ok = [m for m in texts if not (m["notice"] and (not m["worked"] or len("\n\n".join(m["text"])) < 200))]
+    pick = (ok or texts)[-1]
+    return "\n\n".join(pick["text"]).strip() + "\n"
+
+
+def first_line(text, n=70):
+    l = next((x.strip() for x in text.splitlines() if x.strip()), "")
+    return l if len(l) <= n else l[:n - 1] + "…"
 
 
 def report_text(name):
@@ -2508,7 +2770,7 @@ def cmd_report(a):
     if a.print:
         print(text, end="")
         return 0
-    print(f"{name}: {deliver_text(text, name + '-report', is_remote())}")
+    print(f"{name}: {deliver_text(text, name + '-report', is_remote())} - \"{first_line(text)}\"")
     return 0
 
 
@@ -3795,6 +4057,33 @@ class Menu(App):
             self.busy.discard(name)
             self.call_from_thread(self.reload, True)
 
+    def digest_step(self):
+        """Done, first: today's lab digest in a few lines (plain script, no tokens). If it found tool candidates (once per set per day) the user may ask
+        Claude, in the hyperbeam session, to propose tools. Returns True if Done should stop here (Claude was started: press Done again later)."""
+        try:
+            d = lab_digest(read_lab_runs(time.strftime("%Y-%m-%d")))
+            notes = tool_test_notes()
+        except Exception as e:
+            self.say_from_thread(f"Done for now: the lab digest failed ({e}); going on.")
+            return False
+        if not d["runs"] and not notes:
+            return False
+        text = digest_summary(d, notes)
+        if d["candidates"] and not offered_digest(d):
+            if self.choose(text + "\n\nTurn the repeated work into small tools?", [("ask", "Ask Claude to propose tools (a)", "a"), ("skip", "Skip (s)", "s")]) == "ask":
+                pane = find_claude_pane(MENU)
+                if not pane:
+                    self.say_from_thread("Done for now: no Claude pane in the hyperbeam session to ask.")
+                    return False
+                inject_prompt(pane, tools_prompt(d, notes), [])
+                tmux("select-window", "-t", pane, check=False)
+                tmux("select-pane", "-t", pane, check=False)
+                self.say_from_thread("Done for now: Claude is proposing tools in the hyperbeam session's Claude pane. Press Done again when it is finished.")
+                return True
+        else:
+            self.say_from_thread(text.replace("\n", "  |  "))
+        return False
+
     def action_done(self):
         if "@done" in self.busy:
             return self.say("Done for now is already running.")
@@ -3806,6 +4095,8 @@ class Menu(App):
         """Done for now: the wrap-up check on every project worked on since the menu started. All clean: offer to stop their sessions.
         Otherwise offer Claude (in the hyperbeam session's Claude pane); the user presses Done again when finished."""
         try:
+            if self.digest_step():
+                return
             names = sorted(load_journal()["projects"])
             if not names:
                 return self.say_from_thread("Done for now: no project has been opened since the menu started.")
@@ -3868,7 +4159,8 @@ class Menu(App):
         def work():
             remote = False if os.environ.get("HB_SIDEBAR") else client_is_remote(menu_client("client_pid") or "0")
             try:
-                self.say_from_thread(f"{name}: report {deliver_text(report_text(name), name + '-report', remote)}")
+                text = report_text(name)
+                self.say_from_thread(f"{name}: report {deliver_text(text, name + '-report', remote)} - \"{first_line(text, 50)}\"")
             except Exception as e:
                 self.say_from_thread(f"{name}: no report: {e}")
         self.run_worker(work, thread=True)
@@ -4263,6 +4555,10 @@ def main():
     lrs = lsub.add_parser("reset", help="stop YOUR project's runs and clear leftover run files; refuses while other projects have runs (keeps synced projects and caches)")
     lrs.add_argument("--all", action="store_true", help="also wipe the synced projects and the caches")
     lrs.add_argument("--force", action="store_true", help="the user only: kill everything hblab runs, other projects' runs and the display too")
+    dg = lsub.add_parser("digest", help="what the lab runs show: flaky commands, slowest, repeated work (tool candidates); plain text, no Claude")
+    dg.add_argument("--today", action="store_true")
+    dg.add_argument("--since", help="YYYY-MM-DD")
+    dg.add_argument("--no-tests", action="store_true", help="do not run the tools' tests")
     lg = lsub.add_parser("log", help="the lab run log: what ran, why, how long")
     lg.add_argument("--today", action="store_true")
     lsub.add_parser("status", help="disk use, synced projects, caches, processes")
@@ -4270,6 +4566,14 @@ def main():
     ms = sub.add_parser("_migrate-state", help="copy ~/.local/state/hyperbeam into the per-project layout under ~/.local/share/hyperbeam (also runs by itself)")
     ms.add_argument("old", nargs="?")
     ms.set_defaults(f=lambda a: print("migrated %d files%s" % ((lambda r: (r[0], f"; problems: {r[1]}" if r[1] else "; old folder removed"))(migrate_state(a.old)))))
+    tl = sub.add_parser("tool", help="run a tool of tools/ in the lab, in this project's synced copy (--list: TOOLS.md, --test [NAME]: their tests)")
+    tl.add_argument("--list", action="store_true")
+    tl.add_argument("--test", action="store_true")
+    tl.add_argument("--dir", help="the project folder to run in (default: the current directory)")
+    tl.add_argument("--timeout", type=int, default=600)
+    tl.add_argument("name", nargs="?")
+    tl.add_argument("args", nargs=argparse.REMAINDER)
+    tl.set_defaults(f=cmd_tool)
     sub.add_parser("_close-sidebar").set_defaults(f=cmd_close_sidebar)
     sb = sub.add_parser("sidebar", help="hide / show the sidebar (the same as M-s)")
     sb.add_argument("client", nargs="?")
@@ -4285,7 +4589,7 @@ def main():
         os.environ["HB_PROJECTS_DIR"] = str(ROOT)
         argv = argv[1:]
     try:
-        _done, _bad = migrate_state() if (not argv or argv[0] != "lab") else (0, [])      # `lab` commands run as the user: never touch state
+        _done, _bad = migrate_state() if (not argv or argv[0] not in ("lab", "tool")) else (0, [])      # `lab` commands run as the user: never touch state
         if _bad:
             print("hyperbeam: could not migrate the old state folder; it was left in place:\n  " + "\n  ".join(_bad[:5]), file=sys.stderr)
     except OSError as e:

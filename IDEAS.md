@@ -7,4 +7,4 @@
 - Wrap-up notes into .hyperbeam/notes.
 - Polish phase.
 - Prompt files as skills, exportable to claude.ai.
-- Daily lab digest -> tool proposals at Done; TOOLS.md. Also flag flaky tests (the same command failing, then passing).
+- ~~Daily lab digest -> tool proposals at Done; TOOLS.md; flaky tests.~~ Done (PR #23). Later: tools the digest suggests for non-lab work, a weekly view.
