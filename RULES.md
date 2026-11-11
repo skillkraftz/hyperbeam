@@ -9,7 +9,8 @@
   servers, kills or GUI apps as the user. Use `hyperbeam lab run`. Never touch the user's tmux sessions.
 - Give `hyperbeam lab run` a short `--why`. The lab shares the machine's network: use free ports (bind port 0,
   or `$LAB_PORT_MIN`-`$LAB_PORT_MAX`), never 3100+ project ports. Docker-based tests are not run in the lab;
-  list them as an exception.
+  list them as an exception. The lab is shared with other projects: stop only your own runs
+  (`hyperbeam lab stop`); never run `hyperbeam lab reset` (user only).
 - Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.
 - Work on a branch per task. Commit, push, open a PR. End the PR description with a short
   manual test checklist. Don't merge unless the user says so.
@@ -26,3 +27,5 @@
   hyperbeam rules` that lists each exception and why, approved by the user. Otherwise the project follows
   this file; if the project's CLAUDE.md disagrees, the project is brought in line (see ALIGN.md).
 - Manual test checklists use real, runnable commands. No placeholders (no `...`, no `<name>`).
+- Never run `git worktree remove --force` or delete a worktree that has uncommitted changes. Commit or stash
+  first.

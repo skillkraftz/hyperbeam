@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 
 KILL = r"(?:kill-server|kill-session|kill-window|kill-pane|killw|killp)"
@@ -205,6 +206,8 @@ def runs_worktree_script(cmd):
             continue
         # the script run directly, or by an interpreter / wrapper (`uv run --script ./hyperbeam`, `python3 hyperbeam`, `timeout 5 ./hyperbeam`);
         # a bare mention (`git add hyperbeam`, `py_compile hyperbeam`) is not a run
+        if re.search(r"\blab\s+(?:status|stop|log)\b", " ".join(toks)):         # read-only / per-project lab commands never touch state
+            continue
         cand = [toks[0]]
         if re.fullmatch(r"(?:.*/)?(?:python[\d.]*|bash|sh)", toks[0]):          # the script is the first argument that isn't an option (not after -m / -c)
             rest = [t for t in toks[1:] if not t.startswith("-")]
@@ -226,6 +229,67 @@ RULES = RULES + [
      "once migrated the user's live state folder). Run it in the lab: `hyperbeam lab run --dir <worktree> -- uv run --quiet --script hyperbeam ...` "
      "(the lab copies the folder and runs it as hblab with its own home, tmux and display). Only `hyperbeam lab run ...` itself is allowed from a "
      "worktree. Use the installed `hyperbeam` for read-only commands that don't change state, or ask the user."),
+]
+
+
+def runs_lab_reset(cmd):
+    """`hyperbeam lab reset` (forced or not): it kills processes, and the lab is shared with other projects' runs. Agents use `hyperbeam lab stop`."""
+    return bool(re.search(r"hyperbeam\S*\s+lab\s+reset\b", cmd))
+
+
+def force_removes_worktree(cmd):
+    for line in cmd.split("\n"):
+        try:
+            toks = shlex.split(line)
+        except ValueError:
+            toks = line.split()
+        for i in range(len(toks) - 1):
+            if toks[i] == "worktree" and toks[i + 1] == "remove" and any(t in ("-f", "-ff", "--force") or re.fullmatch(r"-[a-z]*f[a-z]*", t) for t in toks[i + 2:]):
+                return True
+    return False
+
+
+def deletes_dirty_worktree(cmd):
+    """`rm -r` of a git worktree folder (or of the folder that holds worktrees) that has uncommitted changes or untracked files."""
+    cwd = CWD or os.getcwd()
+    for line in cmd.split("\n"):
+        try:
+            toks = shlex.split(line)
+        except ValueError:
+            toks = line.split()
+        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
+        while toks and toks[0] in ("sudo", "env", "command", "nohup", "time"):
+            toks = toks[1:]
+        if not toks or os.path.basename(toks[0]) != "rm":
+            continue
+        if not any(t.startswith("-") and not t.startswith("--") and set(t[1:]) & set("rR") or t == "--recursive" for t in toks[1:]):
+            continue
+        for t in toks[1:]:
+            if t.startswith("-"):
+                continue
+            path = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(t))))
+            cands = [path]
+            if os.path.basename(path) == "hyperbeam-work" and os.path.isdir(path):
+                cands = [os.path.join(path, d) for d in os.listdir(path)]
+            for c in cands:
+                if os.path.isfile(os.path.join(c, ".git")):
+                    r = subprocess.run(["git", "-C", c, "status", "--porcelain"], capture_output=True, text=True, timeout=10)
+                    if r.stdout.strip():
+                        return True
+    return False
+
+
+RULES = RULES + [
+    ("lab-reset", runs_lab_reset,
+     "BLOCKED by hyperbeam: `hyperbeam lab reset` (forced or not) is for the user only. The lab is shared: reset kills what other projects have running "
+     "(it once killed another project's e2e suite). To stop your own runs use `hyperbeam lab stop` (it touches only this project's runs). To see what is "
+     "running: `hyperbeam lab status`. If a reset is really needed, ask the user."),
+    ("worktree-force-remove", force_removes_worktree,
+     "BLOCKED by hyperbeam: `git worktree remove --force` throws away uncommitted work (it was lost once). Commit or stash first, push the branch, then "
+     "`git worktree remove <path>` without --force: git itself refuses if something is uncommitted."),
+    ("rm-dirty-worktree", deletes_dirty_worktree,
+     "BLOCKED by hyperbeam: that worktree has uncommitted changes or untracked files, and deleting it would lose them. Commit or stash first (and push), "
+     "then remove it with `git worktree remove <path>`."),
 ]
 
 

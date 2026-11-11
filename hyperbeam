@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, asyncio, hashlib, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
+import argparse, asyncio, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1720,6 +1720,111 @@ def cmd_lab_log(a):
     return 0
 
 
+# Runs as hblab (`sudo -u hblab python3 -c LAB_PY MODE ARGS`). Every `lab run` has an id; its processes (and everything they start, even daemonised
+# ones) carry HB_RUN_ID=<id> in their environment, and the run is recorded in /srv/hblab/runs/<id>.json while it is alive. A run is alive while some
+# process has its tag: records of dead runs are removed here. Modes: list | stop PROJECT | done ID | killall | clean.
+LAB_PY = r"""
+import glob, json, os, shutil, signal, sys, time
+HOME = "/srv/hblab"; ME = os.getpid(); UID = os.getuid()
+def tagged():
+    out = {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) == ME:
+            continue
+        try:
+            if os.stat(f"/proc/{p}").st_uid != UID:
+                continue
+            env = open(f"/proc/{p}/environ", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        for e in env:
+            if e.startswith(b"HB_RUN_ID="):
+                out.setdefault(e[10:].decode(), []).append(int(p))
+                break
+    return out
+def records(alive):
+    recs = []
+    for f in glob.glob(HOME + "/runs/*.json"):
+        try:
+            r = json.load(open(f))
+        except Exception:
+            r = None
+        if r and r.get("id") in alive:
+            recs.append(r)
+        else:
+            try: os.unlink(f)
+            except OSError: pass
+    return recs
+def kill(ids, everything=False):
+    n = 0
+    for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 0)):
+        pids = [p for i, ps in tagged().items() if everything or i in ids for p in ps]
+        if everything:
+            pids = [int(p) for p in os.listdir("/proc") if p.isdigit() and int(p) != ME and os.stat(f"/proc/{p}").st_uid == UID]
+        if not pids:
+            break
+        for p in pids:
+            try: os.kill(p, sig); n += 1
+            except OSError: pass
+        t = time.time() + wait
+        while wait and time.time() < t and any(os.path.exists(f"/proc/{p}") for p in pids):
+            time.sleep(0.2)
+    return n
+def cleanup(i):
+    for d in (f"{HOME}/rt/{i}", f"{HOME}/tmux/{i}"):
+        shutil.rmtree(d, ignore_errors=True)
+    try: os.unlink(f"{HOME}/runs/{i}.json")
+    except OSError: pass
+mode = sys.argv[1]
+if mode == "list":
+    print(json.dumps(records(tagged())))
+elif mode == "stop":
+    recs = [r for r in records(tagged()) if r["project"] == sys.argv[2]]
+    ids = {r["id"] for r in recs}
+    n = kill(ids)
+    for i in ids: cleanup(i)
+    print(json.dumps({"stopped": sorted(ids), "killed": n}))
+elif mode == "done":
+    kill({sys.argv[2]}); cleanup(sys.argv[2])
+elif mode == "killall":
+    n = kill(set(), everything=True)
+    for f in glob.glob(HOME + "/runs/*.json"): os.unlink(f)
+    print(json.dumps({"killed": n}))
+elif mode == "clean":
+    alive = set(tagged())
+    for d in glob.glob(HOME + "/rt/*") + glob.glob(HOME + "/tmux/*"):
+        b = os.path.basename(d)
+        if len(b) == 8 and all(c in "0123456789abcdef" for c in b) and b not in alive:      # per-run folders only (never older, shared ones)
+            shutil.rmtree(d, ignore_errors=True)
+"""
+
+
+def lab_py(*args):
+    r = subprocess.run(lab_sudo("python3", "-c", LAB_PY, *args), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else None
+    except ValueError:
+        return None
+
+
+def lab_runs():
+    """Active lab runs: [{id, project, why, command, cwd, pgid, start}] (records of runs that are gone are removed on the way)."""
+    return sorted(lab_py("list") or [], key=lambda r: r.get("start", 0))
+
+
+def lab_caller_project():
+    """The project the caller means: the folder's project when inside a git repo, else $HB_PROJECT."""
+    cwd = Path.cwd()
+    if subprocess.run(["git", "-C", str(cwd), "rev-parse", "--git-dir"], capture_output=True).returncode == 0:
+        return lab_project_name(cwd)
+    return os.environ.get("HB_PROJECT") or None
+
+
+def fmt_age(sec):
+    sec = int(sec)
+    return f"{sec}s" if sec < 60 else f"{sec // 60}m{sec % 60:02d}s" if sec < 3600 else f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+
+
 def lab_ready():
     """None if the lab works, else the reason it doesn't (and what to do)."""
     try:
@@ -1784,22 +1889,46 @@ def cmd_lab(a):
         print("synced projects: " + (", ".join(f"{n.split('/', 1)[1]} {sz}" for sz, n in rows if n.startswith("projects/")) or "none"))
         print("caches: " + (", ".join(f"{n.split('/', 1)[1]} {sz}" for sz, n in rows if n.startswith("cache/")) or "none"))
         print(f"virtual display {LAB_DISPLAY}: " + ("up" if Path("/tmp/.X11-unix/X99").exists() else "not running (starts with the next `lab run`)"))
+        runs = lab_runs()
+        print("active runs: " + ("none" if not runs else ""))
+        for r in runs:
+            print(f"  {r['project']:<16} {fmt_age(time.time() - r.get('start', time.time())):>8}  {r.get('why') or '(no why)'}  | {r.get('command', '')[:60]}  [{r['id']}]")
         ps = subprocess.run(["ps", "-u", LAB_USER, "-o", "pid,etime,args"], capture_output=True, text=True).stdout.strip()
         print("processes:\n" + (ps if len(ps.splitlines()) > 1 else "  none"))
+        return 0
+    if a.action == "stop":
+        name = a.project or lab_caller_project()
+        if not name:
+            print("hyperbeam lab stop: which project? Give a name (hyperbeam lab stop dotwork), or run it inside the project's folder.")
+            return 2
+        res = lab_py("stop", name)
+        if res is None:
+            print("hyperbeam lab stop: could not reach the lab")
+            return 1
+        print(f"lab stop {name}: " + (f"stopped {len(res['stopped'])} run(s) ({res['killed']} processes); other projects and the display were not touched" if res["stopped"] else "no active runs of this project"))
         return 0
     if a.action == "reset":
         if not os.path.ismount(LAB_HOME):
             print("refusing to wipe: the lab disk is not mounted")
             return 1
-        for _ in range(3):
-            pids = lab_pids()
-            if not pids:
-                break
-            subprocess.run(lab_sudo("kill", "-KILL", *map(str, pids)), capture_output=True, stdin=subprocess.DEVNULL)
-            time.sleep(0.5)
-        subprocess.run(lab_sudo("sh", "-c", f"rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock; find {LAB_HOME} -mindepth 1 -maxdepth 1 ! -name lost+found {'' if a.all else '! -name projects ! -name cache'} -exec rm -rf -- {{}} +"),
-                       capture_output=True, stdin=subprocess.DEVNULL)
-        print(f"lab reset: hblab's processes stopped, " + (f"{LAB_HOME} emptied" if a.all else "runtime files removed; synced projects and caches kept (--all wipes them too)"))
+        mine = lab_caller_project()
+        others = [r for r in lab_runs() if r["project"] != mine]
+        if others and not a.force:
+            print("lab reset refused: other projects have runs going:\n" + "\n".join(
+                f"  {r['project']}  {fmt_age(time.time() - r.get('start', time.time()))}  {r.get('why') or '(no why)'}" for r in others) +
+                "\nReset would kill them. Stop only your own runs with `hyperbeam lab stop`. (The user can override with `lab reset --force`.)")
+            return 1
+        if a.force:                                          # the user only (the guard blocks agents): everything hblab runs, the display too
+            lab_py("killall")
+            subprocess.run(lab_sudo("rm", "-f", "/tmp/.X11-unix/X99", "/tmp/.X99-lock"), capture_output=True, stdin=subprocess.DEVNULL)
+        elif mine:
+            lab_py("stop", mine)
+        lab_py("clean")
+        if a.all:
+            subprocess.run(lab_sudo("sh", "-c", f"find {LAB_HOME} -mindepth 1 -maxdepth 1 ! -name lost+found ! -name runs ! -name tmux ! -name rt -exec rm -rf -- {{}} +"),
+                           capture_output=True, stdin=subprocess.DEVNULL)
+        print("lab reset: " + ("everything hblab ran was stopped (forced), " if a.force else f"your runs ({mine or 'none'}) stopped, other projects' runs and the display left alone, ")
+              + (f"synced projects and caches wiped" if a.all else "leftover run files removed; synced projects and caches kept (--all wipes them too)"))
         return 0
     explicit = a.cmd[:1] == ["--"]
     cmd = a.cmd[1:] if explicit else a.cmd
@@ -1838,8 +1967,10 @@ def cmd_lab(a):
         print(f"lab: copying {src} failed:\n{sync.stderr.strip()[-400:]}", file=sys.stderr)
         return 1
     cache = f"{LAB_HOME}/cache"
+    rid = uuid.uuid4().hex[:8]
     env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_TOOLS}/node_modules/.bin:{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-           "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt",
+           "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux/{rid}", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt/{rid}",
+           "HB_RUN_ID": rid, "HB_RUN_PROJECT": name, "HB_RUN_WHY": a.why or "", "HB_RUN_CWD": str(src), "HB_RUN_CMD": cmd[0] if len(cmd) == 1 else shlex.join(cmd),
            "HB_LAB": "1", "XDG_CACHE_HOME": cache, "npm_config_cache": f"{cache}/npm", "npm_config_store_dir": f"{cache}/pnpm-store",
            "PNPM_HOME": f"{cache}/pnpm", "COREPACK_HOME": f"{cache}/corepack", "UV_CACHE_DIR": f"{cache}/uv", "PIP_CACHE_DIR": f"{cache}/pip",
            "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/playwright", "LAB_PORT_MIN": str(LAB_PORTS[0]), "LAB_PORT_MAX": str(LAB_PORTS[1]), "HB_LAB_PROJECT": name}
@@ -1849,16 +1980,25 @@ def cmd_lab(a):
         print("(lab: no virtual display: install xvfb; GUI tests will fail to open)", file=sys.stderr)
     if not a.why:
         print("(lab: no --why; add a short reason, e.g. --why 'unit tests for the guard': it goes in the run log)", file=sys.stderr)
-    script = ('cd "$1" || exit 97; shift; t="$1"; shift; '
+    # Its own session (setsid): the process group is recorded in /srv/hblab/runs/<id>.json while the run is alive. Everything it starts keeps HB_RUN_ID
+    # in its environment, which is how `lab stop` finds grandchildren (browsers, dev servers) even if they leave the group.
+    script = ('mkdir -p -m700 "$XDG_RUNTIME_DIR" "$TMUX_TMPDIR" "' + str(LAB_HOME) + '/runs"; '
+              'python3 -c \'import json,os,time;i=os.environ["HB_RUN_ID"];json.dump(dict(id=i,project=os.environ["HB_RUN_PROJECT"],why=os.environ["HB_RUN_WHY"],'
+              'command=os.environ["HB_RUN_CMD"],cwd=os.environ["HB_RUN_CWD"],pgid=os.getpgrp(),start=time.time()),open("' + str(LAB_HOME) + '/runs/"+i+".json","w"))\'; '
+              'cd "$1" || exit 97; shift; t="$1"; shift; '
               'if [ $# -eq 1 ]; then exec timeout -k 5 "$t" bash -c "$1"; else exec timeout -k 5 "$t" "$@"; fi')
     t0, tail = time.time(), []
-    p = subprocess.Popen(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "bash", "-c", script, "_", dest, str(a.timeout), *cmd),
+    p = subprocess.Popen(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "setsid", "-w", "bash", "-c", script, "_", dest, str(a.timeout), *cmd),
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    for line in p.stdout:
-        sys.stdout.buffer.write(line)
-        sys.stdout.buffer.flush()
-        tail = (tail + [line.decode(errors="replace").rstrip("\n")])[-20:]
-    rc = p.wait()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        for line in p.stdout:
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+            tail = (tail + [line.decode(errors="replace").rstrip("\n")])[-20:]
+        rc = p.wait()
+    finally:                                      # also when you press Ctrl-C: what this run left behind is stopped, its record and dirs removed
+        lab_py("done", rid)
     lab_log_run(name, src, cmd, a.why or "", time.time() - t0, rc, tail)
     if rc == 124:
         print(f"(lab: stopped after {a.timeout} s; raise it with --timeout)", file=sys.stderr)
@@ -2294,9 +2434,10 @@ def open_prs(name, path, force=False):
     prs, age, err = cached_prs(name, path)
     if not force and age < PR_TTL and (prs is not None or err):
         return prs or []
-    rc, out, e = gh_run(slug, "pr", "list", "--author", "@me", "--state", "open", "--json", "number,title,url,headRefName")
+    rc, out, e = gh_run(slug, "pr", "list", "--author", "@me", "--state", "open", "--json", "number,title,url,headRefName,baseRefName,createdAt")
     try:
-        prs = sorted(({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", "")} for x in json.loads(out)),
+        prs = sorted(({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", ""), "base": x.get("baseRefName", ""),
+                                                                                                        "created": x.get("createdAt", "")} for x in json.loads(out)),
                      key=lambda x: -x["number"]) if rc == 0 else None
     except (ValueError, KeyError, TypeError):
         prs, e = None, "unreadable gh output"
@@ -2305,6 +2446,50 @@ def open_prs(name, path, force=False):
     except OSError:
         pass
     return prs or []
+
+
+STALE_DAYS = 7
+
+
+def pr_age_days(pr):
+    """Whole days since the PR was opened (0 if unknown)."""
+    try:
+        return max(0, int((time.time() - __import__("calendar").timegm(time.strptime(pr["created"][:19], "%Y-%m-%dT%H:%M:%S"))) // 86400))
+    except (KeyError, ValueError, TypeError):
+        return 0
+
+
+def pr_stale(pr):
+    return pr_age_days(pr) > STALE_DAYS
+
+
+def pr_behind(path, pr):
+    """How many commits the PR's branch is behind its base branch (the tests ran against an older base), or None if it can't be told
+    (fork, no network): fetch both branches quietly and count `head..base`."""
+    base = pr.get("base") or default_branch(path)
+    head = pr.get("branch")
+    if not head:
+        return None
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5")
+    f = subprocess.run(["git", "-C", str(path), "fetch", "-q", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}", f"+refs/heads/{head}:refs/hyperbeam/pr-head"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    if f.returncode:
+        return None
+    n = git_out(path, "rev-list", "--count", f"refs/hyperbeam/pr-head..refs/remotes/origin/{base}")
+    return int(n) if n.isdigit() else None
+
+
+def update_prompt(name, pr, behind, base):
+    """What Claude is asked to do about a PR that is behind its base. Written to the prompts folder; returns the file."""
+    return write_prompt(sanitize(name), f"""# Update PR #{pr['number']} ({pr['title']}) and re-test it
+
+The PR branch `{pr.get('branch')}` is {behind} commit{'s' if behind != 1 else ''} behind `{base}`, so its tests ran against an older {base}.
+Do this, in the project's folder (use a worktree if the checkout has other work):
+1. `git fetch`, then rebase the branch onto `origin/{base}` (or merge `origin/{base}` into it if a rebase is messy). Resolve conflicts carefully; ask me if a conflict is not obvious.
+2. Re-run the project's tests in the lab: `hyperbeam lab run --why "re-test PR #{pr['number']} on current {base}" ...` (see the project's CLAUDE.md for the test command).
+3. Push the branch (`--force-with-lease` after a rebase) and tell me the result: tests pass or fail, what changed.
+Do not merge the PR; I will.
+""")
 
 
 def default_branch(path):
@@ -2718,7 +2903,7 @@ def project_info(name, rows=None, footer=True, alert=True):
     section("Vercel", [f"project {n}  (production URL: needs `vercel login`)" for n in vp])
     web = git_web_url(path)
     section("Git", [f"{web}  repo" if web else "", f"{homepage}  homepage (GitHub)" if homepage else ""])
-    section("Pull requests (yours, open)", [f"#{x['number']}  {x['title']}  {x['url']}" for x in open_prs(name, path)])
+    section("Pull requests (yours, open)", [f"#{x['number']}  {x['title']}  {x['url']}" + (f"  [stale: {pr_age_days(x)} days old]" if pr_stale(x) else "") for x in open_prs(name, path)])
     section(".env", [f"{u}  {k} ({f})" for k, u, f in env_urls(path)])
     section("Extra ([links])", [f"{u}  {k}" for k, u in ((man or {}).get("links") or {}).items()])
     if footer:
@@ -2870,11 +3055,15 @@ class Choice(ModalScreen):
     Choice Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 10; }
     """
 
-    def __init__(self, text, options):
+    def __init__(self, text, options, enter=None):
         super().__init__()
-        self.text, self.options = text, options
+        self.text, self.options, self.enter = text, options, enter       # `enter`: the id Enter picks (none: Enter does nothing)
 
     def on_key(self, event):
+        if event.key == "enter" and self.enter:
+            event.stop()
+            self.dismiss(self.enter)
+            return
         for oid, _, key in self.options:
             if event.key == key or (event.key == "escape" and oid == self.options[-1][0]):
                 event.stop()
@@ -3266,7 +3455,7 @@ class Menu(App):
         self.set_class(bool(p and p.get("prs")), "pr")              # a project with an open PR gets a Merge button
         if p and p.get("prs") and not (st and st[0] == "red"):
             pr = p["prs"][0]
-            why = f"PR #{pr['number']}: {pr['title']}" + (f"  (+{len(p['prs']) - 1} more)" if len(p["prs"]) > 1 else "")
+            why = f"PR #{pr['number']}: {pr['title']}" + (f" [stale: {pr_age_days(pr)}d]" if pr_stale(pr) else "") + (f"  (+{len(p['prs']) - 1} more)" if len(p["prs"]) > 1 else "")
         elif st:
             why = f"[{st[0]}] {st[1]}"
         elif p and p["name"] == "hyperbeam" and self.repo[1]:
@@ -3363,10 +3552,10 @@ class Menu(App):
     def save_layouts(self):
         self.run_worker(save_all, thread=True, group="save")
 
-    def choose(self, text, options):
+    def choose(self, text, options, enter=None):
         """Like ask(): a modal with several buttons, from a worker thread; returns the chosen id."""
         done, box = threading.Event(), []
-        self.call_from_thread(self.push_screen, Choice(text, options), lambda v: (box.append(v), done.set()))
+        self.call_from_thread(self.push_screen, Choice(text, options, enter), lambda v: (box.append(v), done.set()))
         done.wait()
         return box[0]
 
@@ -3500,7 +3689,29 @@ class Menu(App):
     def _merge(self, p, pr):
         name = p["name"]
         try:
-            if not self.ask(f"Merge PR #{pr['number']} in {name}?\n\n{pr['title']}\n\nA merge commit; the branch is deleted on GitHub. Nothing is merged without Yes."):
+            self.say_from_thread(f"{name}: checking PR #{pr['number']} against {pr.get('base') or 'main'}...")
+            try:
+                behind = pr_behind(p["path"], pr)
+            except (subprocess.SubprocessError, OSError):
+                behind = None
+            base = pr.get("base") or default_branch(p["path"])
+            title = f"Merge PR #{pr['number']} in {name}?\n\n{pr['title']}\n\n"
+            if pr_stale(pr):
+                title += f"This PR is {pr_age_days(pr)} days old (stale).\n\n"
+            if behind:
+                pick = self.choose(title + f"This PR is {behind} commit{'s' if behind != 1 else ''} behind {base}; its tests ran against an older {base}.\n\n"
+                                   "Ask Claude to update it and re-test (Enter), or merge it as it is.", [
+                    ("ask", "Ask Claude to update and re-test (a)", "a"), ("merge", "Merge anyway (m)", "m"), ("cancel", "Cancel (c)", "c")], enter="ask")
+                if pick == "ask":
+                    sess = sanitize(name)
+                    pane = find_claude_pane(sess) if session_exists(sess) else None
+                    if not pane:
+                        return self.say_from_thread(f"{name}: not running: Open it, then ask again (nothing was merged)")
+                    inject_prompt(pane, update_prompt(name, pr, behind, base), [])
+                    return self.say_from_thread(f"{name}: asked Claude to update PR #{pr['number']} on {base} and re-test (nothing merged)")
+                if pick != "merge":
+                    return self.say_from_thread(f"{name}: merge cancelled")
+            elif not self.ask(title + "A merge commit; the branch is deleted on GitHub. Nothing is merged without Yes."):
                 return self.say_from_thread(f"{name}: merge cancelled")
             self.say_from_thread(f"{name}: merging PR #{pr['number']}...")
             ok, msgs = merge_pr(name, p["path"], pr, self.say_from_thread)
@@ -3798,8 +4009,11 @@ def main():
     lr.add_argument("--fresh", action="store_true", help="wipe this project's synced copy (and what the lab installed in it) first")
     lr.add_argument("--timeout", type=int, default=600, help="seconds before the command is stopped (default 600)")
     lr.add_argument("cmd", nargs=argparse.REMAINDER)
-    lrs = lsub.add_parser("reset", help="stop hblab's processes and clear its runtime files; keeps the synced projects and caches")
-    lrs.add_argument("--all", action="store_true", help="also wipe the synced projects and the caches (empties the lab disk)")
+    lst = lsub.add_parser("stop", help="stop this project's active lab runs (and what they started); other projects' runs are not touched")
+    lst.add_argument("project", nargs="?", help="default: the project of the current folder, else $HB_PROJECT")
+    lrs = lsub.add_parser("reset", help="stop YOUR project's runs and clear leftover run files; refuses while other projects have runs (keeps synced projects and caches)")
+    lrs.add_argument("--all", action="store_true", help="also wipe the synced projects and the caches")
+    lrs.add_argument("--force", action="store_true", help="the user only: kill everything hblab runs, other projects' runs and the display too")
     lg = lsub.add_parser("log", help="the lab run log: what ran, why, how long")
     lg.add_argument("--today", action="store_true")
     lsub.add_parser("status", help="disk use, synced projects, caches, processes")
