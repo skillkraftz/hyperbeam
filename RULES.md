@@ -11,6 +11,8 @@
   or `$LAB_PORT_MIN`-`$LAB_PORT_MAX`), never 3100+ project ports. Docker-based tests are not run in the lab;
   list them as an exception. The lab is shared with other projects: stop only your own runs
   (`hyperbeam lab stop`); never run `hyperbeam lab reset` (user only).
+- Before multi-step lab work, check TOOLS.md (`hyperbeam tool --list`) for a tool that does it, and use it
+  (`hyperbeam tool NAME`) instead of redoing the steps.
 - Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.
 - Work on a branch per task. Commit, push, open a PR. End the PR description with a short
   manual test checklist. Don't merge unless the user says so.
