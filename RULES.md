@@ -5,8 +5,11 @@
 - Security is light: repos are public by default. Gitignore only real secrets (.env, keys,
   tokens) and list them in PRIVATE.md with how to get them back. Never print secret values.
 - Never commit steno-*.txt (personal dictation notes).
-- Testing: never run test servers, kills or GUI apps as the user. Use `hyperbeam lab run`.
-  Never touch the user's tmux sessions.
+- Testing: ALL testing runs in the lab, including unit tests and headless browser suites. Never run test
+  servers, kills or GUI apps as the user. Use `hyperbeam lab run`. Never touch the user's tmux sessions.
+- Give `hyperbeam lab run` a short `--why`. The lab shares the machine's network: use free ports (bind port 0,
+  or `$LAB_PORT_MIN`-`$LAB_PORT_MAX`), never 3100+ project ports. Docker-based tests are not run in the lab;
+  list them as an exception.
 - Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.
 - Work on a branch per task. Commit, push, open a PR. End the PR description with a short
   manual test checklist. Don't merge unless the user says so.
@@ -19,3 +22,6 @@
   in the same PR as any change to those.
 - Record design decisions in docs/DECISIONS.md, newest first: date, decision, why, what was
   rejected. Create the file if missing. Update it in the same PR as the decision.
+- Exceptions to these rules are allowed only in the project's CLAUDE.md, in a section `## Exceptions to
+  hyperbeam rules` that lists each exception and why, approved by the user. Otherwise the project follows
+  this file; if the project's CLAUDE.md disagrees, the project is brought in line (see ALIGN.md).

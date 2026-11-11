@@ -509,7 +509,12 @@ def investigate_prompt(name, path, sess, reason, failures, findings=()):
         ctx.append(f"\nService `{f['name']}` failed: {f['result']}\nLast lines of its window:\n```\n{f['tail'] or '(empty)'}\n```")
     if findings:
         ctx.append("\nStart check findings:\n" + "\n".join(f"- {x}" for x in findings))
-    return write_prompt(sess, (HERE / "ONBOARDING.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
+    try:
+        facts = align_facts(path)
+    except (OSError, subprocess.SubprocessError):
+        facts = "- (could not gather)"
+    ctx.append("\nAlignment facts (gathered by hyperbeam, for ALIGN.md below):\n" + facts)
+    return write_prompt(sess, (HERE / "ONBOARDING.md").read_text() + "\n\n---\n\n" + (HERE / "ALIGN.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
 
 
 def recover_prompt(name, path, sess, findings):
@@ -1659,6 +1664,58 @@ LAB_SETUP = (f"The lab is not set up yet. Read {HERE}/lab/setup.sh, then run it 
              "(it creates the user hblab, a 10G disk image mounted at /srv/hblab, and a sudo rule that lets you run commands as hblab only).")
 
 
+LAB_SYNC_EXCLUDE = [".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "target", ".pytest_cache", ".hyperbeam",
+                    "steno-*.txt", ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*"]
+LAB_PORTS = (39000, 39999)          # the lab shares the machine's network: its servers use these (or port 0), never the projects' 3100+
+LAB_LOG = lambda: DATA_DIR / "lab-runs.jsonl"
+
+
+def lab_project_name(src):
+    """The project a directory belongs to: for a worktree the name of the main checkout (not the branch folder), else the folder's name."""
+    r = subprocess.run(["git", "-C", str(src), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True)
+    common = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    return common.parent.name if common and common.name == ".git" else src.name
+
+
+def lab_log_run(project, cwd, cmd, why, seconds, rc, tail):
+    """One JSON line per `lab run`, written by this script (hblab can't write there): the base for a later digest of repeated lab work."""
+    rec = dict(time=time.strftime("%Y-%m-%dT%H:%M:%S"), project=project, cwd=str(cwd), command=cmd[0] if len(cmd) == 1 else shlex.join(cmd),
+               why=why, seconds=round(seconds, 1), exit=rc, tail=tail[-20:])
+    try:
+        LAB_LOG().parent.mkdir(parents=True, exist_ok=True)
+        with LAB_LOG().open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        LAB_LOG().chmod(0o600)
+    except OSError as e:
+        print(f"(lab: could not write the run log: {e})", file=sys.stderr)
+
+
+def cmd_lab_log(a):
+    try:
+        runs = [json.loads(l) for l in LAB_LOG().read_text().splitlines() if l.strip()]
+    except (OSError, ValueError):
+        runs = []
+    if a.today:
+        runs = [r for r in runs if r["time"].startswith(time.strftime("%Y-%m-%d"))]
+    if not runs:
+        print("no lab runs logged" + (" today" if a.today else "") + f" ({home_rel(LAB_LOG())})")
+        return 0
+    for r in runs:
+        cmd = r["command"] if len(r["command"]) < 70 else r["command"][:69] + "…"
+        print(f"{r['time'][5:16].replace('T', ' ')}  {r['project']:<14} {'ok ' if r['exit'] == 0 else 'rc' + str(r['exit']):<5}{r['seconds']:>6.1f}s  {r['why'] or '(no why)'}  | {cmd}")
+    fails = [r for r in runs if r["exit"] != 0]
+    print(f"\n{len(runs)} runs, {sum(r['seconds'] for r in runs) / 60:.1f} min, {len(fails)} failed")
+    again = {}
+    for r in runs:
+        again.setdefault((r["project"], r["command"]), []).append(r)
+    rep = [(k, v) for k, v in again.items() if len(v) > 1]
+    if rep:
+        print("repeated (candidates for a small tool):")
+        for (proj, c), v in sorted(rep, key=lambda kv: -len(kv[1])):
+            print(f"  {len(v)}x {proj}: {c[:90]}")
+    return 0
+
+
 def lab_ready():
     """None if the lab works, else the reason it doesn't (and what to do)."""
     try:
@@ -1706,6 +1763,8 @@ def lab_xvfb():
 
 def cmd_lab(a):
     """hyperbeam lab run|reset|status. The code goes in as a copy; everything runs as hblab (it can't signal the user's processes)."""
+    if a.action == "log":
+        return cmd_lab_log(a)
     msg = lab_ready()
     if msg:
         print(msg)
@@ -1716,9 +1775,10 @@ def cmd_lab(a):
         print(f"lab: user {LAB_USER}, {LAB_HOME} mounted; disk {u.used / 2**30:.1f} of {u.total / 2**30:.1f} GB used"
               + (f" (image file {img.stat().st_size / 2**30:.0f} GB)" if img.exists() else ""))
         # /srv/hblab is hblab's (mode 750): list it as hblab, and say so instead of crashing if that fails
-        ls = subprocess.run(lab_sudo("ls", "-1", str(LAB_HOME / "run")), capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        runs = sorted(ls.stdout.split()) if ls.returncode == 0 else []
-        print(f"run directories: {', '.join(runs) or 'none'}")
+        du = subprocess.run(lab_sudo("sh", "-c", f"cd {LAB_HOME} 2>/dev/null && du -sh projects/* cache/* 2>/dev/null"), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        rows = [l.split("\t") for l in du.stdout.splitlines() if "\t" in l]
+        print("synced projects: " + (", ".join(f"{n.split('/', 1)[1]} {sz}" for sz, n in rows if n.startswith("projects/")) or "none"))
+        print("caches: " + (", ".join(f"{n.split('/', 1)[1]} {sz}" for sz, n in rows if n.startswith("cache/")) or "none"))
         print(f"virtual display {LAB_DISPLAY}: " + ("up" if Path("/tmp/.X11-unix/X99").exists() else "not running (starts with the next `lab run`)"))
         ps = subprocess.run(["ps", "-u", LAB_USER, "-o", "pid,etime,args"], capture_output=True, text=True).stdout.strip()
         print("processes:\n" + (ps if len(ps.splitlines()) > 1 else "  none"))
@@ -1733,9 +1793,9 @@ def cmd_lab(a):
                 break
             subprocess.run(lab_sudo("kill", "-KILL", *map(str, pids)), capture_output=True, stdin=subprocess.DEVNULL)
             time.sleep(0.5)
-        subprocess.run(lab_sudo("sh", "-c", f"rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock; find {LAB_HOME} -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {{}} +"),
+        subprocess.run(lab_sudo("sh", "-c", f"rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock; find {LAB_HOME} -mindepth 1 -maxdepth 1 ! -name lost+found {'' if a.all else '! -name projects ! -name cache'} -exec rm -rf -- {{}} +"),
                        capture_output=True, stdin=subprocess.DEVNULL)
-        print(f"lab reset: hblab's processes stopped, {LAB_HOME} emptied")
+        print(f"lab reset: hblab's processes stopped, " + (f"{LAB_HOME} emptied" if a.all else "runtime files removed; synced projects and caches kept (--all wipes them too)"))
         return 0
     cmd = [c for c in a.cmd if c != "--"] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
@@ -1745,26 +1805,44 @@ def cmd_lab(a):
     if src in (Path("/"), Path.home()):
         print(f"refusing to copy {src} into the lab: give the project or worktree directory")
         return 2
-    name = re.sub(r"[^A-Za-z0-9._-]", "_", a.name or src.name)
-    dest = f"{LAB_HOME}/run/{name}"
-    subprocess.run(lab_sudo("sh", "-c", 'mkdir -p -m700 "$1/rt" "$1/tmux" "$1/run" && rm -rf -- "$2" && mkdir -p "$2"', "_", str(LAB_HOME), dest), check=True, stdin=subprocess.DEVNULL)
-    tar = subprocess.Popen(["tar", "-C", str(src), "--exclude=.git", "--exclude=node_modules", "--exclude=__pycache__", "--exclude=.venv", "-cf", "-", "."],
-                           stdout=subprocess.PIPE)
-    subprocess.run(lab_sudo("tar", "-C", dest, "-xf", "-"), stdin=tar.stdout, check=True)
-    tar.wait()
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", a.name or lab_project_name(src))
+    dest = f"{LAB_HOME}/projects/{name}"
+    subprocess.run(lab_sudo("sh", "-c", 'mkdir -p -m700 "$1/rt" "$1/tmux" "$1/cache" && if [ -n "$3" ]; then rm -rf -- "$2"; fi; mkdir -p -m750 "$2"',
+                            "_", str(LAB_HOME), dest, "fresh" if a.fresh else ""), check=True, stdin=subprocess.DEVNULL)
+    # One synced copy per project: rsync (as hblab) from the worktree or checkout. What the lab built there (node_modules, .venv, ...) is excluded from
+    # the sync, so it is neither copied from you nor deleted: only the first run installs. Secrets and personal files are never copied.
+    ex = [f"--exclude={x}" for x in LAB_SYNC_EXCLUDE]
+    sync = subprocess.run(["rsync", "-a", "--delete", "--include=.env.example", *ex, "-e", str(HERE / "lab/sudo-hblab"), f"{src}/", f"lab:{dest}/"],
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if sync.returncode:
+        print(f"lab: copying {src} failed:\n{sync.stderr.strip()[-400:]}", file=sys.stderr)
+        return 1
+    cache = f"{LAB_HOME}/cache"
     env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
            "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt",
-           "HB_LAB": "1"}
+           "HB_LAB": "1", "XDG_CACHE_HOME": cache, "npm_config_cache": f"{cache}/npm", "npm_config_store_dir": f"{cache}/pnpm-store",
+           "PNPM_HOME": f"{cache}/pnpm", "COREPACK_HOME": f"{cache}/corepack", "UV_CACHE_DIR": f"{cache}/uv", "PIP_CACHE_DIR": f"{cache}/pip",
+           "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/playwright", "LAB_PORT_MIN": str(LAB_PORTS[0]), "LAB_PORT_MAX": str(LAB_PORTS[1]), "HB_LAB_PROJECT": name}
     if lab_xvfb():
         env["DISPLAY"] = LAB_DISPLAY
     else:
         print("(lab: no virtual display: install xvfb; GUI tests will fail to open)", file=sys.stderr)
+    if not a.why:
+        print("(lab: no --why; add a short reason, e.g. --why 'unit tests for the guard': it goes in the run log)", file=sys.stderr)
     script = ('cd "$1" || exit 97; shift; t="$1"; shift; '
               'if [ $# -eq 1 ]; then exec timeout -k 5 "$t" bash -c "$1"; else exec timeout -k 5 "$t" "$@"; fi')
-    r = subprocess.run(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "bash", "-c", script, "_", dest, str(a.timeout), *cmd))
-    if r.returncode == 124:
+    t0, tail = time.time(), []
+    p = subprocess.Popen(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "bash", "-c", script, "_", dest, str(a.timeout), *cmd),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in p.stdout:
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+        tail = (tail + [line.decode(errors="replace").rstrip("\n")])[-20:]
+    rc = p.wait()
+    lab_log_run(name, src, cmd, a.why or "", time.time() - t0, rc, tail)
+    if rc == 124:
         print(f"(lab: stopped after {a.timeout} s; raise it with --timeout)", file=sys.stderr)
-    return r.returncode
+    return rc
 
 
 def cmd_right(_):
@@ -1957,6 +2035,61 @@ def cmd_copy_pane(a):
     f.write_text(text)
     f.chmod(0o600)
     tmux_msg(a.client, f"{why}saved {n} lines: {home_rel(f)}")
+
+
+# ---------- Align: the facts ALIGN.md compares the project's docs against ----------
+def align_facts(path):
+    """Facts about the real repo, as text, for ALIGN.md: visibility (gh), docs layout, tests, ignores, the hyperbeam wiring, and doc lines that
+    look like claims about visibility (so a stale one can be spotted against the real visibility)."""
+    path = Path(path)
+    out = []
+    r = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner,visibility", "-q", ".nameWithOwner + \" \" + .visibility"], cwd=path,
+                       capture_output=True, text=True, timeout=15) if shutil.which("gh") else None
+    vis = r.stdout.strip().split()[-1].lower() if r and r.returncode == 0 and r.stdout.strip() else ""
+    out.append(f"repo on GitHub: {r.stdout.strip()}" if vis else "repo on GitHub: unknown (no gh, no remote, or not logged in)")
+
+    def has(*names):
+        return [n for n in names if (path / n).exists()]
+    out.append("hyperbeam files: " + (", ".join(has("CLAUDE.md", "README.md", "docs/DECISIONS.md", "PRIVATE.md")) or "none of CLAUDE.md, README.md, docs/DECISIONS.md, PRIVATE.md"))
+    docs = sorted(str(f.relative_to(path)) for f in (path / "docs").rglob("*.md")) if (path / "docs").is_dir() else []
+    out.append("docs/: " + (", ".join(docs[:30]) or "none"))
+    like = [str(f.relative_to(path)) for f in path.glob("*.md") if re.search(r"decision|adr|architecture|design|product|spec|notes", f.name, re.I)] \
+        + [d for d in docs if re.search(r"decision|adr|architecture|design|product|model|spec", d, re.I) and not d.endswith("DECISIONS.md")]
+    out.append("other decision/design-like docs (how do they relate to docs/DECISIONS.md?): " + (", ".join(like) or "none"))
+    claude = (path / "CLAUDE.md").read_text(errors="replace") if (path / "CLAUDE.md").is_file() else ""
+    out.append("CLAUDE.md imports the rules (@.hyperbeam/RULES.md): " + ("yes" if "@.hyperbeam/RULES.md" in claude else "no"))
+    out.append("CLAUDE.md has an 'Exceptions to hyperbeam rules' section: " + ("yes" if re.search(r"^#+\s*Exceptions to hyperbeam rules", claude, re.M | re.I) else "no"))
+    tests = []
+    pj = path / "package.json"
+    if pj.is_file():
+        try:
+            sc = json.loads(pj.read_text()).get("scripts", {})
+            tests += [f"package.json script `{k}`" for k in sc if re.search(r"test|e2e|lint|check", k)]
+        except ValueError:
+            pass
+    tests += [n for n in has("tests", "test", "pytest.ini", "vitest.config.ts", "vitest.e2e.config.ts", "playwright.config.ts", "tox.ini", "Makefile") ]
+    out.append("tests: " + (", ".join(tests) or "none found"))
+    dock = [str(f.relative_to(path)) for f in list(path.glob("docker-compose*")) + list(path.glob("compose*.y*ml")) + list(path.glob("tests/**/docker-compose*"))[:5]]
+    out.append("docker compose files (Docker-based tests are an exception, never run in the lab): " + (", ".join(dock) or "none"))
+    gi = (path / ".gitignore").read_text(errors="replace").splitlines() if (path / ".gitignore").is_file() else []
+    envs = [f.name for f in path.glob(".env*") if not f.name.endswith((".example", ".sample"))]
+    out.append(f".gitignore: {'has' if any(l.strip().startswith('.env') for l in gi) else 'no'} .env rule; env files present: {', '.join(envs) or 'none'}"
+               + ("; steno-*.txt rule: " + ("yes" if any("steno" in l for l in gi) else "no")))
+    claims = []
+    for fn in ("CLAUDE.md", "README.md"):
+        f = path / fn
+        if f.is_file():
+            for i, l in enumerate(f.read_text(errors="replace").splitlines(), 1):
+                if re.search(r"\b(not public|private repo|private repository|closed[- ]source|internal only|public repo|open[- ]source|is public|is private)\b", l, re.I):
+                    claims.append(f"{fn}:{i}: {l.strip()[:140]}")
+    out.append("lines that claim public/private" + (f" (real visibility: {vis})" if vis else "") + ": " + ("; ".join(claims[:6]) or "none"))
+    return "\n".join(f"- {x}" for x in out)
+
+
+def cmd_align_facts(a):
+    path = Path(a.path) if a.path else known_path(os.environ.get("HB_PROJECT", ""))
+    print(align_facts(path))
+    return 0
 
 
 # ---------- context bundle: what a new chat (web or Claude Code) needs, in one paste ----------
@@ -3377,6 +3510,9 @@ def main():
     hk = sub.add_parser("_hooks", help="merge hyperbeam's Claude hooks (waiting state, the Bash guard) into ~/.claude/settings.json")
     hk.add_argument("--settings")
     hk.set_defaults(f=lambda a: print("hooks updated: " + (", ".join(install_hooks(a.settings)) or "already installed")))
+    af = sub.add_parser("align-facts", help="the facts ALIGN.md compares a project's docs against (visibility, docs layout, tests, ignores)")
+    af.add_argument("path", nargs="?")
+    af.set_defaults(f=cmd_align_facts)
     cx = sub.add_parser("context", help="copy a context bundle (RULES, CLAUDE.md, DECISIONS, README, manifest, recent history) to paste into a chat; default project $HB_PROJECT")
     cx.add_argument("project", nargs="?")
     cx.add_argument("--print", action="store_true", help="print it instead of copying")
@@ -3389,10 +3525,15 @@ def main():
     lr = lsub.add_parser("run", help="copy a directory into the lab and run a command there")
     lr.add_argument("--dir", help="directory to copy (default: the current one)")
     lr.add_argument("--name", help="name of the run directory (default: the directory's name)")
+    lr.add_argument("--why", help="a short reason for this run (goes in the run log)")
+    lr.add_argument("--fresh", action="store_true", help="wipe this project's synced copy (and what the lab installed in it) first")
     lr.add_argument("--timeout", type=int, default=600, help="seconds before the command is stopped (default 600)")
     lr.add_argument("cmd", nargs=argparse.REMAINDER)
-    lsub.add_parser("reset", help="stop hblab's processes and empty the lab disk")
-    lsub.add_parser("status", help="disk use, run directories, processes")
+    lrs = lsub.add_parser("reset", help="stop hblab's processes and clear its runtime files; keeps the synced projects and caches")
+    lrs.add_argument("--all", action="store_true", help="also wipe the synced projects and the caches (empties the lab disk)")
+    lg = lsub.add_parser("log", help="the lab run log: what ran, why, how long")
+    lg.add_argument("--today", action="store_true")
+    lsub.add_parser("status", help="disk use, synced projects, caches, processes")
     lb.set_defaults(f=cmd_lab)
     ms = sub.add_parser("_migrate-state", help="copy ~/.local/state/hyperbeam into the per-project layout under ~/.local/share/hyperbeam (also runs by itself)")
     ms.add_argument("old", nargs="?")
