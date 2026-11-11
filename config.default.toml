@@ -2,6 +2,6 @@
 # Taken from the `Host github-*` aliases in ~/.ssh/config and the remotes under ~/projects.
 accounts = ["skillkraftz", "trifactoria", "algoviewz"]
 projects_dir = "~/projects"
-# "switch": Open switches this terminal to the project (also over SSH). "window": a new kitty window per project at the laptop.
-# The menu's Settings tab / Mode button changes it.
-open_mode = "switch"
+# "sidebar" (desktop default): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal.
+# "window": a new kitty window per project. Over SSH it is always switch. The menu's Settings screen changes it.
+open_mode = "sidebar"

@@ -1,0 +1,7 @@
+new_os_window
+os_window_class hyperbeam-sidebar
+os_window_size 170c 48c
+layout splits
+launch --title menu --env HB_SIDEBAR=1 sh -c 'while :; do /home/andy/.cache/hyperbeam-work/sidebar/hyperbeam _menu; [ $? -eq 0 ] && break; sleep 1; done'
+focus
+launch --location=vsplit --bias=73 --title main /home/andy/.cache/hyperbeam-work/sidebar/hyperbeam _right
