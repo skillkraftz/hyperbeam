@@ -1,0 +1,62 @@
+# Design decisions (newest first)
+Date, decision, why, what was rejected. Seeded from the merged PRs and git history on 2026-11-11; add new entries at the top, in the PR that makes the decision.
+
+## 2026-11-11 The repo is the memory; Copy context; opusplan (PR #18)
+- **Decision:** each project's CLAUDE.md describes how it works now and `docs/DECISIONS.md` records design decisions; both change in the same PR as the code. `hyperbeam context` (and the Copy context button) puts RULES.md, CLAUDE.md, DECISIONS.md, README, manifest and recent history on the clipboard for a web chat. The default Claude model is `opusplan` (Opus plans, Sonnet implements, one session). A worktree's `hyperbeam` script may only be started through `hyperbeam lab run`.
+- **Why:** decisions lived in chat histories, so every new chat started blind. One session per project avoids re-explaining between a planning chat and an implementation chat. Running a worktree script as the user migrated the live state folder (PR #17).
+- **Rejected:** an MCP server (more to run; skills come later); separate planning and implementation sessions.
+
+## 2026-11-11 Per-project data folders, `.hyperbeam` link, shared RULES.md (PR #17)
+- **Decision:** config stays in `~/.config/hyperbeam/`; all other state lives in `~/.local/share/hyperbeam/`, with one folder per project (`projects/<name>-<6 hex of the path hash>/`). Each project gets a `.hyperbeam` symlink to it (globally git-ignored). RULES.md in this repo is linked into each folder as `.hyperbeam/RULES.md`, and every project's CLAUDE.md imports it.
+- **Why:** hyperbeam is the one place that holds each project's state, and one rules file keeps every project's Claude consistent. The hash keeps same-named projects in different folders apart; the link is remade on Open, so deleting it loses nothing.
+- **Rejected:** keeping state inside each project (pollutes repos, dies with a clone); name-only keys (collide).
+
+## 2026-11-11 All testing in a lab (PR #16)
+- **Decision:** agent testing runs only through `hyperbeam lab run`, as the user `hblab` on a fixed-size disk image (own home, tmux, Xvfb display). The guard blocks every `kill`/`pkill`/`killall` outside it, and a worktree's script outside it.
+- **Why:** rules and per-command guards kept missing the next way to hurt live work (`tmux kill-server`, windows on the main screen, `pkill -f "hyperbeam _menu"` matching the live tmux server's own command line). A different uid cannot signal the user's processes at all.
+- **Rejected:** more regex rules alone; containers/VMs (heavier than needed for a personal prototype); letting agents have root.
+
+## 2026-11-11 Sidebar window: one OS window, two splits (PRs #13, #15)
+- **Decision:** desktop `open_mode = "sidebar"`: one kitty window with the menu on the left (outside tmux) and `tmux attach` on the right; opening a project switches the right client only. The session file must not start with `new_os_window`. Hide/show uses kitty's stack/splits layouts. The hotkey repairs a half-open window; Done closes it.
+- **Why:** the user works mostly by mouse and voice and wanted a persistent project sidebar; Textual's double-click works outside tmux.
+- **Rejected:** a tmux pane menu on desktop (clicks switch the whole client); a leading `new_os_window` (opened an extra empty window); guessing the right client from activity (record its tty instead).
+
+## 2026-11-11 Guard hook for Claude sessions in hyperbeam (PR #12)
+- **Decision:** a PreToolUse hook (`guard.py`, exit 2 + message) blocks tmux kill commands, kills of tmux/kitty, and GUI apps with a display set. Textual and deliberately simple.
+- **Why:** CLAUDE.md text did not stop a `tmux kill-server` from a Claude session that took down every session (agents inside hyperbeam have `$TMUX`).
+- **Rejected:** relying on instructions only; a sandboxed tmux for agents.
+
+## 2026-11-11 Settings in `~/.config/hyperbeam/config.toml`, defaults in the repo (PR #12)
+- **Decision:** user settings are written to the user's file and laid over `config.default.toml`; hyperbeam never writes into the repo.
+- **Why:** the Settings screen used to dirty the checkout, which blocks `hyperbeam update`.
+
+## 2026-11-11 Loud problems, red only when rare (PR #14)
+- **Decision:** the dot is red only for a down service, secrets in unpushed commits, or a stuck merge with conflicts; everything else is a quiet note. Red shows a popup on entry (or sends RECOVER.md with `on_problem = "auto"`).
+- **Why:** problems must not be missed, but constant red teaches the user to ignore it.
+
+## 2026-11-09 Phone-width menu, status dots, Claude hooks (PR #10)
+- **Decision:** one list (dot, name, port), no tabs, works at 45 columns. Blue/cyan dots come from Claude Code command hooks (Stop, Notification, AskUserQuestion/ExitPlanMode, UserPromptSubmit, PostToolUse) writing a state file; the state is ignored unless a `claude` process runs in the pane. Hooks are merged into `~/.claude/settings.json`, never overwritten.
+- **Why:** the tabbed menu did not fit a phone, and the user needs to see which Claude is waiting.
+- **Rejected:** parsing pane output to guess Claude's state.
+
+## 2026-11-09 Beam in / beam out: saved layouts, start check, wrap-up check, Done (PRs #8, #9)
+- **Decision:** layouts are saved per project and restored on Open (asked); a start check and a wrap-up check report git state and obvious secrets (file, line, pattern, never the value); Claude is started to fix things only when the user says yes. Stop and Done run the wrap-up check first.
+- **Why:** sessions end by crash or reboot, and work gets left uncommitted or unpushed.
+
+## 2026-11-09 Menu in a tmux session, session stack, M-keys (PRs #5, #7)
+- **Decision:** the menu runs in the tmux session `hyperbeam`; each project is its own session (tagged `@hb`); `M-h`, `M-[`, `M-]` navigate the stack; mouse on; `M-y` copies history. Everything is in `hyperbeam.conf`, sourced by one added line in the user's tmux.conf, which hyperbeam never replaces.
+- **Why:** one tool for laptop and phone (Termux over SSH/Tailscale), without new terminal windows per project.
+- **Rejected:** a kitty window per project; replacing the user's tmux.conf.
+
+## 2026-11-08 Manifests outside the projects; onboarding by Claude (PRs #1-#3)
+- **Decision:** a project's manifest (`projects/<name>.toml`: ordered services, ready checks, fixed port, env) lives in this repo, not in the project. There is no heuristic drafting: Claude investigates, proposes the manifest and waits for approval (ONBOARDING.md). Manifests are committed straight to main.
+- **Why:** the user does not want hyperbeam files in other repos; heuristics guessed wrong, Claude reads the project.
+
+## 2026-11-08 Stack choices (PRs #1, #2)
+- **Decision:** one uv script with Textual declared inline; Claude Code is the default agent; one tmux session per project; fixed ports per project through tmux session env (no direnv); the app runs on the host, backing services through docker compose.
+- **Why:** a personal prototype: simplest thing that works, nothing to install.
+- **Rejected:** a packaged app; direnv; containerizing every app.
+
+## 2026-11-09 Phone access by Tailscale name, no tunnels (PR #4)
+- **Decision:** dev servers bind all interfaces (set in each manifest, never in the project) and the phone uses `http://<MagicDNS name>:<port>`.
+- **Why:** simplest; no tunnels to run. Vite needs `--host` and an allowed-hosts variable.

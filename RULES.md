@@ -7,6 +7,7 @@
 - Never commit steno-*.txt (personal dictation notes).
 - Testing: never run test servers, kills or GUI apps as the user. Use `hyperbeam lab run`.
   Never touch the user's tmux sessions.
+- Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.
 - Work on a branch per task. Commit, push, open a PR. End the PR description with a short
   manual test checklist. Don't merge unless the user says so.
 - If you change user-facing behaviour, update the README in the same PR.
@@ -14,3 +15,7 @@
   the user should test.
 - Notes about problems the user must handle (e.g. a leaked key and how to rotate it) go in
   .hyperbeam/notes/<date>-<topic>.md.
+- Keep CLAUDE.md describing how the project works now (setup, run, test, layout). Update it
+  in the same PR as any change to those.
+- Record design decisions in docs/DECISIONS.md, newest first: date, decision, why, what was
+  rejected. Create the file if missing. Update it in the same PR as the decision.

@@ -174,6 +174,61 @@ RULES = RULES + [
 ]
 
 
+CWD = ""         # the tool call's working directory (set by main)
+
+
+def is_worktree_dir(d):
+    """A folder of a git worktree: under ~/.cache/hyperbeam-work/, or with a .git *file* (a linked worktree), anywhere up its path."""
+    d = os.path.realpath(d)
+    if "/hyperbeam-work/" in d + "/":
+        return True
+    while d != "/":
+        if os.path.isfile(os.path.join(d, ".git")):
+            return True
+        d = os.path.dirname(d)
+    return False
+
+
+def runs_worktree_script(cmd):
+    """Any token that names a `hyperbeam` script (relative to the working directory, tracking `cd`) inside a worktree."""
+    cwd = CWD or os.getcwd()
+    for line in cmd.split("\n"):
+        try:
+            toks = shlex.split(line)
+        except ValueError:
+            toks = line.split()
+        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
+        if not toks:
+            continue
+        if toks[0] == "cd" and len(toks) > 1:
+            cwd = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(toks[1]))))
+            continue
+        # the script run directly, or by an interpreter / wrapper (`uv run --script ./hyperbeam`, `python3 hyperbeam`, `timeout 5 ./hyperbeam`);
+        # a bare mention (`git add hyperbeam`, `py_compile hyperbeam`) is not a run
+        cand = [toks[0]]
+        if re.fullmatch(r"(?:.*/)?(?:python[\d.]*|bash|sh)", toks[0]):          # the script is the first argument that isn't an option (not after -m / -c)
+            rest = [t for t in toks[1:] if not t.startswith("-")]
+            cand += rest[:1] if not {"-m", "-c"} & set(toks[1:3]) else []
+        elif re.fullmatch(r"(?:.*/)?(?:uv|env|timeout|sudo|exec|nohup|setsid)", toks[0]):
+            cand += [t for t in toks[1:8] if os.path.basename(t) == "hyperbeam"]
+        for t in cand:
+            if os.path.basename(t) != "hyperbeam":
+                continue
+            p = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(t))))
+            if os.path.isfile(p) and is_worktree_dir(os.path.dirname(p)):
+                return True
+    return False
+
+
+RULES = RULES + [
+    ("worktree-script-outside-lab", runs_worktree_script,
+     "BLOCKED by hyperbeam: a worktree's `hyperbeam` script must not run as the user: it uses the user's real state, tmux and config (running one "
+     "once migrated the user's live state folder). Run it in the lab: `hyperbeam lab run --dir <worktree> -- uv run --quiet --script hyperbeam ...` "
+     "(the lab copies the folder and runs it as hblab with its own home, tmux and display). Only `hyperbeam lab run ...` itself is allowed from a "
+     "worktree. Use the installed `hyperbeam` for read-only commands that don't change state, or ask the user."),
+]
+
+
 def check(cmd):
     """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at."""
     cmd = outside_lab(cmd)
@@ -190,6 +245,8 @@ def main():
         return 0
     if call.get("tool_name") != "Bash":
         return 0
+    global CWD
+    CWD = str(call.get("cwd") or "")
     message = check(str((call.get("tool_input") or {}).get("command", "")))
     if message:
         print(message, file=sys.stderr)

@@ -79,18 +79,18 @@ MENU = "hyperbeam"          # name of the tmux session the menu runs in
 KEYS = [("M-Left/Right/Up/Down", "select pane"), ("M-z", "zoom / unzoom the pane"),
         ("M-h", "back to the hyperbeam session (menu), from anywhere"), ("M-]", "next session in the stack"), ("M-[", "previous session in the stack"),
         ("M-y", "copy the Claude conversation / the pane's whole scrollback (clipboard; outbox over SSH)"),
-        ("M-s", "hide / show the sidebar (desktop sidebar window)")]
+        ("M-s", "hide / show the sidebar (desktop sidebar window)"), ("Shift+Tab", "Claude plan mode (cycles Claude Code's permission modes; with opusplan Opus plans, Sonnet implements)")]
 USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select pane"), ("C-a H J K L", "resize pane"),
              ("M-n / M-p", "next / previous window"), ("C-a w", "window tree"), ("C-a [", "copy mode (v select, y copy)"),
              ("M-`", "mouse on/off"), ("C-a r", "reload tmux.conf")]
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask"}
-CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["sonnet", "opus", "haiku", "fable"],
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask"}
+CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["opusplan", "sonnet", "opus", "haiku", "fable"],
            "claude_effort": ["low", "medium", "high", "xhigh", "max"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
-                "claude_model": "model for every Claude hyperbeam starts (claude --model): sonnet, opus, haiku, fable",
+                "claude_model": "model for every Claude hyperbeam starts (claude --model): opusplan (Opus plans in plan mode, Sonnet does the work), sonnet, opus, haiku, fable",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
                 "menu_width": "columns of the menu sidebar (takes effect when the sidebar window is opened again)",
                 "on_problem": '"ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.',
@@ -1959,6 +1959,83 @@ def cmd_copy_pane(a):
     tmux_msg(a.client, f"{why}saved {n} lines: {home_rel(f)}")
 
 
+# ---------- context bundle: what a new chat (web or Claude Code) needs, in one paste ----------
+def recent_history(path):
+    """Branch, upstream, uncommitted summary and the last 20 commits. Only cheap git calls, so it stays fast on large repos: `log -n 20` reads
+    20 commits, `status -uno` skips the untracked-file scan (the slow part on a big tree), `rev-list --count` on the upstream range."""
+    def g(*a):
+        r = subprocess.run(["git", "-C", str(path), *a], capture_output=True, text=True, timeout=10, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+        return r.stdout.rstrip("\n") if r.returncode == 0 else ""      # not strip(): status lines start with a space
+    if not g("rev-parse", "--git-dir"):
+        return "(not a git repository)"
+    br = g("symbolic-ref", "--short", "-q", "HEAD") or f"(detached at {g('rev-parse', '--short', 'HEAD')})"
+    lines = [f"branch: {br}"]
+    ahead = g("rev-list", "--left-right", "--count", "@{u}...HEAD")
+    if ahead:
+        behind, ah = ahead.split()
+        lines.append(f"upstream: {g('rev-parse', '--abbrev-ref', '@{u}')} ({ah} ahead, {behind} behind)")
+    st = [l for l in g("status", "--porcelain=v1", "-uno").splitlines() if l.strip()]
+    lines.append(f"uncommitted (tracked files): {len(st)}" + (" - " + ", ".join(l[3:] for l in st[:8]) + (", ..." if len(st) > 8 else "") if st else ""))
+    lines += ["", "last 20 commits:"] + [f"  {l}" for l in g("log", "-n", "20", "--no-color", "--date=short", "--pretty=format:%h %ad %s").splitlines()]
+    return "\n".join(lines)
+
+
+def context_bundle(name, path=None):
+    """One text to paste into a chat: header, RULES.md, the project's CLAUDE.md, docs/DECISIONS.md, README, hyperbeam manifest, recent history."""
+    path = Path(path) if path else known_path(name)
+
+    def first(*names):
+        for n in names:
+            f = path / n
+            if f.is_file():
+                return f.read_text(errors="replace").rstrip()
+        return None
+    readme = next((f for f in sorted(path.glob("README*")) if f.is_file()), None) if path.is_dir() else None
+    man = MANIFESTS / f"{name}.toml"
+    parts = [("RULES.md", (HERE / "RULES.md").read_text().rstrip() if (HERE / "RULES.md").is_file() else None),
+             ("CLAUDE.md", first("CLAUDE.md")),
+             ("docs/DECISIONS.md", first("docs/DECISIONS.md")),
+             (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
+             (f"hyperbeam manifest (projects/{name}.toml)", man.read_text().rstrip() if man.is_file() else None),
+             ("Recent history", recent_history(path) if path.is_dir() else None)]
+    out = [f"# Context for {name}", f"path: {home_rel(path)}", f"date: {time.strftime('%Y-%m-%d')}", "",
+           "Paste this at the start of a chat. It is the project's own docs, current as of the date above."]
+    for title, body in parts:
+        out += ["", f"======== {title} ========", body if body is not None else "(none yet)"]
+    return "\n".join(out) + "\n"
+
+
+def copy_context(name, remote):
+    """The bundle to the clipboard (local) or the outbox (remote). -> 'copied N lines' / 'saved N lines: path'."""
+    text = context_bundle(name)
+    n = len(text.splitlines())
+    if not remote:
+        try:
+            wl_copy(text)
+            return f"copied {n} lines"
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            why = f"clipboard failed ({e}); "
+    else:
+        why = ""
+    d = STATE_DIR / "outbox"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{name}-context-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    f.write_text(text)
+    f.chmod(0o600)
+    return f"{why}saved {n} lines: {home_rel(f)}"
+
+
+def cmd_context(a):
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam context: no project (run it in a project session, or give a name)")
+    if a.print:
+        print(context_bundle(name), end="")
+        return 0
+    print(f"{name}: {copy_context(name, is_remote())}")
+    return 0
+
+
 def cmd_clip(a):
     """Mouse drag-select: tmux pipes the selection here. Local client: also onto the Wayland clipboard."""
     text = sys.stdin.read()
@@ -2601,7 +2678,7 @@ class SettingsScreen(ModalScreen):
         lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
         lines += [f"  {k}\n      {d}" for k, d in KEYS]
         lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, i info, r refresh, q quit"]
+        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, c copy context, i info, r refresh, q quit"]
         return "\n".join(lines)
 
     def on_mount(self):
@@ -2663,7 +2740,7 @@ class Menu(App):
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
     BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"), Binding("h", "hide", "Hide sidebar"),
-                Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
+                Binding("b", "onboard", "Onboard"), Binding("c", "context", "Copy context"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
@@ -2678,7 +2755,7 @@ class Menu(App):
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("onboard", "Onboard (b)"), ("context", "Copy context (c)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
                 if bid == "hide" and not os.environ.get("HB_SIDEBAR"):
                     continue
                 button = Button(label, id=f"b-{bid}")
@@ -2866,7 +2943,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "info", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "info", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -3024,6 +3101,21 @@ class Menu(App):
             return self.say(f"{p['name']} is busy.")
         self.busy.add(p["name"])
         self.run_worker(lambda: self._open(p, onboard=True), thread=True)
+
+    def action_context(self):
+        """Copy the context bundle of the selected project (clipboard at the laptop, outbox over SSH)."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        name = p["name"]
+
+        def work():
+            remote = False if os.environ.get("HB_SIDEBAR") else client_is_remote(menu_client("client_pid") or "0")
+            try:
+                self.say_from_thread(f"{name}: {copy_context(name, remote)}")
+            except Exception as e:
+                self.say_from_thread(f"{name}: context failed: {e}")
+        self.run_worker(work, thread=True)
 
     def action_info(self):
         """The same text as `kk`, in a plain tmux window (so mouse-drag copy works), closed with Enter."""
@@ -3285,6 +3377,10 @@ def main():
     hk = sub.add_parser("_hooks", help="merge hyperbeam's Claude hooks (waiting state, the Bash guard) into ~/.claude/settings.json")
     hk.add_argument("--settings")
     hk.set_defaults(f=lambda a: print("hooks updated: " + (", ".join(install_hooks(a.settings)) or "already installed")))
+    cx = sub.add_parser("context", help="copy a context bundle (RULES, CLAUDE.md, DECISIONS, README, manifest, recent history) to paste into a chat; default project $HB_PROJECT")
+    cx.add_argument("project", nargs="?")
+    cx.add_argument("--print", action="store_true", help="print it instead of copying")
+    cx.set_defaults(f=cmd_context)
     mg = sub.add_parser("_migrate-config", help="copy an old repo config.toml's values to ~/.config/hyperbeam/config.toml (once)")
     mg.add_argument("legacy", nargs="?")
     mg.set_defaults(f=lambda a: print(f"wrote {CONFIG_FILE}" if migrate_config(a.legacy) else f"nothing to do ({CONFIG_FILE} exists or no old file)"))
