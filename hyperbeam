@@ -76,11 +76,12 @@ MENU = "hyperbeam"          # name of the tmux session the menu runs in
 # The keys of hyperbeam.conf (keep in sync with it). Shown in the menu's button bar and Settings tab and in the status bar.
 KEYS = [("M-Left/Right/Up/Down", "select pane"), ("M-z", "zoom / unzoom the pane"),
         ("M-h", "back to the hyperbeam session (menu), from anywhere"), ("M-]", "next session in the stack"), ("M-[", "previous session in the stack"),
-        ("M-y", "copy pane scrollback (clipboard; outbox over SSH)")]
+        ("M-y", "copy the Claude conversation / the pane's whole scrollback (clipboard; outbox over SSH)"),
+        ("M-s", "hide / show the sidebar (desktop sidebar window)")]
 USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select pane"), ("C-a H J K L", "resize pane"),
              ("M-n / M-p", "next / previous window"), ("C-a w", "window tree"), ("C-a [", "copy mode (v select, y copy)"),
              ("M-`", "mouse on/off"), ("C-a r", "reload tmux.conf")]
-HINT = "M-arrows pane  M-z zoom  M-h menu  M-[ M-] stack  M-y copy"
+HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
 DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask"}
@@ -786,6 +787,8 @@ def save_all():
     n = 0
     for line in tmux("list-sessions", "-F", fmt, check=False).stdout.splitlines():
         sess, tag = (line.split("\t") + [""])[:2]
+        if tag == "1":
+            refresh_claude_pane(sess)       # HB_CLAUDE_PANE stays right (a no-op while the pane it names exists)
         if tag == "1" and sess != MENU:
             n += save_layout(session_project(sess))
     return n
@@ -1107,6 +1110,26 @@ def open_project(name, path, man, ask, say, onboard=False):
                   restore=restore, findings=findings, recover=recover, notes=notes)
 
 
+def publish_claude_pane(sess, pane, plan=()):
+    """HB_CLAUDE_PANE = the tmux pane id of the session's Claude pane: in the session environment (every pane created afterwards has it, and
+    `tmux show-environment -t SESSION HB_CLAUDE_PANE` answers for older ones), and exported in the panes of `plan` that already exist
+    ([(pane id, role, cwd)]: their processes were started before the id was known). The integration point for tools in a pane (stenographr)."""
+    if not pane:
+        return
+    tmux("set-environment", "-t", sess, "HB_CLAUDE_PANE", pane, check=False)
+    for pid, role, _ in plan:
+        if role in ("claude", "shell", "other"):
+            send_line(pid, f"export HB_CLAUDE_PANE={pane}; clear")
+
+
+def refresh_claude_pane(sess):
+    """Keep HB_CLAUDE_PANE right if the pane it names is gone (the user closed or rebuilt it)."""
+    cur = tmux("show-environment", "-t", sess, "HB_CLAUDE_PANE", check=False).stdout.strip().partition("=")[2]
+    if cur and tmux("display-message", "-p", "-t", cur, "#{pane_id}", check=False).stdout.strip() == cur:
+        return
+    publish_claude_pane(sess, find_claude_pane(sess))
+
+
 def new_pane(args, cmd=None):
     """Run a tmux command that creates a pane (new-session, split-window) and return the new pane's id."""
     return tmux(*args, "-P", "-F", "#{pane_id}", *([cmd] if cmd else [])).stdout.strip()
@@ -1124,8 +1147,9 @@ def ensure_menu():
     clean_server_env()
     claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(HERE),
                        "-e", "HB_PROJECT=hyperbeam", "-e", "HOST=0.0.0.0"])
+    publish_claude_pane(MENU, claude)
     new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(HERE)])
-    send_line(claude, claude_base())
+    send_line(claude, f"export HB_CLAUDE_PANE={claude}; " + claude_base())
     tmux("select-pane", "-t", claude)
     new_pane(["new-window", "-d", "-t", f"={MENU}:", "-n", "menu", "-c", str(HERE)], menu_cmd())
     tag_session(MENU)
@@ -1134,6 +1158,7 @@ def ensure_menu():
 def default_layout(sess, path, envargs):
     """New session with window `work`: Claude on the left (60%), a shell on the right (40%). Returns [(pane id, role, cwd)]."""
     claude = new_pane(["new-session", "-d", "-s", sess, "-n", "work", "-x", "200", "-y", "50", "-c", str(path), *envargs])
+    publish_claude_pane(sess, claude)
     shell = new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(path)])
     tmux("select-pane", "-t", claude)
     return [(claude, "claude", str(path)), (shell, "shell", str(path))]
@@ -1191,6 +1216,7 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     tag_session(sess)
     claude_panes = [p for p in plan if p[1] == "claude"] or plan[:1]
     first_claude = claude_panes[0][0]
+    publish_claude_pane(sess, first_claude, plan if restore else claude_panes[:1])      # a default layout's shell pane inherited it; its Claude pane was made before the id was known
     shell = next((p[0] for p in plan if p[1] == "shell"), None) or next((p[0] for p in plan if p[1] == "other"), None)
     services = man.get("service", []) if man else []
     if services:
@@ -1382,7 +1408,7 @@ def sidebar_session_file(cols=170, rows=48):
     bias = round(100 * (cols - w - 1) / (cols - 1))
     loop = f"while :; do {SELF} _menu; [ $? -eq 0 ] && break; sleep 1; done"
     return "\n".join([
-        "new_os_window", "os_window_class hyperbeam-sidebar", f"os_window_size {cols}c {rows}c", "layout splits",
+        "os_window_class hyperbeam-sidebar", f"os_window_size {cols}c {rows}c", "layout splits",
         shlex.join(["launch", "--title", "menu", "--env", "HB_SIDEBAR=1", "sh", "-c", loop]), "focus",
         shlex.join(["launch", "--location=vsplit", f"--bias={bias}", "--title", "main", str(HERE / "hyperbeam"), "_right"]), ""])
 
@@ -1413,11 +1439,48 @@ def launch_sidebar():
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(sidebar_session_file())
     proc = subprocess.Popen(["kitty", "--class", "hyperbeam-sidebar", "--title", "hyperbeam", *shlex.split(os.environ.get("HB_KITTY_ARGS", "")),
-                             "-o", "allow_remote_control=socket-only", "--listen-on", f"unix:{display_env()['XDG_RUNTIME_DIR']}/hyperbeam-sidebar",
+                             "-o", "allow_remote_control=socket-only", "-o", "enabled_layouts=splits,stack", "--listen-on", f"unix:{display_env()['XDG_RUNTIME_DIR']}/hyperbeam-sidebar",
                              "--session", str(f)],
                             env=display_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     sidebar_update(kitty_pid=proc.pid)
     return "opened the sidebar window"
+
+
+SIDEBAR_SOCK = lambda: f"unix:{display_env()['XDG_RUNTIME_DIR']}/hyperbeam-sidebar"
+
+
+def kitten_sidebar(*args, check=True):
+    """`kitten @ --to <the sidebar kitty's socket> ...` (that kitty only: see launch_sidebar)."""
+    return subprocess.run(["kitten", "@", "--to", SIDEBAR_SOCK(), *args], capture_output=True, text=True, timeout=8, check=check)
+
+
+def sidebar_toggle():
+    """M-s / the Hide button: switch the sidebar kitty's layout between `splits` (menu left, main right) and `stack` (only the focused window,
+    the main side, full width). Nothing is closed: the menu keeps running behind. Returns what it did."""
+    try:
+        tabs = [t for ow in json.loads(kitten_sidebar("ls").stdout) for t in ow.get("tabs", [])]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "the sidebar window can't be controlled (open it again once: it was started before this version)"
+    if not tabs:
+        return "no sidebar window"
+    hidden = tabs[0].get("layout") == "stack"
+    try:
+        if hidden:
+            kitten_sidebar("goto-layout", "splits")
+            return "sidebar shown"
+        kitten_sidebar("focus-window", "--match", "title:^main$")
+        kitten_sidebar("goto-layout", "stack")
+        return "sidebar hidden (M-s shows it)"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"sidebar toggle failed: {(getattr(e, 'stderr', '') or e)!s:.80}"
+
+
+def cmd_sidebar(a):
+    msg = sidebar_toggle()
+    if a.client:
+        tmux_msg(a.client, msg)
+    else:
+        print(msg)
 
 
 def cmd_right(_):
@@ -1518,14 +1581,84 @@ def cmd_stack(a):
     tmux_msg(a.client, f"stack {names.index(names[i]) + 1}/{len(names)}: {names[i]}")
 
 
+CLAUDE_DIR = Path(os.environ.get("HB_CLAUDE_DIR") or Path.home() / ".claude")      # HB_CLAUDE_DIR: tests
+
+
+def claude_session_file(pane):
+    """The conversation file (~/.claude/projects/<cwd>/<session id>.jsonl) of the Claude running in tmux pane `pane`, or None if the pane is not
+    running claude. Claude Code writes ~/.claude/sessions/<pid>.json (pid, sessionId, cwd, and `tmux: <session>:<window>.<pane id>`) for every
+    interactive session: that names the exact session. Fallback: the newest .jsonl of the pane's cwd."""
+    cmd, cwd = (tmux("display-message", "-p", "-t", pane, "#{pane_current_command}\t#{pane_current_path}", check=False).stdout.strip("\n").split("\t") + ["", ""])[:2]
+    if cmd != "claude":
+        return None
+    best = None
+    for f in (CLAUDE_DIR / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if str(d.get("tmux", "")).endswith(f".{pane}") and Path(f"/proc/{d.get('pid')}").exists() and (best is None or int(d.get("startedAt", 0)) > int(best.get("startedAt", 0))):
+            best = d
+    if best and best.get("sessionId"):
+        proj = CLAUDE_DIR / "projects" / re.sub(r"[^A-Za-z0-9]", "-", best.get("cwd") or cwd)
+        if (proj / f"{best['sessionId']}.jsonl").is_file():
+            return proj / f"{best['sessionId']}.jsonl"
+    files = sorted((CLAUDE_DIR / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)).glob("*.jsonl"), key=lambda x: x.stat().st_mtime)
+    return files[-1] if files else None
+
+
+def tool_summary(b):
+    """One line for a tool call: the tool and its main argument."""
+    i = b.get("input") or {}
+    arg = next((str(i[k]) for k in ("command", "file_path", "path", "pattern", "url", "query", "description", "prompt", "skill") if i.get(k)), "")
+    return f"  [{b.get('name', 'tool')}] " + clip(" ".join(arg.split()), 110)
+
+
+def transcript_text(f):
+    """A Claude Code conversation file as plain text: your messages and Claude's replies; tool calls as one-line summaries; no thinking, no tool
+    output, no system reminders. Returns (text, number of lines)."""
+    out = []
+    for line in Path(f).read_text(errors="replace").splitlines():
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
+            continue
+        c = (o.get("message") or {}).get("content")
+        blocks = [{"type": "text", "text": c}] if isinstance(c, str) else (c or [])
+        who = "You" if o["type"] == "user" else "Claude"
+        parts = []
+        for b in blocks:
+            if b.get("type") == "text":
+                t = re.sub(r"<system-reminder>.*?</system-reminder>", "", b.get("text", ""), flags=re.S).strip()
+                if t and not t.startswith(("<command-", "<local-command", "Caveat:")):
+                    parts.append(t)
+            elif b.get("type") == "tool_use":
+                parts.append(tool_summary(b))
+        if parts:
+            out += [f"### {who}", *parts, ""]
+    text = "\n".join(out).rstrip() + "\n" if out else ""
+    return text, len(text.splitlines())
+
+
 def cmd_copy_pane(a):
-    """M-y: the pane's whole scrollback, trailing blank lines trimmed. Local client: clipboard. Remote: a file in the outbox."""
-    out = tmux("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", a.pane, check=False).stdout
-    lines = [l.rstrip() for l in out.splitlines()]
-    while lines and not lines[-1]:
-        lines.pop()
-    text = "\n".join(lines) + "\n"
-    n = len(lines)
+    """M-y: a Claude pane: the whole conversation from Claude's session file (Claude redraws its screen, so tmux's scrollback doesn't hold it);
+    any other pane: the whole scrollback, trailing blank lines trimmed. Local client: clipboard. Remote: a file in the outbox."""
+    text = ""
+    f = claude_session_file(a.pane)
+    if f:
+        try:
+            text, n = transcript_text(f)
+        except OSError:
+            text = ""
+    if not text:
+        out = tmux("capture-pane", "-p", "-J", "-S", "-", "-E", "-", "-t", a.pane, check=False).stdout
+        lines = [l.rstrip() for l in out.splitlines()]
+        while lines and not lines[-1]:
+            lines.pop()
+        text = "\n".join(lines) + "\n"
+        n = len(lines)
     if not client_is_remote(a.client_pid):
         try:
             wl_copy(text)
@@ -2218,7 +2351,8 @@ class SettingsScreen(ModalScreen):
         event.stop()
         bid = event.button.id
         if bid == "close":
-            return self.dismiss()
+            self.dismiss()      # not `return self.dismiss()`: Textual awaits what a handler returns, and a screen can't await its own dismiss
+            return
         kind, key = bid.split("-", 1)
         self.sel = [k for k, _ in self.LABELS].index(key)
         self.change(key, -1 if kind == "m" else 1)
@@ -2244,7 +2378,7 @@ class Menu(App):
     .fix #b-fix { display: block; }
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
-    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"),
+    BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"), Binding("h", "hide", "Hide sidebar"),
                 Binding("b", "onboard", "Onboard"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
@@ -2260,7 +2394,9 @@ class Menu(App):
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("fix", "Fix (f)")]:
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
+                if bid == "hide" and not os.environ.get("HB_SIDEBAR"):
+                    continue
                 button = Button(label, id=f"b-{bid}")
                 button.can_focus = False
                 yield button
@@ -2446,7 +2582,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "update", "onboard", "info", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "info", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -2615,6 +2751,12 @@ class Menu(App):
         if side:                    # the sidebar's right client looks at `home`: show the info window there
             tmux("switch-client", "-c", side, "-t", f"={MENU}:={win}", check=False)
 
+    def action_hide(self):
+        """Sidebar: hide it (the main side goes full width; M-s on that side brings it back)."""
+        if not os.environ.get("HB_SIDEBAR"):
+            return self.say("Hide: only in the sidebar window.")
+        self.run_worker(lambda: self.say_from_thread(sidebar_toggle()), thread=True)
+
     def action_update(self):
         """A popup on the client that shows the main area runs `hyperbeam update` (it restarts this menu at the end, so it must not run here)."""
         c = sidebar_client() if os.environ.get("HB_SIDEBAR") else menu_client()
@@ -2759,6 +2901,7 @@ def cmd_update_finish(a):
     if session_exists(MENU):
         for sess in stack():
             tag_session(sess)       # refresh the key hints in the status bars
+            refresh_claude_pane(sess)
     restart_menus()
     own = os.environ.get("TMUX_PANE", "")
     panes = claude_panes()
@@ -2858,6 +3001,9 @@ def main():
     mg = sub.add_parser("_migrate-config", help="copy an old repo config.toml's values to ~/.config/hyperbeam/config.toml (once)")
     mg.add_argument("legacy", nargs="?")
     mg.set_defaults(f=lambda a: print(f"wrote {CONFIG_FILE}" if migrate_config(a.legacy) else f"nothing to do ({CONFIG_FILE} exists or no old file)"))
+    sb = sub.add_parser("sidebar", help="hide / show the sidebar (the same as M-s)")
+    sb.add_argument("client", nargs="?")
+    sb.set_defaults(f=cmd_sidebar)
     sv = sub.add_parser("_save")
     sv.add_argument("session", nargs="?")
     sv.set_defaults(f=cmd_save)

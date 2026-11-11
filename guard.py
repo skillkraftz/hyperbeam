@@ -47,10 +47,16 @@ def tmux_kill(cmd):
 
 
 def kill_tmux_or_kitty(cmd):
+    if re.search(r"\bpgrep\b\s+(?:-\S+\s+)*-\w*f[^\n;&]*\|\s*xargs\b[^\n;&]*\bkill", cmd):
+        return True
     for seg in re.split(r"[;&|\n]+", cmd):
         if re.search(r"tmux\s+-[LS]\s", seg):                       # a pattern aimed at a test server's own command line
             continue
         if re.search(r"\b(?:pkill|killall)\b.*\b(?:tmux|kitty)\b", seg):
+            return True
+        # a full-command-line match: a tmux server's command line is the command that created it (`hyperbeam _menu; ...`), so any pattern can hit it
+        if re.search(r"\bpkill\b\s+(?:-\S+\s+)*-\w*f", seg) or re.search(r"\bkill\b.*\$\(\s*pgrep\s+(?:-\S+\s+)*-\w*f", seg) \
+                or re.search(r"\bpgrep\b\s+(?:-\S+\s+)*-\w*f.*\|\s*xargs\s+(?:\S+\s+)*kill", seg):
             return True
         if re.search(r"\bkill\b.*(?:pgrep|pidof)\b.*\b(?:tmux|kitty)\b", seg):
             return True
@@ -83,8 +89,9 @@ RULES = [
      "hyperbeam and every project session. Instead: for tests use your own server, `tmux -L hb-test ...` (or `-S /tmp/<short>/sock`); "
      "TMUX_TMPDIR does not help while $TMUX is set. Ask the user before touching real sessions."),
     ("kill-tmux-or-kitty", kill_tmux_or_kitty,
-     "BLOCKED by hyperbeam: killing tmux or kitty processes would take down the user's real sessions and terminals. Instead: stop only a test "
-     "server you started yourself (`tmux -L hb-test kill-server`), or ask the user."),
+     "BLOCKED by hyperbeam: killing tmux or kitty processes would take down the user's real sessions and terminals (also `pkill -f PATTERN`: a "
+     "tmux server's command line is the command that created it, so any pattern can match the user's live server). Instead: stop only a test "
+     "server you started yourself (`tmux -L hb-test kill-server`), kill your own test processes by pid, or ask the user."),
     ("gui-on-user-screens", gui_with_display,
      "BLOCKED by hyperbeam: starting a kitty or other GUI app here would open a window on the user's screens (WAYLAND_DISPLAY or DISPLAY is set). "
      "Instead: run headless (`env -u WAYLAND_DISPLAY -u DISPLAY ...`) or use the lab (coming soon)."),
