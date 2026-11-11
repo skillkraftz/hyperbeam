@@ -613,9 +613,135 @@ def clear_status(name):
         pfile(name, k).unlink(missing_ok=True)
 
 
+# ---------- drift: has the project's run setup changed since it was onboarded? (no tokens: a fingerprint of the run-defining parts) ----------
+def _names(deps):
+    """Package names from a list/dict of dependencies (`requests>=2`, `pkg[extra]; python_version<'3'`, or a name -> version table): versions are noise."""
+    items = deps.keys() if isinstance(deps, dict) else deps or []
+    return sorted({re.split(r"[\s<>=!~;\[(@]", str(i), 1)[0].strip().lower() for i in items if str(i).strip()})
+
+
+def _compose_parts(text):
+    """service names, images and published ports of a compose file, by indentation (no YAML library: this only needs those three things)."""
+    out, svc, in_services, in_ports, base = {}, None, False, False, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        ind = len(line) - len(line.lstrip())
+        t = line.strip()
+        if ind == 0:
+            in_services, svc, in_ports = t == "services:", None, False
+            continue
+        if not in_services:
+            continue
+        if base is None:
+            base = ind
+        if ind == base and t.endswith(":"):
+            svc, in_ports = t[:-1].strip("\"'"), False
+            out[svc] = {"image": "", "ports": []}
+        elif svc and ind > base:
+            if t.startswith("image:"):
+                out[svc]["image"] = t[6:].strip().strip("\"'")
+            elif t == "ports:":
+                in_ports = True
+            elif in_ports and t.startswith("- "):
+                out[svc]["ports"].append(t[2:].strip().strip("\"'"))
+            elif not t.startswith("-"):
+                in_ports = False
+    return {k: {"image": v["image"], "ports": sorted(v["ports"])} for k, v in sorted(out.items())}
+
+
+def fingerprint(path):
+    """{file: parts} for the run-defining files of a project: what a setup change looks like, without the noise (versions, lockfiles, names)."""
+    path, out = Path(path), {}
+
+    def add(rel, parts):
+        if parts:
+            out[rel] = parts
+    for f in sorted(path.glob("package.json")):
+        try:
+            d = json.loads(f.read_text())
+            add(f.name, {"scripts": d.get("scripts", {}), "dependencies": _names(d.get("dependencies")), "devDependencies": _names(d.get("devDependencies")),
+                         "workspaces": d.get("workspaces", [])})
+        except ValueError:
+            pass
+    for f in sorted([*path.glob("docker-compose*.y*ml"), *path.glob("compose*.y*ml")]):
+        add(f.name, {"services": _compose_parts(f.read_text(errors="replace"))})
+    pp = path / "pyproject.toml"
+    if pp.is_file():
+        try:
+            d = tomllib.loads(pp.read_text())
+            po = d.get("tool", {}).get("poetry", {})
+            add(pp.name, {"scripts": {**d.get("project", {}).get("scripts", {}), **po.get("scripts", {})},
+                          "dependencies": _names(d.get("project", {}).get("dependencies")) + [f"poetry:{n}" for n in _names(po.get("dependencies"))],
+                          "optional": {k: _names(v) for k, v in {**d.get("project", {}).get("optional-dependencies", {}), **d.get("dependency-groups", {})}.items() if isinstance(v, list)}})
+        except tomllib.TOMLDecodeError:
+            pass
+    for f in sorted(path.glob("requirements*.txt")):
+        add(f.name, {"dependencies": _names([l for l in f.read_text(errors="replace").splitlines() if l.strip() and not l.lstrip().startswith(("#", "-"))])})
+    if (path / "Procfile").is_file():
+        add("Procfile", {"processes": sorted(l.strip() for l in (path / "Procfile").read_text(errors="replace").splitlines() if l.strip() and not l.startswith("#"))})
+    if (path / "Makefile").is_file():
+        add("Makefile", {"targets": sorted({m.group(1) for m in re.finditer(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)\s*:(?!=)", (path / "Makefile").read_text(errors="replace"), re.M)})})
+    for n in (".env.example", ".env.sample", ".env.template"):
+        if (path / n).is_file():
+            add(n, {"variables": sorted({m.group(1) for m in re.finditer(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", (path / n).read_text(errors="replace"), re.M)})})
+    if (path / "Cargo.toml").is_file():
+        try:
+            d = tomllib.loads((path / "Cargo.toml").read_text())
+            add("Cargo.toml", {"dependencies": _names(d.get("dependencies")), "dev": _names(d.get("dev-dependencies")), "bins": sorted(b.get("name", "") for b in d.get("bin", []))})
+        except tomllib.TOMLDecodeError:
+            pass
+    return out
+
+
+def fingerprint_file(name, path):
+    return project_dir(name, path) / "fingerprint.json"
+
+
+def take_fingerprint(name, path):
+    """Record the run setup as onboarded now (Onboard/Align wrote or confirmed the manifest, or the user pressed Mark as onboarded)."""
+    man = MANIFESTS / f"{name}.toml"
+    fingerprint_file(name, path).write_text(json.dumps({"date": time.strftime("%Y-%m-%d %H:%M"), "manifest_mtime": man.stat().st_mtime if man.is_file() else 0,
+                                                        "parts": fingerprint(path)}, indent=1))
+
+
+def drift_notes(name, path):
+    """A quiet note when the run-defining files changed since the project was onboarded. Projects with a manifest but no fingerprint get a
+    baseline now, without a note; a manifest written since the fingerprint counts as onboarding done (new fingerprint, no note). Never red."""
+    man = MANIFESTS / f"{name}.toml"
+    if not man.is_file() or not Path(path).is_dir():
+        return []
+    f = fingerprint_file(name, path)
+    try:
+        old = json.loads(f.read_text())
+    except (OSError, ValueError):
+        take_fingerprint(name, path)
+        return []
+    if man.stat().st_mtime > old.get("manifest_mtime", 0) + 0.5:
+        take_fingerprint(name, path)
+        return []
+    now = fingerprint(path)
+    changed = []
+    for fn in sorted(set(now) | set(old.get("parts", {}))):
+        a, b = old.get("parts", {}).get(fn), now.get(fn)
+        if a != b:
+            what = sorted(k for k in set(a or {}) | set(b or {}) if (a or {}).get(k) != (b or {}).get(k)) if a and b else ["added" if b else "removed"]
+            changed.append(f"{fn} ({', '.join(what)})")
+    return [f"setup changed since onboarding: {'; '.join(changed)} (Onboard to update)"] if changed else []
+
+
+def onboarded_on(name, path):
+    try:
+        return json.loads(fingerprint_file(name, path).read_text()).get("date", "")
+    except (OSError, ValueError):
+        return ""
+
+
 def recheck(name, path):
     """Refresh: run the git checks again and store the result, so a red dot clears when the problem is gone."""
-    write_status(name, *git_red_notes(path, fetch=False, behind=False))
+    red, notes = git_red_notes(path, fetch=False, behind=False)
+    write_status(name, red, [*drift_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
 
 
 def claude_state(name):
@@ -831,6 +957,15 @@ def install_hooks(settings=None):
         for gi, g in enumerate(groups):
             g["hooks"] = [h for i, h in enumerate(g.get("hooks", [])) if (event, gi, i) in claimed or not any(m in h.get("command", "") for m in HOOK_MARKS)]
         hooks[event] = [g for g in groups if g.get("hooks")]
+    # Claude's default model: opusplan (Opus plans, Sonnet builds), set once; the marker keeps a later manual choice (/model, settings) from being reset by every update
+    marker = DATA_DIR / "claude-model-set"
+    if not marker.exists():
+        data["model"] = "opusplan"
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(time.strftime("%Y-%m-%d") + "\n")
+        except OSError:
+            pass
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(data, indent=2) + "\n")
     return [] if json.dumps(data, sort_keys=True) == before else sorted({e for e, _, _ in want})
@@ -1037,7 +1172,7 @@ def start_check(name, path, fetch=True):
     """(red, notes) on Open. Only red problems make Open offer Claude; a crash (saved layout not clean) is a note, like the git state."""
     red, notes = git_red_notes(path, fetch)
     crash = crash_note(name)
-    return red, ([crash] if crash else []) + notes
+    return red, drift_notes(name, path) + ([crash] if crash else []) + notes
 
 
 # ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
@@ -2217,7 +2352,7 @@ def align_facts(path):
         + [d for d in docs if re.search(r"decision|adr|architecture|design|product|model|spec", d, re.I) and not d.endswith("DECISIONS.md")]
     out.append("other decision/design-like docs (how do they relate to docs/DECISIONS.md?): " + (", ".join(like) or "none"))
     claude = (path / "CLAUDE.md").read_text(errors="replace") if (path / "CLAUDE.md").is_file() else ""
-    out.append("CLAUDE.md imports the rules (@.hyperbeam/RULES.md): " + ("yes" if "@.hyperbeam/RULES.md" in claude else "no"))
+    out.append("CLAUDE.md imports the rules (@.hyperbeam/RULES.md): " + ("yes" if re.search(r"^@(?:\.hyperbeam/)?RULES\.md\s*$", claude, re.M) else "no"))
     out.append("CLAUDE.md has an 'Exceptions to hyperbeam rules' section: " + ("yes" if re.search(r"^#+\s*Exceptions to hyperbeam rules", claude, re.M | re.I) else "no"))
     tests = []
     pj = path / "package.json"
@@ -2288,6 +2423,7 @@ def context_bundle(name, path=None):
     parts = [("RULES.md", (HERE / "RULES.md").read_text().rstrip() if (HERE / "RULES.md").is_file() else None),
              ("CLAUDE.md", first("CLAUDE.md")),
              ("docs/DECISIONS.md", first("docs/DECISIONS.md")),
+             ("IDEAS.md", first("IDEAS.md")),
              (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
              (f"hyperbeam manifest (projects/{name}.toml)", man.read_text().rstrip() if man.is_file() else None),
              ("Recent history", recent_history(path) if path.is_dir() else None)]
@@ -3017,6 +3153,67 @@ def cmd_warn(args):
 
 
 # ---------- the menu ----------
+def project_summary(name, path, st=None, prs=None):
+    """The text of the Project screen: where it is, how it runs, what needs attention, when it was onboarded. (Computed in a worker thread.)"""
+    path = Path(path)
+    man = load_manifests().get(name)
+    sess = sanitize(name)
+    running = session_exists(sess)
+    L = [f"{name}", f"  path     {home_rel(path)}", f"  branch   {branch_of(path)}",
+         f"  port     {man.get('port') if man and man.get('port') else '-' if man else 'unset (no manifest)'}",
+         f"  session  {'running' if running else 'not running'}"]
+    if man and man.get("service"):
+        ports = {p: (proc, lo) for p, proc, lo in session_listeners(sess)} if running else {}
+        L += ["", "services"] + [f"  {n:<12} {s_:<8} {d}" for n, s_, d in service_states(sess, man, ports)]
+    elif man:
+        L += ["", "services: none"]
+    prs = prs if prs is not None else open_prs(name, path)
+    L += ["", "open PR" + ("s" if len(prs) > 1 else "")] + ([f"  #{x['number']}  {x['title']}" + (f"  [stale: {pr_age_days(x)} days old]" if pr_stale(x) else "") for x in prs] if prs else ["  none"])
+    red = red_findings(name, man) if running else []
+    notes = note_findings(name) if running else []
+    L += ["", "problems"] + ([f"  ! {x}" for x in red] if red else ["  none"])
+    L += ["", "notes"] + ([f"  - {x}" for x in notes] if notes else ["  none"])
+    when = onboarded_on(name, path)
+    L += ["", f"onboarded: {when or ('never (no manifest)' if not man else 'not yet recorded')}"]
+    drift = next((x for x in (notes if running else drift_notes(name, path)) if x.startswith("setup changed")), "")
+    L += [f"drift: {drift if drift else 'none'}"] if man else []
+    return "\n".join(L)
+
+
+class ProjectScreen(ModalScreen):
+    """The selected project at a glance, with the actions that belong to it. A button closes the screen and returns its name; the Menu then runs it."""
+    BINDINGS = [Binding("escape", "close", "Close")]
+    DEFAULT_CSS = """
+    ProjectScreen { align: center top; }
+    ProjectScreen > Vertical { width: 100%; max-width: 80; height: 100%; background: $surface; padding: 0 1; }
+    ProjectScreen #ptext { height: 1fr; }
+    ProjectScreen #pbuttons { layout: grid; grid-size: 2; grid-gutter: 0 1; height: auto; margin-top: 1; }
+    ProjectScreen Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
+    """
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with VerticalScroll(id="ptext"):
+                yield Static(self.text, markup=False)
+            with Container(id="pbuttons"):
+                for bid, label in [("onboard", "Onboard"), ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"),
+                                   ("info", "Info window"), ("mark_onboarded", "Mark as onboarded"), ("close", "Close (esc)")]:
+                    b = Button(label, id=f"pb-{bid}")
+                    b.can_focus = False
+                    yield b
+
+    def on_button_pressed(self, event):
+        event.stop()
+        self.dismiss(event.button.id[3:] if event.button.id != "pb-close" else "")
+
+    def action_close(self):
+        self.dismiss("")
+
+
 class Confirm(ModalScreen):
     BINDINGS = [Binding("y,enter", "answer(True)", "Yes"), Binding("n,escape", "answer(False)", "No")]
     DEFAULT_CSS = """
@@ -3190,7 +3387,7 @@ class SettingsScreen(ModalScreen):
         lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
         lines += [f"  {k}\n      {d}" for k, d in KEYS]
         lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, c copy context, p copy report, m merge PR, i info, r refresh, q quit"]
+        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, c copy context, p copy report, m merge PR, i or j project screen, r refresh, q quit"]
         return "\n".join(lines)
 
     def on_mount(self):
@@ -3254,7 +3451,7 @@ class Menu(App):
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
     BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"), Binding("h", "hide", "Hide sidebar"),
-                Binding("b", "onboard", "Onboard"), Binding("c", "context", "Copy context"), Binding("p", "report", "Copy report"), Binding("m", "merge", "Merge PR"), Binding("i", "info", "Info"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
+                Binding("b", "onboard", "Onboard"), Binding("c", "context", "Copy context"), Binding("p", "report", "Copy report"), Binding("m", "merge", "Merge PR"), Binding("i", "project", "Project"), Binding("j", "project", "Project"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
@@ -3269,7 +3466,7 @@ class Menu(App):
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("onboard", "Onboard (b)"), ("context", "Copy context (c)"), ("report", "Copy report (p)"), ("merge", "Merge (m)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
+            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("onboard", "Onboard (b)"), ("context", "Copy context (c)"), ("report", "Copy report (p)"), ("merge", "Merge (m)"), ("project", "Project (j)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
                 if bid == "hide" and not os.environ.get("HB_SIDEBAR"):
                     continue
                 button = Button(label, id=f"b-{bid}")
@@ -3487,7 +3684,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "project", "edit_manifest", "mark_onboarded", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -3725,6 +3922,58 @@ class Menu(App):
             self.say_from_thread(f"{name}: merge ERROR {e}")
         finally:
             self.busy.discard(name)
+
+    def action_project(self):
+        """The Project screen for the selected project (also on i); its buttons run the matching actions after it closes."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        name, path, prs = p["name"], p["path"], p.get("prs")
+
+        def work():
+            try:
+                text = project_summary(name, path, prs=prs)
+            except Exception as e:
+                text = f"{name}\n\ncould not read the project: {e}"
+            self.call_from_thread(lambda: self.push_screen(ProjectScreen(text), lambda r: self.run_project_action(r)))
+        self.run_worker(work, thread=True)
+
+    def run_project_action(self, what):
+        if what and hasattr(self, "action_" + what):
+            getattr(self, "action_" + what)()
+
+    def action_edit_manifest(self):
+        """projects/<name>.toml in $EDITOR (else nvim), in a new window of the project's tmux session, shown on the right side of the sidebar."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        man = MANIFESTS / f"{p['name']}.toml"
+        sess = sanitize(p["name"])
+        if not man.is_file():
+            return self.say(f"{p['name']}: no manifest yet: use Onboard.")
+        if not session_exists(sess):
+            return self.say(f"{p['name']}: not running: Open it first, then Edit manifest.")
+        win = "manifest"
+        tmux("kill-window", "-t", f"={sess}:={win}", check=False)
+        side = sidebar_client() if os.environ.get("HB_SIDEBAR") else menu_client()
+        tmux("new-window", *(["-d"] if side else []), "-t", f"{sess}:", "-n", win, "-c", str(MANIFESTS), f"${{EDITOR:-nvim}} {shlex.quote(str(man))}")
+        if side:
+            tmux("switch-client", "-c", side, "-t", f"={sess}:={win}", check=False)
+        self.say(f"{p['name']}: editing {home_rel(man)} (window `{win}` of its session)")
+
+    def action_mark_onboarded(self):
+        """Take the project's fingerprint as it is now: the setup is onboarded (clears a 'setup changed' note)."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        if not (MANIFESTS / f"{p['name']}.toml").is_file():
+            return self.say(f"{p['name']}: no manifest yet: use Onboard.")
+        take_fingerprint(p["name"], p["path"])
+        if p["running"]:
+            recheck(p["name"], p["path"])
+        self.recheck_next = True
+        self.reload(keep=True)
+        self.say(f"{p['name']}: marked as onboarded ({onboarded_on(p['name'], p['path'])})")
 
     def action_info(self):
         """The same text as `kk`, in a plain tmux window (so mouse-drag copy works), closed with Enter."""

@@ -29,3 +29,15 @@
 - Manual test checklists use real, runnable commands. No placeholders (no `...`, no `<name>`).
 - Never run `git worktree remove --force` or delete a worktree that has uncommitted changes. Commit or stash
   first.
+
+## Working with the user
+- The user often dictates: messages are long and loose. Extract the intent and follow his actual
+  design. Read the existing docs before proposing. Don't invent structure, UI flows or strict
+  rules.
+- Keep answers direct. Ask at most a few questions, each with a recommended default.
+- He runs commands literally: no placeholders.
+- He works mostly by mouse and voice (RSI): prefer visible buttons over keys to memorize.
+- He is on a Claude Pro plan with 5-hour limits. Be economical: read what you need, prefer
+  existing scripts and tools over long exploration, don't re-run expensive suites without a
+  reason.
+- Planning happens in plan mode (opusplan: Opus plans, Sonnet implements).
