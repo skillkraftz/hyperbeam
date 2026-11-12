@@ -1,6 +1,11 @@
 # Design decisions (newest first)
 Date, decision, why, what was rejected. Seeded from the merged PRs and git history on 2026-11-11; add new entries at the top, in the PR that makes the decision.
 
+## 2026-11-12 Merge merges every open PR, oldest first, and stops only at a real problem
+- **Decision:** the Merge button merges all of the project's open PRs oldest first after one confirmation; each is re-checked against main (files in common) just before it merges; the first one that needs a look stops the run; the project's update runs once at the end. The just-merged PRs are removed from the list directly (GitHub's list lags).
+- **Why:** Claude opens PRs in the background, so several are waiting; merging only the newest, with a question per PR, meant clicking Merge and answering for each. The user wants one click and a complaint only when something will need investigating.
+- **Rejected:** merging only the newest (what it did); no re-check between merges (two PRs touching the same file would merge untested together); updating after every merge (hyperbeam's update restarts the menu).
+
 ## 2026-11-12 Merge stops only when main changed the PR's own files
 - **Decision:** Merge's "behind main" modal (Ask Claude to update / Merge anyway) appears only when commits on main since the branch point touch files the PR also changes. Behind in other files: the plain Yes/No, with a one-line note.
 - **Why:** manifests go straight to main by design, and Claude opens PRs in the background, so main moves on all the time. PR #31 was flagged "1 commit behind" for a stenographr manifest commit. The user wants Merge to complain only when the default would leave something to investigate.
