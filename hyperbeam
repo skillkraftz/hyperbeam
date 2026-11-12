@@ -203,7 +203,7 @@ def known_path(name):
     man = load_manifests().get(name)
     if man:
         p = manifest_path(man)
-    elif name == "hyperbeam":
+    elif name == "hyperbeam" and not (ROOT / "hyperbeam").is_dir():       # normally ~/projects/hyperbeam, the dev folder; HERE (the installed copy) is the app
         p = HERE
     else:
         p = next((c for c in (ROOT / name, ROOT / name.replace("_", "/")) if c.is_dir()), None)
@@ -1517,15 +1517,16 @@ def menu_cmd():
 
 
 def ensure_menu():
-    """The `hyperbeam` session, two windows: `home` (Claude in ~/projects/hyperbeam on the left, a shell on the right; what the sidebar shows
+    """The `hyperbeam` session, two windows: `home` (Claude in the dev folder ~/projects/hyperbeam on the left, a shell on the right; what the sidebar shows
     on its right) and `menu` (the menu, for SSH and the switch/window modes)."""
     if session_exists(MENU):
         return
     clean_server_env()
-    claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(HERE),
-                       "-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', HERE)}", "-e", "HOST=0.0.0.0", "-e", f"PATH={session_path()}"])
+    dev = known_path("hyperbeam")                 # Claude works in the dev folder; the app itself runs from HERE (the installed copy)
+    claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(dev),
+                       "-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', dev)}", "-e", "HOST=0.0.0.0", "-e", f"PATH={session_path()}"])
     publish_claude_pane(MENU, claude)
-    new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(HERE)])
+    new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(dev)])
     send_line(claude, f"export HB_CLAUDE_PANE={claude}; " + claude_base())
     tmux("select-pane", "-t", claude)
     new_pane(["new-window", "-d", "-t", f"={MENU}:", "-n", "menu", "-c", str(HERE)], menu_cmd())
