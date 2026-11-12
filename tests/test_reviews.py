@@ -1,62 +1,10 @@
 """The review pass: counting merged PRs since the last review record, the row note, the context line, the facts for the prompt, the once-a-day offer,
 and the Done step. Runs in the lab: hyperbeam lab run --why "tests" -- uv run --quiet --with textual python3 -m unittest discover -s tests -v"""
-import importlib.machinery
-import importlib.util
-import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent.parent
-loader = importlib.machinery.SourceFileLoader("hb", str(HERE / "hyperbeam"))
-spec = importlib.util.spec_from_loader("hb", loader)
-hb = importlib.util.module_from_spec(spec)
-loader.exec_module(hb)
-
-
-class Repo:
-    """A throwaway repo with an origin: main, and PRs merged with merge commits."""
-
-    def __init__(self):
-        self.d = Path(tempfile.mkdtemp())
-        self.o, self.r = self.d / "o.git", self.d / "r"
-        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.o)], check=True)
-        subprocess.run(["git", "clone", "-q", str(self.o), str(self.r)], check=True, capture_output=True)
-        self.git("config", "user.email", "t@t")
-        self.git("config", "user.name", "t")
-        self.git("checkout", "-qb", "main")
-        self.write("README.md", "base\n")
-        self.commit("base")
-        self.git("push", "-q", "origin", "main")
-
-    def git(self, *a):
-        return subprocess.run(["git", *a], cwd=self.r, check=True, capture_output=True, text=True).stdout.strip()
-
-    def write(self, f, text):
-        p = self.r / f
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
-
-    def commit(self, msg):
-        self.git("add", "-A")
-        self.git("commit", "-qm", msg)
-
-    def merge_pr(self, n, files=None):
-        b = f"pr{n}"
-        self.git("checkout", "-qb", b, "main")
-        for f in files or [f"file{n}.txt"]:
-            self.write(f, f"{n}\n")
-        self.commit(f"change {n}")
-        self.git("checkout", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", f"Merge pull request #{n} from o/{b}", b)
-        self.git("push", "-q", "origin", "main")
-        return self.git("rev-parse", "--short", "HEAD")
-
-    def review_record(self, date, through, prs="[1, 2]"):
-        self.write(f"docs/reviews/{date}.md", f"---\nthrough: {through}\nprs: {prs}\n---\nreviewed\n")
-        self.commit(f"review {date}")
-        self.git("push", "-q", "origin", "main")
+from common import Repo, hb
 
 
 class ReviewCounting(unittest.TestCase):
@@ -136,10 +84,12 @@ class OfferedOnce(unittest.TestCase):
         old = hb.DATA_DIR
         hb.DATA_DIR = Path(tempfile.mkdtemp())
         try:
-            self.assertFalse(hb.review_offered("p"))
-            hb.review_mark_offered("p")
-            self.assertTrue(hb.review_offered("p"))
-            self.assertFalse(hb.review_offered("q"))
+            self.assertFalse(hb.daily_done("review:p"))
+            hb.daily_mark("review:p")
+            self.assertTrue(hb.daily_done("review:p"))
+            self.assertFalse(hb.daily_done("review:q"))
+            hb.daily_mark("digest:x")                                   # a second key does not disturb the first
+            self.assertTrue(hb.daily_done("review:p"))
         finally:
             hb.DATA_DIR = old
 
@@ -151,12 +101,12 @@ class DoneStep(unittest.TestCase):
         self.repo = Repo()
         through = self.repo.merge_pr(1)
         self.repo.review_record("2026-11-12", through)
-        self.saved = {k: getattr(hb, k) for k in ("load_journal", "known_path", "review_offered", "review_mark_offered", "start_review")}
+        self.saved = {k: getattr(hb, k) for k in ("load_journal", "known_path", "daily_done", "daily_mark", "start_review")}
         hb.load_journal = lambda: {"projects": {"proj": {}}}
         hb.known_path = lambda n: self.repo.r
-        hb.review_offered = lambda n: False
+        hb.daily_done = lambda n: False
         self.offers, self.started, self.marked, self.result = [], [], [], (True, "started")
-        hb.review_mark_offered = lambda n: self.marked.append(n)
+        hb.daily_mark = lambda n: self.marked.append(n)
         hb.start_review = lambda n, p, since: (self.started.append((n, since)), self.result)[1]
         for n in range(2, 7):
             self.repo.merge_pr(n)
@@ -186,12 +136,12 @@ class DoneStep(unittest.TestCase):
         self.assertIn("5 PRs merged since the last review", self.offers[0])
         self.assertIn("Previous Claude", self.offers[0])
         self.assertEqual(self.started, [("proj", hb.reviews_due(self.repo.r)[1]["through"])])
-        self.assertEqual(self.marked, ["proj"])
+        self.assertEqual(self.marked, ["review:proj"])
 
     def test_later_does_not_start_does_not_stop_done_and_is_remembered(self):
         self.assertFalse(self.menu("later").review_step())
         self.assertEqual(self.started, [])
-        self.assertEqual(self.marked, ["proj"])
+        self.assertEqual(self.marked, ["review:proj"])
 
     def test_a_review_that_could_not_start_does_not_use_up_the_offer(self):
         self.result = (False, "proj is not running: open it, then ask again")
@@ -201,7 +151,7 @@ class DoneStep(unittest.TestCase):
         self.assertTrue(any("no review started" in x for x in m.say))
 
     def test_already_offered_today_is_quiet(self):
-        hb.review_offered = lambda n: True
+        hb.daily_done = lambda n: True
         self.assertFalse(self.menu("ask").review_step())
         self.assertEqual(self.offers, [])
 

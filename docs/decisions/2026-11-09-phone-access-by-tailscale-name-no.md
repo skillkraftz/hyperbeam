@@ -2,7 +2,7 @@
 id: 2026-11-09-phone-access-by-tailscale-name-no
 status: implemented
 prs: [4]
-topic: unsorted
+topic: ui
 ---
 # Phone access by Tailscale name, no tunnels
 

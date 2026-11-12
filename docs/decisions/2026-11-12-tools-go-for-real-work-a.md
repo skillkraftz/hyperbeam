@@ -2,7 +2,7 @@
 id: 2026-11-12-tools-go-for-real-work-a
 status: implemented
 prs: [35]
-topic: unsorted
+topic: tools
 ---
 # Tools: Go for real work, a daily check, usage and bypass in the digest
 

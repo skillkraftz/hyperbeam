@@ -2,7 +2,7 @@
 id: 2026-11-12-hyperbeam-refresh-prs-an-agent-tells
 status: implemented
 prs: [39]
-topic: unsorted
+topic: merge
 ---
 # `hyperbeam refresh-prs`: an agent tells the sidebar about a new PR
 

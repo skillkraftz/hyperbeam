@@ -2,7 +2,7 @@
 id: 2026-11-09-beam-in-beam-out-saved-layouts
 status: implemented
 prs: [8, 9]
-topic: unsorted
+topic: workflow
 ---
 # Beam in / beam out: saved layouts, start check, wrap-up check, Done
 

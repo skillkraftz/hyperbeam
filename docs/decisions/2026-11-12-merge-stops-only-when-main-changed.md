@@ -1,8 +1,10 @@
 ---
 id: 2026-11-12-merge-stops-only-when-main-changed
-status: implemented
+status: superseded
 prs: [32]
-topic: unsorted
+topic: merge
+collapsed_into: [2026-11-12-merge-flow]
+code: hyperbeam:_merge_all
 ---
 # Merge stops only when main changed the PR's own files
 

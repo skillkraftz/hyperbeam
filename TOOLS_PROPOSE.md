@@ -14,7 +14,7 @@ Skip candidates that are not worth a tool (one-off, already one short command, o
 If nothing is worth a tool, say so in one line and stop. Then **stop and wait for approval**. Nothing is built before the user says which ones.
 
 ## 2. After approval
-Work on a branch from an up-to-date main, in a worktree (`git worktree add -b tools-<name> ~/.cache/hyperbeam-work/tools-<name> main`).
+Work on a branch from an up-to-date main in hyperbeam's dev folder (`git fetch`, `git switch -c tools-<name> origin/main`); a git worktree only if the checkout has other work.
 For each approved tool, create `tools/<name>/`:
 - The language: **Go** for a tool that does real work (runs, measures, parses or waits on things): `tools/<name>/main.go` + `go.mod` + a `.gitignore`
   with `/<name>`; `hyperbeam tool` builds it when the source is newer than the binary (the build step is fine: it is paid once). bash or python3
@@ -27,5 +27,5 @@ For each approved tool, create `tools/<name>/`:
   but did not go through the tool ("done by hand": agents bypassing it).
 - one line in `TOOLS.md`: `- **name** - usage line - the work it replaces`.
 Test each in the lab: `hyperbeam lab run --why "test tool NAME" -- hyperbeam tool --test NAME`, or run `bash tools/<name>/test` through `hyperbeam lab run`.
-Commit, push, open a PR with a manual test checklist of real commands, remove the worktree, and report: branch, PR URL, the tools, what they save, what is
+Commit, push, open a PR with a manual test checklist of real commands, and report: branch, PR URL, the tools, what they save, what is
 untested. Do not merge. Add a decision record (docs/decisions/, see RULES.md) only if a real design decision was made.

@@ -1,7 +1,7 @@
 ---
 id: 2026-11-12-review-fresh-claude
 status: implemented
-prs: []
+prs: [43]
 topic: workflow
 ---
 # The review runs in a fresh plan-mode Claude swapped into the pane

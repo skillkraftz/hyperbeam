@@ -1,7 +1,7 @@
 ---
 id: 2026-11-12-review-pass
 status: implemented
-prs: []
+prs: [42]
 topic: workflow
 ---
 # A review pass after every few merged PRs, recorded in docs/reviews/

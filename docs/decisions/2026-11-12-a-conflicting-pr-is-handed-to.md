@@ -1,8 +1,10 @@
 ---
 id: 2026-11-12-a-conflicting-pr-is-handed-to
-status: implemented
+status: superseded
 prs: [38]
-topic: unsorted
+topic: merge
+collapsed_into: [2026-11-12-merge-flow]
+code: hyperbeam:_merge_all
 ---
 # A conflicting PR is handed to Claude to rebase, not left to the user
 

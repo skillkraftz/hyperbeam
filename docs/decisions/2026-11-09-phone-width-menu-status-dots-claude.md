@@ -2,7 +2,7 @@
 id: 2026-11-09-phone-width-menu-status-dots-claude
 status: implemented
 prs: [10]
-topic: unsorted
+topic: ui
 ---
 # Phone-width menu, status dots, Claude hooks
 

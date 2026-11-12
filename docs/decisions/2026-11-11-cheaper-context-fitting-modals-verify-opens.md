@@ -2,7 +2,7 @@
 id: 2026-11-11-cheaper-context-fitting-modals-verify-opens
 status: implemented
 prs: [27]
-topic: unsorted
+topic: ui
 ---
 # Cheaper context, fitting modals, verify opens the PR, Docker in the lab
 

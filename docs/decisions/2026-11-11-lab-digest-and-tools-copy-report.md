@@ -2,7 +2,7 @@
 id: 2026-11-11-lab-digest-and-tools-copy-report
 status: implemented
 prs: [23]
-topic: unsorted
+topic: tools
 ---
 # Lab digest and tools; Copy report finds the real report
 

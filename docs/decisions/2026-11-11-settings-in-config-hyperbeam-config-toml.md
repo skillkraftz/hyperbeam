@@ -2,7 +2,7 @@
 id: 2026-11-11-settings-in-config-hyperbeam-config-toml
 status: implemented
 prs: [12]
-topic: unsorted
+topic: install
 ---
 # Settings in `~/.config/hyperbeam/config.toml`, defaults in the repo
 

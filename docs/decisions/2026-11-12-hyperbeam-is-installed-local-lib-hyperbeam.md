@@ -2,7 +2,7 @@
 id: 2026-11-12-hyperbeam-is-installed-local-lib-hyperbeam
 status: implemented
 prs: [40]
-topic: unsorted
+topic: install
 ---
 # hyperbeam is installed (~/.local/lib/hyperbeam); development happens in ~/projects/hyperbeam on branches
 

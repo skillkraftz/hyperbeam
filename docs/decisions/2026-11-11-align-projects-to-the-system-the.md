@@ -2,7 +2,7 @@
 id: 2026-11-11-align-projects-to-the-system-the
 status: implemented
 prs: [19]
-topic: unsorted
+topic: workflow
 ---
 # Align projects to the system; the lab keeps synced copies and a run log
 

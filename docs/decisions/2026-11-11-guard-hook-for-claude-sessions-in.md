@@ -2,7 +2,7 @@
 id: 2026-11-11-guard-hook-for-claude-sessions-in
 status: implemented
 prs: [12]
-topic: unsorted
+topic: hooks
 ---
 # Guard hook for Claude sessions in hyperbeam
 

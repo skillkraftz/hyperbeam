@@ -2,7 +2,7 @@
 id: 2026-11-11-verify-command-sidebar-screenshots-rootless-podman
 status: implemented
 prs: [25]
-topic: unsorted
+topic: lab
 ---
 # Verify command, sidebar screenshots, rootless podman
 

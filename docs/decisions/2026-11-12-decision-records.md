@@ -1,7 +1,7 @@
 ---
 id: 2026-11-12-decision-records
 status: implemented
-prs: []
+prs: [41]
 topic: docs
 ---
 # Decisions are one file each, with a status and what they collapsed into

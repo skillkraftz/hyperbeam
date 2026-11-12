@@ -2,7 +2,7 @@
 id: 2026-11-11-stale-doc-hints-and-wrap-up
 status: implemented
 prs: [24]
-topic: unsorted
+topic: docs
 ---
 # Stale-doc hints and wrap-up notes
 

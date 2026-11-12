@@ -2,7 +2,7 @@
 id: 2026-11-08-stack-choices
 status: implemented
 prs: [1, 2]
-topic: unsorted
+topic: ui
 ---
 # Stack choices
 
