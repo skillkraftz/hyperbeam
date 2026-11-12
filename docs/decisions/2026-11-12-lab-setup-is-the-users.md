@@ -1,8 +1,9 @@
 ---
 id: 2026-11-12-lab-setup-is-the-users
-status: implemented
+status: superseded
 prs: [46]
 topic: lab
+collapsed_into: [2026-11-12-lab-refuses-nesting]
 ---
 # The lab's setup is the user's; no lab inside the lab; error messages state facts
 

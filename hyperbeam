@@ -2307,8 +2307,9 @@ def cmd_sidebar(a):
 LAB_USER, LAB_HOME, LAB_DISPLAY = "hblab", Path("/srv/hblab"), ":99"
 LAB_USERS_OWN = "The lab's setup (lab/setup.sh, remove.sh, podman-setup.sh, the sudoers rule, the disk image) is the user's: report this, and don't run or suggest running them."
 LAB_SETUP = f"The lab user {LAB_USER} does not exist on this machine. {LAB_USERS_OWN}"
-LAB_NESTED = ("Already inside the lab (HB_LAB=1): run the command directly. `hyperbeam tool` and `hyperbeam NAME test` run in the lab by themselves; "
-              "a lab run inside the lab fails (hblab has no sudo). Nothing on the machine needs changing.")
+LAB_NESTED = ("This command starts the lab, and you are already in it (HB_LAB=1: a `hyperbeam lab run` is running you), where hblab has no sudo. Nothing is wrong with "
+              "the lab and nothing on the machine needs changing. `hyperbeam tool`, `shot`, `NAME test` and `lab run` start the lab themselves, so do not put them inside "
+              "`hyperbeam lab run`: run the program directly instead (a tool: `$HB_TOOLS/NAME/NAME`; tests: the project's own test command).")
 
 
 TOOLS_SRC = Path(os.environ.get("HB_TOOLS_SRC") or HERE / "tools")       # the tools folder (HB_TOOLS_SRC: tests)
@@ -2715,6 +2716,9 @@ def cmd_tool(a):
     if a.list:
         print((HERE / "TOOLS.md").read_text() if (HERE / "TOOLS.md").is_file() else "no TOOLS.md")
         return 0
+    if os.environ.get("HB_LAB"):
+        print(LAB_NESTED)
+        return 2
     if a.test:
         res = run_tool_tests([a.name] if a.name else None)
         try:                                       # a passing test clears that tool's red finding
@@ -3042,7 +3046,7 @@ def cmd_shot(a):
     dest = f"{LAB_HOME}/shots/{sid}"
     cmd = ["--", "uv", "run", "--quiet", "--with", "pyte", "--with", "pillow", "--script", "hyperbeam", "_shot-render", "--cols", str(cols), "--rows", str(a.rows),
            "--out", dest, "--screens", ",".join(screens)]
-    ns = types.SimpleNamespace(action="run", dir=str(HERE), name="hyperbeam", why=f"shot {cols}x{a.rows}", fresh=False, timeout=300, cmd=cmd, collect=dest, collect_to=None, quiet=False)
+    ns = types.SimpleNamespace(action="run", dir=str(Path(a.dir).expanduser()) if a.dir else str(HERE), name="hyperbeam", why=f"shot {cols}x{a.rows}", fresh=False, timeout=300, cmd=cmd, collect=dest, collect_to=None, quiet=False)
     return cmd_lab(ns)
 
 
@@ -6528,6 +6532,7 @@ def main():
     sh_.add_argument("--rows", type=int, default=40)
     sh_.add_argument("--phone", action="store_true", help="42 columns, what the phone shows")
     sh_.add_argument("--screen", choices=["all", *SHOT_SCREENS], default="all")
+    sh_.add_argument("--dir", help="draw this checkout's sidebar (a dev folder or a worktree, to see a branch) instead of the installed copy")
     sh_.set_defaults(f=cmd_shot)
     sr = sub.add_parser("_shot-render")
     sr.add_argument("--cols", type=int, default=35)
