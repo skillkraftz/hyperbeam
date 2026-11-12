@@ -3888,8 +3888,10 @@ def cached_prs(name, path):
         return None, 1e9, ""
 
 
-def open_prs(name, path, force=False):
-    """Open PRs opened by the user (newest first): [{number, title, url, branch}]. Cached for PR_TTL seconds per project, errors too."""
+def open_prs(name, path, force=False, gone=()):
+    """Open PRs opened by the user (newest first): [{number, title, url, branch}]. Cached for PR_TTL seconds per project, errors too.
+    gone: PR numbers just merged. `gh pr list --author` goes through GitHub's search index, which lags a few seconds, so right after a
+    merge it still lists the merged PR (the Merge button stayed until a second click)."""
     slug = github_slug(path)
     if not slug:
         return []
@@ -3901,6 +3903,7 @@ def open_prs(name, path, force=False):
         prs = sorted(({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", ""), "base": x.get("baseRefName", ""),
                                                                                                         "created": x.get("createdAt", "")} for x in json.loads(out)),
                      key=lambda x: -x["number"]) if rc == 0 else None
+        prs = [x for x in prs if x["number"] not in gone] if prs is not None else None
     except (ValueError, KeyError, TypeError):
         prs, e = None, "unreadable gh output"
     try:
@@ -5332,67 +5335,87 @@ class Menu(App):
         self.run_worker(work, thread=True)
 
     def action_merge(self):
-        """Merge the selected project's open PR (the newest of yours) after a confirmation; then the local checkout, the badge, and for hyperbeam itself an update."""
+        """Merge all of the selected project's open PRs (yours), oldest first, after one confirmation. See _merge_all."""
         p = self.current()
         if not p or not p.get("prs"):
             return self.say("No open PR of yours for the selected project.")
         if p["name"] in self.busy:
             return self.say(f"{p['name']} is busy.")
         self.busy.add(p["name"])
-        self.run_worker(lambda: self._merge(p, p["prs"][0]), thread=True)
+        self.run_worker(lambda: self._merge_all(p, sorted(p["prs"], key=lambda x: x["number"])), thread=True)
 
-    def _merge(self, p, pr):
+    def _merge_all(self, p, prs):
+        """One confirmation, then every PR in order; before each one the check against main is made again (the one before it moved main). A PR
+        with nothing in common with main's new commits merges without a question; the first real problem (main changed the PR's own files and
+        the user says update or cancel, GitHub refuses, a conflict) stops the run and the rest stay open. The project's update runs once, last."""
         name = p["name"]
+        merged, stopped = [], None
         try:
-            self.say_from_thread(f"{name}: checking PR #{pr['number']} against {pr.get('base') or 'main'}...")
-            try:
-                behind, overlap = pr_behind(p["path"], pr) or (None, [])
-            except (subprocess.SubprocessError, OSError):
-                behind, overlap = None, []
-            base = pr.get("base") or default_branch(p["path"])
-            title = f"Merge PR #{pr['number']} in {name}?\n\n{pr['title']}\n\n"
-            if pr_stale(pr):
-                title += f"This PR is {pr_age_days(pr)} days old (stale).\n\n"
-            if behind and not overlap:                # main moved on elsewhere (a manifest, another PR): nothing for the user to look at
-                title += f"{base} has {behind} newer commit{'s' if behind != 1 else ''}, none in this PR's files.\n\n"
-            if behind and overlap:
-                shown = ", ".join(overlap[:3]) + (f" and {len(overlap) - 3} more" if len(overlap) > 3 else "")
-                pick = self.choose(title + f"This PR is {behind} commit{'s' if behind != 1 else ''} behind {base}, and {base} also changed {shown}; its tests ran without those changes.\n\n"
-                                   "Ask Claude to update it and re-test (Enter), or merge it as it is.", [
-                    ("ask", "Ask Claude to update and re-test (a)", "a"), ("merge", "Merge anyway (m)", "m"), ("cancel", "Cancel (c)", "c")], enter="ask")
-                if pick == "ask":
-                    sess = sanitize(name)
-                    pane = find_claude_pane(sess) if session_exists(sess) else None
-                    if not pane:
-                        return self.say_from_thread(f"{name}: not running: Open it, then ask again (nothing was merged)")
-                    inject_prompt(pane, update_prompt(name, pr, behind, base), [])
-                    return self.say_from_thread(f"{name}: asked Claude to update PR #{pr['number']} on {base} and re-test (nothing merged)")
-                if pick != "merge":
-                    return self.say_from_thread(f"{name}: merge cancelled")
-            elif not self.ask(title + "A merge commit; the branch is deleted on GitHub. Nothing is merged without Yes."):
+            lines = "\n".join(f"#{x['number']} {x['title']}" + (f" (stale: {pr_age_days(x)} days old)" if pr_stale(x) else "") for x in prs)
+            if not self.ask(f"Merge {len(prs)} PR{'s' if len(prs) != 1 else ''} in {name}, oldest first?\n\n{lines}\n\n"
+                            "A merge commit each; the branches are deleted on GitHub. It stops at the first one that needs a look. Nothing is merged without Yes."):
                 return self.say_from_thread(f"{name}: merge cancelled")
-            self.say_from_thread(f"{name}: merging PR #{pr['number']}...")
-            ok, msgs = merge_pr(name, p["path"], pr, self.say_from_thread)
-            prs = open_prs(name, p["path"], force=True)
-            p["prs"] = prs or None
-            self.call_from_thread(self.refresh_list)
-            self.say_from_thread(f"{name}: " + "; ".join(msgs))
-            if ok:
+            for pr in prs:
+                stopped = self._merge_one(p, pr)
+                if stopped:
+                    stopped = f"stopped at #{pr['number']}: {stopped}"
+                    break
+                merged.append(pr)
+            local_ok = bool(merged) and merged[-1].get("_local_ok")
+            if merged:
+                p["prs"] = open_prs(name, p["path"], force=True, gone={x["number"] for x in merged}) or None
+                self.call_from_thread(self.refresh_list)
                 try:
-                    (DATA_DIR / "merge-verified").write_text(time.strftime("%Y-%m-%d %H:%M") + f" {name} #{pr['number']}\n")     # `verify` stops asking for a Merge test
+                    (DATA_DIR / "merge-verified").write_text(time.strftime("%Y-%m-%d %H:%M") + f" {name} #{merged[-1]['number']}\n")     # `verify` stops asking for a Merge test
                 except OSError:
                     pass
-            if ok and name == "hyperbeam" and any(m.startswith("local: on") and "failed" not in m for m in msgs):
+            summary = ("merged " + ", ".join(f"#{x['number']}" for x in merged)) if merged else "nothing merged"
+            if local_ok and name == "hyperbeam":
+                self.say_from_thread(f"{name}: {summary}" + (f"; {stopped}" if stopped else ""))
                 self.call_from_thread(self.update_hyperbeam)       # the menu restarts itself: this runs in a popup
-            elif ok and any(m.startswith("local: on") and "failed" not in m for m in msgs):
+            elif local_ok:
                 lines = []                                         # merged and pulled: now the project's own update (install, restart services), one click in all
                 rc = run_verb(name, "update", p["path"], lines.append)
                 last = next((l for l in reversed(lines) if l.strip()), "")
-                self.say_from_thread(f"{name}: merged; update {'ok' if rc == 0 else 'FAILED'}: {last}")
+                self.say_from_thread(f"{name}: {summary}; update {'ok' if rc == 0 else 'FAILED'}: {last}" + (f"; {stopped}" if stopped else ""))
+            else:
+                self.say_from_thread(f"{name}: {summary}" + (f"; {stopped}" if stopped else ""))
         except Exception as e:
-            self.say_from_thread(f"{name}: merge ERROR {e}")
+            self.say_from_thread(f"{name}: merge ERROR {e}" + (f" (merged {', '.join('#' + str(x['number']) for x in merged)} before)" if merged else ""))
         finally:
             self.busy.discard(name)
+
+    def _merge_one(self, p, pr):
+        """Check one PR against its base and merge it. -> None when merged, else why the run stops (a sentence)."""
+        name = p["name"]
+        self.say_from_thread(f"{name}: checking PR #{pr['number']} against {pr.get('base') or 'main'}...")
+        try:
+            behind, overlap = pr_behind(p["path"], pr) or (None, [])
+        except (subprocess.SubprocessError, OSError):
+            behind, overlap = None, []
+        base = pr.get("base") or default_branch(p["path"])
+        if behind and overlap:
+            shown = ", ".join(overlap[:3]) + (f" and {len(overlap) - 3} more" if len(overlap) > 3 else "")
+            pick = self.choose(f"PR #{pr['number']} in {name}: {pr['title']}\n\nThis PR is {behind} commit{'s' if behind != 1 else ''} behind {base}, and {base} also changed {shown}; "
+                               "its tests ran without those changes.\n\nAsk Claude to update it and re-test (Enter), or merge it as it is.", [
+                ("ask", "Ask Claude to update and re-test (a)", "a"), ("merge", "Merge anyway (m)", "m"), ("cancel", "Cancel (c)", "c")], enter="ask")
+            if pick == "ask":
+                sess = sanitize(name)
+                pane = find_claude_pane(sess) if session_exists(sess) else None
+                if not pane:
+                    return f"{name} is not running: Open it, then ask again (nothing more was merged)"
+                inject_prompt(pane, update_prompt(name, pr, behind, base), [])
+                return f"asked Claude to update it on {base} and re-test"
+            if pick != "merge":
+                return "cancelled"
+        self.say_from_thread(f"{name}: merging PR #{pr['number']}...")
+        ok, msgs = merge_pr(name, p["path"], pr, self.say_from_thread)
+        if not ok:
+            return "; ".join(msgs)
+        pr["_local_ok"] = any(m.startswith("local: on") and "failed" not in m for m in msgs)
+        for m in msgs[1:]:
+            self.say_from_thread(f"{name}: {m}")
+        return None
 
     def action_more(self):
         self.action_project()
