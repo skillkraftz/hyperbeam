@@ -87,7 +87,7 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask"}
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
 CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["opusplan", "sonnet", "opus", "haiku", "fable"],
            "claude_effort": ["low", "medium", "high", "xhigh", "max"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
@@ -842,7 +842,8 @@ def write_wrapup_note(name, r):
 def recheck(name, path):
     """Refresh: run the git checks again and store the result, so a red dot clears when the problem is gone."""
     red, notes = git_red_notes(path, fetch=False, behind=False)
-    write_status(name, red, [*drift_notes(name, path), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
+    cn = context_note(name, path) if session_exists(sanitize(name)) else ""
+    write_status(name, red, [*drift_notes(name, path), *([cn] if cn else []), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
 
 
 def claude_state(name):
@@ -1504,7 +1505,7 @@ def ensure_menu():
         return
     clean_server_env()
     claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(HERE),
-                       "-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', HERE)}", "-e", "HOST=0.0.0.0"])
+                       "-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', HERE)}", "-e", "HOST=0.0.0.0", "-e", f"PATH={session_path()}"])
     publish_claude_pane(MENU, claude)
     new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(HERE)])
     send_line(claude, f"export HB_CLAUDE_PANE={claude}; " + claude_base())
@@ -1561,6 +1562,11 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     env = session_env(man, name)
     ensure_link(name, path)
     env["HB_STATE"] = str(project_dir(name, path))
+    try:
+        install_shims()
+        env["PATH"] = session_path()          # `NAME VERB` and `hb VERB` inside the session
+    except OSError:
+        pass
     clean_server_env()
     envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
     plan = None
@@ -2459,6 +2465,9 @@ def cmd_shot_render(a):
             pdata = data / "hyperbeam" / "projects" / f"{name}-{hashlib.sha1(str((root / name).resolve()).encode()).hexdigest()[:6]}"
             pdata.mkdir(parents=True, exist_ok=True)
             (pdata / "prs.json").write_text(json.dumps({"time": time.time(), "prs": [{"number": int(pr[0]), "title": pr[1], "url": "https://github.com/x/y/pull/" + pr[0], "branch": "feature"}], "error": ""}))
+    (data / "hyperbeam").mkdir(parents=True, exist_ok=True)
+    (data / "hyperbeam" / "rate-limits.json").write_text(json.dumps({"at": time.time(), "five_hour": {"used_percentage": 83, "resets_at": time.time() + 3 * 3600 + 120},
+                                                                      "seven_day": {"used_percentage": 41, "resets_at": time.time() + 3 * 86400}}))
     (root / "dotwork" / "t.txt").write_text("x")                                    # an untracked file only: nothing to show but the PR
     for n in ("dotwork",):                                                      # github_slug needs a GitHub origin for the PR cache to be read
         subprocess.run(["git", "-C", str(root / n), "remote", "add", "origin", f"git@github-skillkraftz:skillkraftz/{n}.git"])
@@ -2780,13 +2789,134 @@ def verbs_facts(path, name):
     return "; ".join(out)
 
 
-# ---------- usage: what the 5-hour windows cost (from Claude Code's own conversation files; plain script, no tokens) ----------
-WINDOW_SECONDS = 5 * 3600
-USAGE_FILE = lambda: DATA_DIR / "usage-limit.json"
+# ---------- usage: the numbers claude.ai shows (from Claude Code's status line) plus what the local conversation files can honestly tell ----------
+RATE_FILE = lambda: DATA_DIR / "rate-limits.json"
+STATUSLINE_MARK = "# hyperbeam: rate limits"
+STATUSLINE_SNIPPET = STATUSLINE_MARK + r""" (added by `hyperbeam _hooks`: writes the status line's rate_limits to ~/.local/share/hyperbeam/rate-limits.json)
+{ d="${XDG_DATA_HOME:-$HOME/.local/share}/hyperbeam"; mkdir -p "$d"; printf '%s' "$input" | jq -c '{at: now, five_hour: .rate_limits.five_hour, seven_day: .rate_limits.seven_day} | select(.five_hour != null or .seven_day != null)' > "$d/.rl.tmp" 2>/dev/null && [ -s "$d/.rl.tmp" ] && mv "$d/.rl.tmp" "$d/rate-limits.json"; } 2>/dev/null
+"""
 
 
 def fmt_tok(n):
     return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(int(n))
+
+
+def fmt_when(epoch, now=None):
+    """A moment in the system's local time zone, 12-hour: `3:02am` today, `Thu 1:00am` within the week, `Nov 20 1:00am` later."""
+    now = now or time.time()
+    d, n = datetime.datetime.fromtimestamp(epoch), datetime.datetime.fromtimestamp(now)
+    clock = d.strftime("%I:%M%p").lstrip("0").lower()
+    if d.date() == n.date():
+        return clock
+    if 0 < (d.date() - n.date()).days < 7:
+        return f"{d.strftime('%a')} {clock}"
+    return f"{d.strftime('%b')} {d.day} {clock}"
+
+
+def fmt_left(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 86400}d {seconds % 86400 // 3600}h" if seconds >= 86400 else f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+
+
+def rate_limits():
+    """The last rate_limits Claude Code's status line gave, from rate-limits.json: {'at', 'five_hour': {used_percentage, resets_at}, 'seven_day': ...} or None."""
+    try:
+        d = json.loads(RATE_FILE().read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and (d.get("five_hour") or d.get("seven_day")) else None
+
+
+def usage_window_text(w, key, at, now=None, short=False):
+    """`5h 83% - resets Thu 1:00am (in 2h 41m)`, `... (as of 9:41pm)` when the data is stale, `... window over` once it has reset."""
+    now = now or time.time()
+    label = {"five_hour": "5h", "seven_day": "week"}[key]
+    if not w:
+        return ""
+    r = w.get("resets_at") or 0
+    if r and r <= now:
+        return f"{label} window reset: run a prompt to refresh"
+    pct = round(w.get("used_percentage", 0))
+    s = f"{label} {pct}% - resets {fmt_when(r, now)}" if r else f"{label} {pct}%"
+    if not short and r:
+        s += f" (in {fmt_left(r - now)})"
+    if at and now - at > 300:
+        s += f" (as of {fmt_when(at, now)})"
+    return s
+
+
+def usage_line(short=True):
+    """The title-line text: the 5-hour limit as claude.ai shows it. No data yet: says how to get it (never a guess)."""
+    rl = rate_limits()
+    if not rl or not rl.get("five_hour"):
+        return "5h: run any Claude prompt to refresh"
+    return usage_window_text(rl["five_hour"], "five_hour", rl.get("at"), short=short)
+
+
+def install_statusline(settings=None):
+    """Make Claude Code's status line script write rate_limits to rate-limits.json: append the marked snippet to the user's statusLine script (backup kept,
+    its output unchanged); with no statusLine configured, add a minimal script of ours. Idempotent. -> a message or ''."""
+    f = Path(settings or os.environ.get("HB_SETTINGS") or Path.home() / ".claude/settings.json")
+    try:
+        data = json.loads(f.read_text()) if f.exists() else {}
+    except ValueError:
+        return "settings.json unreadable"
+    cmd = (data.get("statusLine") or {}).get("command", "")
+    script = next((Path(os.path.expanduser(t)) for t in shlex.split(cmd) if t.endswith(".sh")), None) if cmd else None
+    if script is None:
+        script = DATA_DIR / "statusline.sh"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        script.write_text('#!/bin/bash\ninput=$(cat)\nprintf "%s" "$(echo "$input" | jq -r .cwd)"\n')
+        script.chmod(0o755)
+        data["statusLine"] = {"type": "command", "command": f"bash {script}"}
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(data, indent=2) + "\n")
+    if not script.is_file():
+        return f"statusLine script {script} not found"
+    text = script.read_text()
+    if STATUSLINE_MARK in text:
+        return ""
+    if "input=$(cat)" not in text:
+        return f"{home_rel(script)} does not read its input into $input: add `{STATUSLINE_SNIPPET.splitlines()[1][:50]}...` yourself"
+    bak = script.with_name(script.name + ".hyperbeam-backup")
+    if not bak.exists():
+        bak.write_text(text)
+    script.write_text(text.rstrip("\n") + "\n" + STATUSLINE_SNIPPET)
+    return f"added the rate-limit snippet to {home_rel(script)} (backup {bak.name})"
+
+
+def conversation_sizes(path_filter=None, within=6 * 3600):
+    """The conversations Claude Code wrote to recently: [(project, session id, tokens fed to its last request, requests, mtime)]. The size of a conversation is
+    what each new request re-reads: cache read + cache creation + input of its latest request (read from the end of the file)."""
+    out, names = [], {}
+    now = time.time()
+    for f in (CLAUDE_DIR / "projects").glob("*/*.jsonl"):
+        try:
+            st = f.stat()
+            if now - st.st_mtime > within:
+                continue
+            with f.open("rb") as fh:
+                fh.seek(max(0, st.st_size - 400_000))
+                tail = fh.read().decode(errors="replace").splitlines()
+        except OSError:
+            continue
+        size = 0
+        for line in reversed(tail):
+            if '"usage"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            u = (o.get("message") or {}).get("usage")
+            if o.get("type") == "assistant" and u and not o.get("isSidechain"):
+                size = u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("input_tokens", 0)
+                break
+        if size:
+            folder = f.parent.name
+            proj = names.setdefault(folder, usage_project_name(folder))
+            out.append((proj, f.stem, size, st.st_mtime))
+    return sorted(out, key=lambda r: -r[2])
 
 
 def usage_project_name(folder):
@@ -2802,9 +2932,50 @@ def usage_project_name(folder):
     return folder.split("-projects-")[-1] if "-projects-" in folder else folder
 
 
+def context_note(name, path):
+    """A quiet note when the project's active conversation is huge: every request re-reads all of it (the cost driver). '' otherwise."""
+    limit = cfg_get("context_warn")
+    mine = [r for r in conversation_sizes(within=3 * 3600) if r[0] == name]
+    if mine and mine[0][2] >= limit:
+        return (f"this conversation re-reads {fmt_tok(mine[0][2])} tokens on every request: finish the task, then start a fresh Claude "
+                f"(Copy context carries what matters)")
+    return ""
+
+
+def usage_report(span="today"):
+    """The text of `hyperbeam usage`: the limits as Claude reports them, then what the local files say (Claude Code only, not claude.ai)."""
+    now = time.time()
+    rl = rate_limits()
+    L = []
+    if rl and rl.get("five_hour"):
+        L += [usage_window_text(rl["five_hour"], "five_hour", rl.get("at"), now)]
+        if rl.get("seven_day"):
+            L += [usage_window_text(rl["seven_day"], "seven_day", rl.get("at"), now)]
+        L += ["  (from Claude Code's status line: the same numbers claude.ai shows, web chats included; they update while Claude Code runs)"]
+    else:
+        L += ["5-hour and weekly limits: not available yet. Run `hyperbeam update` once, then any Claude Code prompt: the status line writes them to "
+              + home_rel(RATE_FILE()) + " (Pro/Max only)."]
+    since = {"today": now - 24 * 3600, "week": now - 7 * 86400}.get(span, 0.0)
+    recs = [r for r in usage_records(since)[0] if r["t"] >= since]
+    L += ["", f"Claude Code activity, last {'24 hours' if span == 'today' else '7 days' if span == 'week' else 'all time'} (this machine, Claude Code only: not claude.ai)"]
+    by = {}
+    for r in recs:
+        by.setdefault(r["proj"], []).append(r)
+    for proj, rs in sorted(by.items(), key=lambda kv: -len(kv[1]))[:8]:
+        q = {k: sum(r[k] for r in rs) for k in ("in", "out", "cc", "cr")}
+        L.append(f"  {proj:<24} {len(rs):>5} requests  output {fmt_tok(q['out']):>6}  new context {fmt_tok(q['cc'] + q['in']):>6}  re-read {fmt_tok(q['cr']):>6}")
+    if not by:
+        L.append("  none")
+    big = conversation_sizes(within=24 * 3600)[:4]
+    if big:
+        L += ["", "conversation sizes (what every new request in that conversation re-reads; this is where tokens go: finish the task, start a fresh Claude)"]
+        L += [f"  {pj:<24} {fmt_tok(sz):>6} tokens   last used {fmt_when(mt, now)}" for pj, sid, sz, mt in big]
+    return L
+
+
 def usage_records(since=0.0):
-    """(usage records, human prompt times, limit-hit times) from ~/.claude/projects/*/*.jsonl modified after `since`. A record: dict(t, model, proj, sid, in, out, cc, cr)."""
-    recs, prompts, hits = [], [], []
+    """(usage records, human prompt times) from ~/.claude/projects/*/*.jsonl modified after `since`. A record: dict(t, model, proj, sid, in, out, cc, cr)."""
+    recs, prompts = [], []
     names = {}
     for f in sorted((CLAUDE_DIR / "projects").glob("*/*.jsonl")):
         try:
@@ -2834,153 +3005,177 @@ def usage_records(since=0.0):
                 if u:
                     recs.append(dict(t=t, model=(o["message"].get("model") or "?"), proj=proj, sid=f.stem, **{"in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0),
                                      "cc": u.get("cache_creation_input_tokens", 0), "cr": u.get("cache_read_input_tokens", 0)}))
-            elif o.get("type") == "user":
-                if is_human_prompt(o):
-                    prompts.append(t)
-                else:
-                    c = (o.get("message") or {}).get("content")
-                    if isinstance(c, str) and c.startswith("[Usage limit reached"):
-                        hits.append(t)
+            elif o.get("type") == "user" and is_human_prompt(o):
+                prompts.append(t)
     recs.sort(key=lambda r: r["t"])
-    return recs, sorted(prompts), sorted(hits)
-
-
-def usage_windows(recs):
-    """Group records into 5-hour windows: a window starts at the first request after the previous window ended; it ends 5 hours after its start."""
-    out = []
-    for r in recs:
-        if not out or r["t"] >= out[-1]["end"]:
-            out.append(dict(start=r["t"], end=r["t"] + WINDOW_SECONDS, recs=[]))
-        out[-1]["recs"].append(r)
-    return out
-
-
-def sums(recs):
-    return {k: sum(r[k] for r in recs) for k in ("in", "out", "cc", "cr")} | {"requests": len(recs)}
-
-
-USAGE_METRICS = {"requests": lambda s: s["requests"], "work": lambda s: s["in"] + s["out"] + s["cc"], "output": lambda s: s["out"],
-                 "weighted": lambda s: s["in"] + s["out"] + s["cc"] + s["cr"] * 0.1}
-
-
-def usage_limit_state(wins, hits):
-    """Record each limit hit with its window's sums (usage-limit.json); with 3+ hits pick the metric whose value at the hits varies least and take the median as
-    the limit; a limit set by hand (`--set-limit N`, in requests) wins. -> dict(metric, limit, hits) or {} when there is nothing to estimate from."""
-    try:
-        st = json.loads(USAGE_FILE().read_text())
-    except (OSError, ValueError):
-        st = {}
-    known = {round(h["time"]) for h in st.get("hits", [])}
-    for h in hits:
-        w = next((w for w in wins if w["start"] <= h <= w["end"]), None)
-        if w and round(h) not in known:
-            st.setdefault("hits", []).append(dict(time=h, **sums([r for r in w["recs"] if r["t"] <= h])))
-            known.add(round(h))
-    if st.get("manual"):
-        st["metric"], st["limit"] = "requests", st["manual"]
-    elif len(st.get("hits", [])) >= 3:
-        best = None
-        for name, fn in USAGE_METRICS.items():
-            vals = sorted(fn(h) for h in st["hits"])
-            mean = sum(vals) / len(vals)
-            cv = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5 / mean if mean else 9
-            if best is None or cv < best[0]:
-                best = (cv, name, vals[len(vals) // 2])
-        st["metric"], st["limit"] = best[1], best[2]
-    try:
-        USAGE_FILE().parent.mkdir(parents=True, exist_ok=True)
-        USAGE_FILE().write_text(json.dumps(st))
-    except OSError:
-        pass
-    return st
-
-
-def usage_report(span="today"):
-    """-> (text lines, current window dict or None, limit state). span: today | week | all."""
-    now = time.time()
-    since = {"today": now - 36 * 3600, "week": now - 8 * 86400}.get(span, 0.0)
-    recs, prompts, hits = usage_records(since)
-    wins = usage_windows(recs)
-    st = usage_limit_state(wins, hits)
-    cur = wins[-1] if wins and wins[-1]["end"] > now else None
-    day0 = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
-    L = [f"usage  (now {time.strftime('%H:%M')}; a window starts at your first request and ends 5 hours later)"]
-    shown = [w for w in wins if (span != "today" or w["end"] > day0)]
-    if cur:
-        s = sums(cur["recs"])
-        ex = sum(1 for t in prompts if cur["start"] - 300 <= t <= cur["end"])          # the prompt that starts a window comes just before its first request
-        left = int(cur["end"] - now)
-        pct = ""
-        if st.get("limit"):
-            fn = USAGE_METRICS.get(st["metric"], USAGE_METRICS["requests"])
-            pct = f", ~{min(999, round(100 * fn(s) / st['limit']))}% of the estimated limit ({st['metric']})"
-        L += ["", f"current window: {time.strftime('%H:%M', time.localtime(cur['start']))} -> ends {time.strftime('%H:%M', time.localtime(cur['end']))} (in {left // 3600}h {left % 3600 // 60:02d}m)",
-              f"  {s['requests']} requests, {ex} exchanges{pct}", f"  tokens: output {fmt_tok(s['out'])}, new context {fmt_tok(s['cc'] + s['in'])}, re-read context {fmt_tok(s['cr'])}",
-              f"  per exchange: {fmt_tok((s['out'] + s['cc'] + s['in']) / ex) if ex else '-'} new, {fmt_tok(s['cr'] / ex) if ex else '-'} re-read"]
-        by = {}
-        for r in cur["recs"]:
-            by.setdefault(r["proj"], []).append(r)
-        for proj, rs in sorted(by.items(), key=lambda kv: -len(kv[1]))[:5]:
-            q = sums(rs)
-            L.append(f"  {proj:<24} {q['requests']:>4} requests  output {fmt_tok(q['out']):>6}  re-read {fmt_tok(q['cr']):>6}")
-    else:
-        L += ["", "current window: none (the next request starts one)"]
-    L += ["", f"windows ({span})"]
-    for w in shown[-8:]:
-        s = sums(w["recs"])
-        hit = any(w["start"] <= h <= w["end"] for h in hits)
-        L.append(f"  {time.strftime('%m-%d %H:%M', time.localtime(w['start']))}  {s['requests']:>4} requests  output {fmt_tok(s['out']):>6}  re-read {fmt_tok(s['cr']):>6}" + ("   <- hit the limit" if hit else ""))
-    sess = {}
-    for r in (cur["recs"] if cur else (shown[-1]["recs"] if shown else [])):
-        sess.setdefault((r["proj"], r["sid"]), []).append(r)
-    heavy = sorted(((sums(rs)["cr"] / len(rs), k, len(rs)) for k, rs in sess.items() if len(rs) >= 5), reverse=True)[:3]
-    if heavy:
-        L += ["", "heaviest conversations (context re-read per request: long ones cost the most; start a fresh one when a task is done)"]
-        L += [f"  {k[0]:<24} {fmt_tok(avg):>6} per request over {n} requests" for avg, k, n in heavy]
-    n_hits = len(st.get("hits", []))
-    L += ["", "limit: " + (f"~{st['limit']:,.0f} ({st['metric']}), from {'your setting' if st.get('manual') else f'{n_hits} limit hits'}" if st.get("limit") else
-                         f"not known yet ({n_hits} limit hit{'s' * (n_hits != 1)} recorded; at 3 the estimate starts; or `hyperbeam usage --set-limit N` in requests)")]
-    return L, cur, st
-
-
-_USAGE_CACHE = {"t": 0.0, "line": ""}
-
-
-def usage_line():
-    """One short line for the Project screen and the title: when the window ends and what it holds (cached for a minute)."""
-    if time.time() - _USAGE_CACHE["t"] < 60:
-        return _USAGE_CACHE["line"]
-    L, cur, st = usage_report("today")
-    line = ""
-    if cur:
-        s = sums(cur["recs"])
-        pct = ""
-        if st.get("limit"):
-            pct = f" ~{min(999, round(100 * USAGE_METRICS.get(st['metric'], USAGE_METRICS['requests'])(s) / st['limit']))}%"
-        line = f"5h window ends {time.strftime('%H:%M', time.localtime(cur['end']))} - {s['requests']} requests{pct}"
-    _USAGE_CACHE.update(t=time.time(), line=line)
-    return line
-
-
-def usage_nudge():
-    """A note when the estimate says the window is nearly used up (never red); '' otherwise or when there is no estimate."""
-    L, cur, st = usage_report("today")
-    if not cur or not st.get("limit"):
-        return ""
-    pct = 100 * USAGE_METRICS.get(st["metric"], USAGE_METRICS["requests"])(sums(cur["recs"])) / st["limit"]
-    return f"the 5-hour window is ~{round(pct)}% used (ends {time.strftime('%H:%M', time.localtime(cur['end']))}): plan the cleanup and docs now" if pct >= 85 else ""
+    return recs, sorted(prompts)
 
 
 def cmd_usage(a):
-    if a.set_limit:
-        recs, prompts, hits = usage_records(time.time() - 8 * 86400)
-        st = usage_limit_state(usage_windows(recs), hits)
-        st["manual"] = a.set_limit
-        USAGE_FILE().write_text(json.dumps(st))
-        print(f"limit set to {a.set_limit} requests per 5-hour window")
-        return 0
-    L, cur, st = usage_report("week" if a.week else "all" if a.all else "today")
-    print("\n".join(L))
+    print("\n".join(usage_report("week" if a.week else "all" if a.all else "today")))
+    return 0
+
+
+# ---------- `NAME VERB` inside a project's session: shims on the session PATH, and `hb VERB` for the current project ----------
+SHIM_MARK = "# hyperbeam shim"
+RESERVED = {"hb", "hyperbeam", "kk", "update", "scan", "open", "stop", "info", "list", "phone", "context", "report", "verify", "shot", "usage", "lab", "tool", "new",
+            "align-facts", "try", "sidebar", "fix", "test", "install", "version", "help", "restart"}
+
+
+def shim_dir():
+    return DATA_DIR / "bin"
+
+
+def install_shims():
+    """Write `hb` and one shim per project into ~/.local/share/hyperbeam/bin (first on the PATH of every session hyperbeam starts), so inside the
+    dotwork session `dotwork help` and `dotwork update` work. A shim is NOT made when a real command of that name exists (stenographr is an installed
+    CLI): `hb VERB` covers it. Stale shims of ours are removed. -> (names with a shim, names left to a real command)."""
+    d = shim_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    names = set(load_manifests())
+    if ROOT.is_dir():
+        names |= {x.name for x in ROOT.iterdir() if x.is_dir() and not x.name.startswith(".")}
+    clean_path = os.pathsep.join(x for x in os.environ.get("PATH", "").split(os.pathsep) if x and Path(x) != d)
+    made, real = [], []
+    body_hb = (f"#!/bin/sh\n{SHIM_MARK}\n[ -n \"$HB_PROJECT\" ] || {{ echo 'hb: run it inside a hyperbeam project session'; exit 2; }}\n"
+               f"if [ $# -eq 0 ]; then set -- help; fi\nexec {SELF} \"$HB_PROJECT\" \"$@\"\n")
+    wanted = {"hb": body_hb}
+    for n in sorted(names):
+        if n in RESERVED or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", n):
+            continue
+        if shutil.which(n, path=clean_path):
+            real.append(n)
+            continue
+        wanted[n] = f"#!/bin/sh\n{SHIM_MARK}\nif [ $# -eq 0 ]; then set -- help; fi\nexec {SELF} {shlex.quote(n)} \"$@\"\n"
+        made.append(n)
+    for n, body in wanted.items():
+        f = d / n
+        if not f.exists() or f.read_text() != body:
+            f.write_text(body)
+        f.chmod(0o755)
+    for f in d.iterdir():
+        try:
+            if f.name not in wanted and SHIM_MARK in f.read_text():
+                f.unlink()
+        except (OSError, UnicodeDecodeError):
+            pass
+    return made, real
+
+
+def session_path():
+    """The PATH of a project session: the shim folder first, then what hyperbeam itself runs with."""
+    return f"{shim_dir()}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def verbs_summary(name, path):
+    """One line: which standard verbs the project defines itself and which are hyperbeam's defaults."""
+    own, default = [], []
+    for v in VERBS[:-1]:
+        cmd, src = verb_command(name, path, v)
+        (own if src.startswith(("manifest", "package.json", "Makefile")) else default).append(v)
+    return "verbs: " + (f"own: {', '.join(own)}" if own else "none of its own") + (f"; hyperbeam's: {', '.join(default)}" if default else "")
+
+
+def hook_summary_for_update():
+    msgs = []
+    sl = install_statusline()
+    if sl:
+        msgs.append(sl)
+    made, real = install_shims()
+    msgs.append(f"session commands: hb + {len(made)} project name{'s' * (len(made) != 1)}" + (f"; left to the real command: {', '.join(real)}" if real else ""))
+    return msgs
+
+
+# ---------- `hyperbeam new NAME [--cli|--web]`: a project that conforms from the first commit ----------
+GITIGNORE = "node_modules/\n.venv/\n__pycache__/\n*.pyc\n.env\n.env.*\n!.env.example\nsteno-*.txt\n.hyperbeam\n"
+
+
+def free_port():
+    used = {m.get("port") for m in load_manifests().values() if m.get("port")}
+    port = 3100
+    while port in used or port_open(port):
+        port += 1
+    return port
+
+
+def new_files(name, kind, about, port):
+    pkg = re.sub(r"[^A-Za-z0-9]", "_", name).lower()
+    today = time.strftime("%Y-%m-%d")
+    f = {".gitignore": GITIGNORE}
+    cmds = {"cli": ("uv sync", f"uv run {name} ...", "uv run pytest -q"), "web": ("npm install", "npm run dev", "npm test")}[kind]
+    f["README.md"] = (f"# {name}\n\n{about}\n\n## Why\n(What problem does this solve, for whom? Two sentences.)\n\n## Using it\n"
+                      f"- `hyperbeam {name} install` ({cmds[0]}), `hyperbeam {name} update`, `hyperbeam {name} version`, `hyperbeam {name} help`, `hyperbeam {name} test` (runs in the lab).\n"
+                      + (f"- `{name} help` lists what it can do (after `hyperbeam {name} install`).\n" if kind == "cli" else f"- `npm run dev` serves it on port {port}; `/version` answers its version.\n")
+                      + "\n## Status\nPrototype. Decisions are in docs/DECISIONS.md.\n")
+    f["CLAUDE.md"] = (f"# {name}\n\n@.hyperbeam/RULES.md\n\n{about}\n\n## How it works now\n- Setup: `hyperbeam {name} install`. Run: {cmds[1]}. Test: `hyperbeam {name} test` (in the lab).\n"
+                      f"- Version, update and help are built in from the first commit: `hyperbeam {name} version|update|help`"
+                      + (f" and `{name} version|update|install|help` itself.\n" if kind == "cli" else f"; the app answers `/version`.\n") + "\n## Exceptions to hyperbeam rules\n(none)\n")
+    f["docs/DECISIONS.md"] = (f"# Design decisions (newest first)\n\n## {today} Created with `hyperbeam new --{kind}`\n- **Decision:** start from the standard skeleton: version, help, update and install are built in from the first commit.\n"
+                              "- **Why:** prototypes that become projects need them, and adding them later never happens.\n- **Rejected:** a blank folder.\n")
+    if kind == "cli":
+        f["pyproject.toml"] = (f'[project]\nname = "{name}"\nversion = "0.1.0"\ndescription = "{about}"\nrequires-python = ">=3.11"\ndependencies = []\n\n[project.scripts]\n{name} = "{pkg}.cli:main"\n\n'
+                               f'[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n\n[tool.hatch.build.targets.wheel]\npackages = ["src/{pkg}"]\n\n[dependency-groups]\ndev = ["pytest"]\n')
+        f[f"src/{pkg}/__init__.py"] = f'try:\n    from importlib.metadata import version as _v\n    __version__ = _v("{name}")\nexcept Exception:\n    __version__ = "0.1.0"\n'
+        f[f"src/{pkg}/cli.py"] = (f'"""{name}: {about}"""\nimport argparse, subprocess, sys\nfrom pathlib import Path\n\nfrom . import __version__\n\nREPO = Path(__file__).resolve().parents[2]\n\n\n'
+                                  'def install():\n    return subprocess.call(["uv", "tool", "install", "--editable", str(REPO), "--force"])\n\n\n'
+                                  'def update():\n    rc = subprocess.call(["git", "-C", str(REPO), "pull", "--ff-only"])\n    return rc or install()\n\n\n'
+                                  'def main(argv=None):\n    ap = argparse.ArgumentParser(prog="' + name + '", description=__doc__)\n    ap.add_argument("--version", action="version", version=__version__)\n'
+                                  '    sub = ap.add_subparsers(dest="cmd")\n    sub.add_parser("version", help="print the version")\n    sub.add_parser("update", help="pull the latest and reinstall")\n    sub.add_parser("install", help="install the command")\n'
+                                  '    sub.add_parser("help", help="this list")\n    a = ap.parse_args(argv)\n    if a.cmd == "version":\n        print(__version__)\n    elif a.cmd == "update":\n        return update()\n'
+                                  '    elif a.cmd == "install":\n        return install()\n    else:\n        ap.print_help()\n    return 0\n\n\nif __name__ == "__main__":\n    sys.exit(main())\n')
+        f["tests/test_cli.py"] = f'from {pkg}.cli import main\nfrom {pkg} import __version__\n\n\ndef test_version(capsys):\n    assert main(["version"]) == 0\n    assert __version__ in capsys.readouterr().out\n\n\ndef test_help(capsys):\n    assert main(["help"]) == 0\n    assert "update" in capsys.readouterr().out\n'
+    else:
+        f["package.json"] = json.dumps({"name": name, "version": "0.1.0", "description": about, "main": "server.js", "scripts": {
+            "dev": "node server.js", "test": "node --test", "version": "node -p \"require('./package.json').version\"", "update": "git pull --ff-only && npm install",
+            "install-deps": "npm install", "help": "node server.js --help"}}, indent=2) + "\n"
+        f["server.js"] = ('const http = require("http");\nconst { version } = require("./package.json");\n\nfunction handler(req, res) {\n  if (req.url === "/version") {\n    res.setHeader("content-type", "application/json");\n'
+                          '    return res.end(JSON.stringify({ name: "' + name + '", version }));\n  }\n  res.setHeader("content-type", "text/html");\n  res.end("<h1>' + name + '</h1><p>v" + version + "</p>");\n}\n\n'
+                          'const server = http.createServer(handler);\nmodule.exports = { server };\n\nif (require.main === module) {\n  if (process.argv.includes("--version")) { console.log(version); process.exit(0); }\n'
+                          '  if (process.argv.includes("--help")) {\n    console.log("' + name + ': ' + about.replace('"', "'") + '\\nnpm run dev      serve on $PORT (default ' + str(port) + ')\\nnpm test         run the tests\\nnpm run version  print the version\\nnpm run update   pull and install\\n/version         the running version as JSON");\n    process.exit(0);\n  }\n'
+                          '  const port = Number(process.env.PORT || ' + str(port) + ');\n  server.listen(port, process.env.HOST || "0.0.0.0", () => console.log("' + name + ' on " + port));\n}\n')
+        f["test/server.test.js"] = ('const test = require("node:test");\nconst assert = require("node:assert");\nconst { server } = require("../server.js");\nconst { version } = require("../package.json");\n\n'
+                                    'test("/version answers the package version", async () => {\n  await new Promise((r) => server.listen(0, "127.0.0.1", r));\n  const res = await fetch("http://127.0.0.1:" + server.address().port + "/version");\n'
+                                    '  const body = await res.json();\n  server.close();\n  assert.strictEqual(body.version, version);\n});\n')
+    return f
+
+
+def cmd_new(a):
+    name = a.name
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        sys.exit("hyperbeam new: the name is lowercase letters, digits, - and _")
+    path = ROOT / name
+    if path.exists() or (MANIFESTS / f"{name}.toml").exists():
+        sys.exit(f"hyperbeam new: {name} already exists ({home_rel(path)})")
+    kind = "web" if a.web else "cli"
+    about = a.about or "(one line: what it is)"
+    port = free_port() if kind == "web" else None
+    for rel, text in new_files(name, kind, about, port).items():
+        f = path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"]):
+        subprocess.run(cmd, cwd=path, check=True, capture_output=True)
+    ensure_link(name, path)
+    subprocess.run(["git", "-c", "user.name=" + (git_out(path, "config", "user.name") or "hyperbeam"), "-c", "user.email=" + (git_out(path, "config", "user.email") or "noreply@hyperbeam.invalid"),
+                    "commit", "-q", "-m", f"Initial commit (hyperbeam new --{kind}): version, help, update and install built in"], cwd=path, check=True, capture_output=True)
+    man = f'path = "{home_rel(path)}"\n' + (f"port = {port}\n\n[[service]]\nname = \"dev\"\ncmd = \"npm run dev\"\n" if kind == "web" else "")
+    MANIFESTS.mkdir(parents=True, exist_ok=True)
+    (MANIFESTS / f"{name}.toml").write_text(man)
+    print(f"created {home_rel(path)} ({kind}): README, CLAUDE.md, docs/DECISIONS.md, manifest, a first commit; `hyperbeam {name} version|help|update|install|test` all work")
+    if MANIFESTS == HERE / "projects" and (HERE / ".git").exists():      # manifests are committed straight to hyperbeam's main
+        subprocess.run(["git", "-C", str(HERE), "add", str(MANIFESTS / f"{name}.toml")], capture_output=True)
+        c = subprocess.run(["git", "-C", str(HERE), "commit", "-q", "-m", f"Add {name} manifest", "--", str(MANIFESTS / f"{name}.toml")], capture_output=True, text=True)
+        if c.returncode == 0:
+            push = subprocess.run(["git", "-C", str(HERE), "push", "-q", "origin", "main"], capture_output=True, text=True, timeout=60)
+            print("manifest committed to hyperbeam's main" + ("" if push.returncode == 0 else f" (push failed: {push.stderr.strip()[:80]}: push it yourself)"))
+    install_shims()
+    if not a.no_open:
+        try:
+            open_project(name, path, load_manifests().get(name), ask_tty, print)
+            touch_opened(name)
+            print(f"opened: select {name} in the sidebar, or `hyperbeam {name}`")
+        except Exception as e:
+            print(f"(not opened: {e})")
     return 0
 
 
@@ -4175,6 +4370,7 @@ def project_info(name, rows=None, footer=True, alert=True):
     section("Vercel", [f"project {n}  (production URL: needs `vercel login`)" for n in vp])
     web = git_web_url(path)
     section("Git", [f"{web}  repo" if web else "", f"{homepage}  homepage (GitHub)" if homepage else ""])
+    section("Standard verbs (hyperbeam NAME VERB, or NAME VERB / hb VERB inside the session)", [verbs_summary(name, path)])
     section("Pull requests (yours, open)", [f"#{x['number']}  {x['title']}  {x['url']}" + (f"  [stale: {pr_age_days(x)} days old]" if pr_stale(x) else "") for x in open_prs(name, path)])
     section(".env", [f"{u}  {k} ({f})" for k, u, f in env_urls(path)])
     section("Extra ([links])", [f"{u}  {k}" for k, u in ((man or {}).get("links") or {}).items()])
@@ -4319,9 +4515,20 @@ def project_summary(name, path, st=None, prs=None):
     if nf:
         L.append(f"notes folder: {len(nf)}, latest {nf[-1].name}")
     try:
-        u = usage_line()
-        if u:
-            L.append(u)
+        L.append(verbs_summary(name, path))
+    except Exception:
+        pass
+    try:
+        rl = rate_limits()
+        if rl and rl.get("five_hour"):
+            L.append(usage_window_text(rl["five_hour"], "five_hour", rl.get("at"), short=True))
+            if rl.get("seven_day"):
+                L.append(usage_window_text(rl["seven_day"], "seven_day", rl.get("at"), short=True))
+        else:
+            L.append(usage_line())
+        big = [r for r in conversation_sizes(within=6 * 3600) if r[0] == name]
+        if big:
+            L.append(f"context: {fmt_tok(big[0][2])} per request" + (" (very long)" if big[0][2] >= cfg_get("context_warn") else ""))
     except Exception:
         pass
     return "\n".join(L)
@@ -4654,7 +4861,7 @@ class Menu(App):
         self.set_interval(600, self.fetch_repo)
         self.set_interval(60, self.recheck_running)
         self.set_interval(60, self.poll_prs)
-        self.set_interval(300, self.poll_usage)
+        self.set_interval(60, self.poll_usage)
         self.set_timer(4, self.poll_usage)
         self.set_timer(3, self.poll_prs)
         self.set_timer(2, self.recheck_running)
@@ -4710,21 +4917,19 @@ class Menu(App):
 
     def refresh_title(self):
         w = max(20, (self.query_one("#title", Static).size.width or 35) - 2)
-        extra = "update available (u)" if self.repo[0] == "behind" else getattr(self, "usage_text", "")
-        self.query_one("#title", Static).update(clip(("hyperbeam  " + extra).strip(), w))
+        usage = getattr(self, "usage_text", "")
+        text = "hyperbeam  update available (u)" if self.repo[0] == "behind" else (usage or "hyperbeam")          # the limit as claude.ai shows it; the name only when there is nothing else
+        self.query_one("#title", Static).update(clip(text, w))
 
     def poll_usage(self):
-        """The 5-hour window line for the title, read in a worker thread every 5 minutes."""
+        """The 5-hour limit for the title (what claude.ai shows, from the status line's file), read every minute in a worker thread."""
         def work():
             try:
-                line = usage_line()
-                nudge = usage_nudge()
+                line = usage_line(short=True)
             except Exception:
                 return
-            self.usage_text = (line.replace("5h window ends ", "5h ends ").replace(" requests", " req") if line else "")
+            self.usage_text = line
             self.call_from_thread(self.refresh_title)
-            if nudge:
-                self.say_from_thread(nudge)
         self.run_worker(work, thread=True, group="usage", exclusive=True)
         self.refresh_list()
 
@@ -5441,6 +5646,8 @@ def do_update(branch=None, yes=False):
 def cmd_update_finish(a):
     """The steps after the checkout, run by the new code: hooks, tmux config, menus, Claude panes."""
     print("hooks: " + (", ".join(install_hooks()) and "updated" or "already current"))
+    for m in hook_summary_for_update():
+        print(m)
     if tmux("source-file", "-q", str(HERE / "hyperbeam.conf"), check=False).returncode == 0 and tmux("has-session", check=False).returncode == 0:
         print("tmux: hyperbeam.conf reloaded")
     else:
@@ -5544,7 +5751,7 @@ def main():
     wc.set_defaults(f=cmd_wrapup)
     hk = sub.add_parser("_hooks", help="merge hyperbeam's Claude hooks (waiting state, the Bash guard) into ~/.claude/settings.json")
     hk.add_argument("--settings")
-    hk.set_defaults(f=lambda a: print("hooks updated: " + (", ".join(install_hooks(a.settings)) or "already installed")))
+    hk.set_defaults(f=lambda a: (print("hooks updated: " + (", ".join(install_hooks(a.settings)) or "already installed")), [print(m) for m in hook_summary_for_update()], 0)[2])
     af = sub.add_parser("align-facts", help="the facts ALIGN.md compares a project's docs against (visibility, docs layout, tests, ignores)")
     af.add_argument("path", nargs="?")
     af.set_defaults(f=cmd_align_facts)
@@ -5598,11 +5805,17 @@ def main():
     vf = sub.add_parser("verify", help="check what only your own accounts and machine can show (gh logins, hooks, lab, home permissions); prints PASS/FAIL/YOU with the exact command")
     vf.add_argument("what", nargs="?", choices=["all", "github", "hooks", "lab", "merge"], default="all")
     vf.set_defaults(f=cmd_verify)
+    nw = sub.add_parser("new", help="a new project that conforms from the first commit: README, CLAUDE.md, DECISIONS.md, manifest, and version/help/update/install built in")
+    nw.add_argument("name")
+    nw.add_argument("--cli", action="store_true", help="a Python (uv) command line tool (the default)")
+    nw.add_argument("--web", action="store_true", help="a Node web app with /version")
+    nw.add_argument("--about", help="one line: what it is")
+    nw.add_argument("--no-open", action="store_true", help="do not start its session")
+    nw.set_defaults(f=cmd_new)
     us = sub.add_parser("usage", help="what the 5-hour windows cost, from Claude Code's conversation files (plain script)")
     us.add_argument("--today", action="store_true")
     us.add_argument("--week", action="store_true")
     us.add_argument("--all", action="store_true")
-    us.add_argument("--set-limit", type=int, metavar="N", help="the number of requests per 5-hour window at which you hit the limit")
     us.set_defaults(f=cmd_usage)
     sh_ = sub.add_parser("shot", help="pictures of the sidebar at a given width, made in the lab and brought back to ~/.cache/hyperbeam-shots/")
     sh_.add_argument("--cols", type=int, default=35, help="menu width in columns (default 35)")

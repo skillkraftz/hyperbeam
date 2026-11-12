@@ -19,7 +19,7 @@ Compare the project's CLAUDE.md, README and docs/ against RULES.md **and against
 - **Tests**: how they run; which need Docker (those cannot run in the lab: propose listing them as an exception, with the reason), which need a browser
   or a GPU, which start servers (they must use a free port or the lab range `$LAB_PORT_MIN`-`$LAB_PORT_MAX`, never a project port 3100+).
 - **Stale docs**: the facts list `docs that may be stale` (commands and paths the README or CLAUDE.md mention that don't exist, docs older than the run setup). Check each and propose the fix or confirm it is a false alarm.
-- **Standard verbs**: the facts list which of install, update, test, version, help the project provides itself and which only have hyperbeam's default. Propose the smallest real addition where the default doesn't fit (a `version` script that prints the version, a real `update`, `--help`), as a change to the project.
+- **Standard verbs**: the facts list which of install, update, test, version, help the project provides itself and which only have hyperbeam's default. Propose the smallest real addition where the default doesn't fit (a `version` script that prints the version, a real `update`, `--help`), as a change to the project. Compare the project's own entry point with the standard: a CLI should answer `NAME --version`, `NAME help`, `NAME update`, `NAME install` itself; a web app `/version`. Where the default `update` is wrong for how the project is installed (an editable tool install is `uv tool install --editable ...`, not `uv sync`), propose a `[commands]` entry for the manifest or a real subcommand.
 - **Hygiene**: steno files ignored, `.hyperbeam` not committed, README matches how the project behaves now.
 
 ## 2. Propose, then wait

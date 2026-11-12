@@ -33,8 +33,8 @@ Works locally; the phone (SSH from Termux over Tailscale) attaches to the same s
 - State is in `~/.local/share/hyperbeam/` (per project: `projects/<name>-<hash>/`, linked into each project as `.hyperbeam`); settings in `~/.config/hyperbeam/config.toml`.
 
 ## Commands (details in the reference)
-`hyperbeam` (sidebar), `update`, `scan`, `open NAME`, `stop NAME`, `info`/`kk`, `list`, `phone`, `context [--size|--full]`, `report`, `align-facts`, `verify [merge]`, `shot [--cols 35]`, `usage`, `lab run|status|stop|log|digest|reset`, `tool NAME|--list|--test`.
-**`hyperbeam NAME VERB`**: the same verbs in every project: `install`, `update`, `test` (always in the lab), `version`, `help`, `restart`. A project's own script/Makefile target/manifest `[commands]` wins; otherwise hyperbeam derives a default from the lockfile (pnpm/npm/uv/pip/cargo). The sidebar's Update button runs `update` for the selected project, and **Merge runs the project's update by itself afterwards**: click Merge, nothing else.
+`hyperbeam` (sidebar), `update`, `scan`, `open NAME`, `stop NAME`, `info`/`kk`, `list`, `phone`, `context [--size|--full]`, `report`, `align-facts`, `verify [merge]`, `shot [--cols 35]`, `usage`, `new NAME --cli|--web`, `lab run|status|stop|log|digest|reset`, `tool NAME|--list|--test`.
+**`hyperbeam NAME VERB`**: the same verbs in every project: `install`, `update`, `test` (always in the lab), `version`, `help`, `restart`. A project's own script/Makefile target/manifest `[commands]` wins; otherwise hyperbeam derives a default from the lockfile (pnpm/npm/uv/pip/cargo). The sidebar's Update button runs `update` for the selected project, and **Merge runs the project's update by itself afterwards**: click Merge, nothing else. Inside a project's session `NAME VERB` and `hb VERB` do the same (`dotwork help`); `hyperbeam new` starts a project that already conforms.
 `lab run [--dir D] [--why TEXT] [--fresh] [--collect PATH] [--timeout S] [--] COMMAND` runs as the user `hblab` in a synced copy of the project (secrets and `.git` are not copied); options go before the command. The lab shares the machine's network: bind port 0 or `$LAB_PORT_MIN`-`$LAB_PORT_MAX`. `lab reset` is the user's, agents use `lab stop`.
 
 ## Testing
@@ -45,7 +45,8 @@ Blocks, with a message saying what to do instead: tmux kill commands aimed at th
 
 ## Reference: docs/REFERENCE.md sections
 - Conventions: the same verbs in every project
-- Usage (the 5-hour windows)
+- Usage (the numbers claude.ai shows)
+- Commands inside a session, and `hyperbeam new`
 - Data layout, .hyperbeam, RULES.md
 - Context: the repo is the memory
 - Align (projects follow the system)
