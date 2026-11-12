@@ -178,10 +178,16 @@ RULES = RULES + [
 CWD = ""         # the tool call's working directory (set by main)
 
 
+INSTALLED = os.path.expanduser("~/.local/lib/hyperbeam")      # the app the user runs: a clone of main that install.sh keeps current
+
+
 def is_worktree_dir(d):
-    """A folder of a git worktree: under ~/.cache/hyperbeam-work/, or with a .git *file* (a linked worktree), anywhere up its path."""
+    """A folder of a git worktree: under ~/.cache/hyperbeam-work/, or with a .git *file* (a linked worktree), anywhere up its path; or, once hyperbeam is
+    installed, any other checkout of hyperbeam itself (the dev folder ~/projects/hyperbeam): only the installed copy may run as the user."""
     d = os.path.realpath(d)
     if "/hyperbeam-work/" in d + "/":
+        return True
+    if os.path.isdir(INSTALLED) and d != os.path.realpath(INSTALLED) and os.path.isfile(os.path.join(d, "guard.py")) and os.path.isfile(os.path.join(d, "hyperbeam")):
         return True
     while d != "/":
         if os.path.isfile(os.path.join(d, ".git")):
@@ -225,10 +231,10 @@ def runs_worktree_script(cmd):
 
 RULES = RULES + [
     ("worktree-script-outside-lab", runs_worktree_script,
-     "BLOCKED by hyperbeam: a worktree's `hyperbeam` script must not run as the user: it uses the user's real state, tmux and config (running one "
+     "BLOCKED by hyperbeam: a worktree's or the dev folder's `hyperbeam` script must not run as the user: it uses the user's real state, tmux and config (running one "
      "once migrated the user's live state folder). Run it in the lab: `hyperbeam lab run --dir <worktree> -- uv run --quiet --script hyperbeam ...` "
      "(the lab copies the folder and runs it as hblab with its own home, tmux and display). Only `hyperbeam lab run ...` itself is allowed from a "
-     "worktree. Use the installed `hyperbeam` for read-only commands that don't change state, or ask the user."),
+     "worktree. The installed `hyperbeam` (~/.local/lib/hyperbeam, on PATH) is the one that runs as the user; or ask the user."),
 ]
 
 

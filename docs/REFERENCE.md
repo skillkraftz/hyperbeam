@@ -256,3 +256,8 @@ removes them from an already-running server's global environment. Verified on a 
 - pnpm 12 installs dependencies by itself on `pnpm dev`. Opening a project whose node_modules is missing therefore modifies it.
 - `claude "prompt"` starts an interactive session with that first prompt (`claude --help`); `-n` names it, `-c` continues, `-r` resumes.
 - Textual parses `[x]` in labels as markup: write shortcuts as `Open (o)`.
+
+## Install layout (installed app, dev folder)
+- **`bash install.sh`** (idempotent; run from any checkout, e.g. `bash ~/projects/hyperbeam/install.sh`): clones origin into `~/.local/lib/hyperbeam` (or fast-forwards it to `origin/main`), links `~/.local/bin/hyperbeam` and `~/.config/tmux/hyperbeam.conf` to it, and runs its `hyperbeam _hooks` (through `uv run --script`) so the guard hook in `~/.claude/settings.json` points at the installed `guard.py`. Overrides for tests: `HB_LIB`, `HB_BIN`, `HB_TMUXCONF`, `HB_ORIGIN`, `HB_SETTINGS`.
+- **`HERE`** (the script's real folder) is the installed copy: prompts, manifests (`projects/`), tools, lab scripts, `RULES.md`, `hyperbeam.conf`, `guard.py`. `update` / Merge fast-forward it (`do_update`, `repo_state`), manifests are committed and pushed to its main (the clone is always on main). A change is live after it is merged and `hyperbeam update` ran (Merge runs it).
+- **The project "hyperbeam"** is `~/projects/hyperbeam` (`known_path`; `HERE` only if that folder doesn't exist): the sidebar row, the home session's Claude and its state folder. Development there is on a branch from `origin/main`; the guard blocks running any other checkout's `hyperbeam` script as the user (`INSTALLED` in guard.py; before the install exists the old worktree rule applies).
