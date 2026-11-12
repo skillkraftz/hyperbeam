@@ -319,15 +319,21 @@ NEST_MESSAGE = ("BLOCKED by hyperbeam: that puts a lab command inside `hyperbeam
 SETUP_SCRIPT = re.compile(r"(^|/)(setup|remove|podman-setup)\.sh$")
 
 
+def command_head(toks, keep_sudo=False):
+    """toks without leading VAR=x words, wrappers (sudo, env, ...) and options; keep_sudo stops at a `sudo`."""
+    toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
+    while toks and not (keep_sudo and toks[0] == "sudo") and (toks[0] in WRAPPERS or toks[0].startswith("-")):
+        toks = toks[1:]
+    return toks
+
+
 def runs_lab_setup(cmd):
     """Running lab/setup.sh, remove.sh or podman-setup.sh (directly, with bash/sh, under sudo). Reading them (cat, grep) is fine."""
     for toks in split_commands(cmd) or [cmd.split()]:
-        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-        while toks and (toks[0] in WRAPPERS or toks[0].startswith("-")):
-            toks = toks[1:]
+        toks = command_head(toks)
         if toks and os.path.basename(toks[0]) in SHELLS:
             toks = [t for t in toks[1:] if not t.startswith("-")]
-        if toks and SETUP_SCRIPT.search(toks[0]) and "lab" in toks[0].split("/")[-2:-1] + [""]:
+        if toks and SETUP_SCRIPT.search(toks[0]) and "lab" in toks[0].split("/")[-2:-1]:
             return True
     return False
 
@@ -335,9 +341,7 @@ def runs_lab_setup(cmd):
 def runs_sudo(cmd):
     """Any sudo except `sudo -n -l` (listing the rules). Agents have no sudo: the lab already runs things as hblab."""
     for toks in split_commands(cmd) or [cmd.split()]:
-        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-        while toks and toks[0] != "sudo" and (toks[0] in WRAPPERS or toks[0].startswith("-")):
-            toks = toks[1:]
+        toks = command_head(toks, keep_sudo=True)
         if toks and os.path.basename(toks[0]) == "sudo" and not (toks[1:3] == ["-n", "-l"] or toks[1:2] in (["-nl"], ["-ln"])):
             return True
     return False

@@ -2,7 +2,7 @@
 id: 2026-11-12-manager-session-is-home
 status: implemented
 prs: [45]
-topic: sidebar
+topic: ui
 ---
 # The hyperbeam session is home: first in the list, where Stop returns to, width kept on resize
 

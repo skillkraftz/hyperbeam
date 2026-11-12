@@ -7,7 +7,7 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - stenographr: paused in its own repo. The integration contract is `HB_CLAUDE_PANE` (the tmux pane id of a session's Claude pane). Later, a Dictate toggle.
 - Polish phase.
 - Prompt files as skills, exportable to claude.ai.
-- Sidebar redesign, next round (docs/UI.md, "Redesign directions that remain"): one status area, a half-height Project panel, the phone at keyboard height.
+- Sidebar redesign, next round (docs/UI.md, "Redesign directions that remain"): one status area, a half-height Project panel, the phone at keyboard height; on resize the sidebar keeps a fixed `menu_width` in columns (PR #45), the user has not said whether proportional is wanted.
 - Compact local context, next step (the CLAUDE.md trim is done, PR #27): trim the other projects' CLAUDE.md the same way (dotwork 13 KB); generated per-project `.hyperbeam/MAP.md` (file map, recent changes, open PR) so a session reads one file.
 - Merge-time docs gate (stale docs: ask Claude to update / merge anyway), "Mark docs reviewed" snooze for the stale-docs note, a Promote prompt that rewrites a settled prototype's README for an end user.
 - Docker in the lab: works for single containers and host-network compose (docs/PODMAN.md); compose's own networks need `sudo loginctl enable-linger hblab` (untested) when a project needs them.
