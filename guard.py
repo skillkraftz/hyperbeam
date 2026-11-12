@@ -304,11 +304,57 @@ def deletes_dirty_worktree(cmd):
     return False
 
 
+def nests_lab(cmd):
+    """A `hyperbeam lab run` whose command is itself a lab command (`tool`, `lab`, `shot`, `NAME test`): that runs the lab inside the lab, where hblab has no sudo."""
+    for m in re.finditer(r"hyperbeam\S*\s+lab\s+run\b(.*)", cmd, re.S):
+        if re.search(r"\bhyperbeam\S*\s+(tool|lab|shot)\b|\bhyperbeam\S*\s+(?!lab\b)\S+\s+test\b", m.group(1)):
+            return True
+    return False
+
+
+NEST_MESSAGE = ("BLOCKED by hyperbeam: that puts a lab command inside `hyperbeam lab run`. `hyperbeam tool ...`, `hyperbeam shot` and `hyperbeam NAME test` already run in the lab "
+                "by themselves; inside it they fail ('sudo may not run commands as hblab'), which looks like a broken setup and is not one. Run the command directly, "
+                "without `hyperbeam lab run`. Nothing on the machine needs changing.")
+
+SETUP_SCRIPT = re.compile(r"(^|/)(setup|remove|podman-setup)\.sh$")
+
+
+def runs_lab_setup(cmd):
+    """Running lab/setup.sh, remove.sh or podman-setup.sh (directly, with bash/sh, under sudo). Reading them (cat, grep) is fine."""
+    for toks in split_commands(cmd) or [cmd.split()]:
+        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
+        while toks and (toks[0] in WRAPPERS or toks[0].startswith("-")):
+            toks = toks[1:]
+        if toks and os.path.basename(toks[0]) in SHELLS:
+            toks = [t for t in toks[1:] if not t.startswith("-")]
+        if toks and SETUP_SCRIPT.search(toks[0]) and "lab" in toks[0].split("/")[-2:-1] + [""]:
+            return True
+    return False
+
+
+def runs_sudo(cmd):
+    """Any sudo except `sudo -n -l` (listing the rules). Agents have no sudo: the lab already runs things as hblab."""
+    for toks in split_commands(cmd) or [cmd.split()]:
+        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
+        while toks and toks[0] != "sudo" and (toks[0] in WRAPPERS or toks[0].startswith("-")):
+            toks = toks[1:]
+        if toks and os.path.basename(toks[0]) == "sudo" and not (toks[1:3] == ["-n", "-l"] or toks[1:2] in (["-nl"], ["-ln"])):
+            return True
+    return False
+
+
 RULES = RULES + [
     ("lab-reset", runs_lab_reset,
      "BLOCKED by hyperbeam: `hyperbeam lab reset` (forced or not) is for the user only. The lab is shared: reset kills what other projects have running "
      "(it once killed another project's e2e suite). To stop your own runs use `hyperbeam lab stop` (it touches only this project's runs). To see what is "
      "running: `hyperbeam lab status`. If a reset is really needed, ask the user."),
+    ("lab-setup", runs_lab_setup,
+     "BLOCKED by hyperbeam: lab/setup.sh, remove.sh and podman-setup.sh are for the user only (they change /etc, the disk image, the hblab user). If the lab fails, "
+     "check read-only (`hyperbeam lab status`, `id hblab`, `df /srv/hblab`, the last lines of ~/.local/share/hyperbeam/lab-runs.jsonl), report what you find and "
+     "ask the user. An error message is not a reason to change the lab."),
+    ("sudo", runs_sudo,
+     "BLOCKED by hyperbeam: agents don't use sudo (only `sudo -n -l`, to list rules). Tests and tools run as hblab through `hyperbeam lab run`, `hyperbeam tool` and "
+     "`hyperbeam NAME test`. If something really needs root, say what and why, and ask the user to run it."),
     ("worktree-force-remove", force_removes_worktree,
      "BLOCKED by hyperbeam: `git worktree remove --force` throws away uncommitted work (it was lost once). Commit or stash first, push the branch, then "
      "`git worktree remove <path>` without --force: git itself refuses if something is uncommitted."),
@@ -319,7 +365,9 @@ RULES = RULES + [
 
 
 def check(cmd):
-    """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at."""
+    """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at (except for nesting)."""
+    if nests_lab(cmd):
+        return NEST_MESSAGE
     cmd = outside_lab(cmd)
     for name, test, message in RULES:
         if test(cmd):

@@ -2154,8 +2154,10 @@ def cmd_sidebar(a):
 
 # ---------- the lab: agent testing runs as the user `hblab`, whose home is a disk image (see lab/setup.sh) ----------
 LAB_USER, LAB_HOME, LAB_DISPLAY = "hblab", Path("/srv/hblab"), ":99"
-LAB_SETUP = (f"The lab is not set up yet. Read {HERE}/lab/setup.sh, then run it once:  sudo bash {HERE}/lab/setup.sh\n"
-             "(it creates the user hblab, a 10G disk image mounted at /srv/hblab, and a sudo rule that lets you run commands as hblab only).")
+LAB_USERS_OWN = "The lab's setup (lab/setup.sh, remove.sh, podman-setup.sh, the sudoers rule, the disk image) is the user's: report this, and don't run or suggest running them."
+LAB_SETUP = f"The lab user {LAB_USER} does not exist on this machine. {LAB_USERS_OWN}"
+LAB_NESTED = ("Already inside the lab (HB_LAB=1): run the command directly. `hyperbeam tool` and `hyperbeam NAME test` run in the lab by themselves; "
+              "a lab run inside the lab fails (hblab has no sudo). Nothing on the machine needs changing.")
 
 
 TOOLS_SRC = Path(os.environ.get("HB_TOOLS_SRC") or HERE / "tools")       # the tools folder (HB_TOOLS_SRC: tests)
@@ -2632,10 +2634,10 @@ def verify_checks(which="all"):
     if which in ("all", "lab"):
         msg = lab_ready()
         if msg:
-            add("FAIL", "lab: " + msg.splitlines()[0], "sudo bash " + str(HERE / "lab/setup.sh"))
+            add("FAIL", "lab: " + msg.splitlines()[0], "(the user runs this, never an agent) sudo bash " + str(HERE / "lab/setup.sh"))
         else:
             ps = subprocess.run(lab_sudo("true"), capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
-            add("PASS" if ps else "FAIL", "lab: runs commands as hblab" if ps else "lab: sudo as hblab does not work", "" if ps else "sudo bash " + str(HERE / "lab/setup.sh"))
+            add("PASS" if ps else "FAIL", "lab: runs commands as hblab" if ps else "lab: sudo as hblab does not work", "" if ps else "(the user runs this, never an agent) sudo bash " + str(HERE / "lab/setup.sh"))
             u = shutil.disk_usage(LAB_HOME)
             add("PASS" if u.free > 2 ** 30 else "FAIL", f"lab: disk {u.used / 2**30:.1f} of {u.total / 2**30:.1f} GB used", "" if u.free > 2 ** 30 else "hyperbeam lab status")
         mode = Path.home().stat().st_mode & 0o777
@@ -2644,7 +2646,7 @@ def verify_checks(which="all"):
         else:
             add("PASS", f"{home_rel(Path.home())} is mode {mode:o}: the lab user can't read your home")
         add("PASS" if shutil.which("podman") else "YOU", "podman " + ("is installed" if shutil.which("podman") else "is not installed: Docker-based tests can't run in the lab yet (docs/PODMAN.md)"),
-            "" if shutil.which("podman") else "sudo bash " + str(HERE / "lab/podman-setup.sh"))
+            "" if shutil.which("podman") else "(the user runs this, never an agent) sudo bash " + str(HERE / "lab/podman-setup.sh"))
     return out
 
 
@@ -3495,15 +3497,17 @@ def cmd_new(a):
 
 
 def lab_ready():
-    """None if the lab works, else the reason it doesn't (and what to do)."""
+    """None if the lab works, else the reason it doesn't. States facts only: the lab's setup is the user's, no message tells anyone to run it."""
+    if os.environ.get("HB_LAB"):
+        return LAB_NESTED
     try:
         pwd.getpwnam(LAB_USER)
     except KeyError:
         return LAB_SETUP
     if not os.path.ismount(LAB_HOME):
-        return f"The lab user exists but {LAB_HOME} is not mounted. Try: sudo mount {LAB_HOME}  (or run {HERE}/lab/setup.sh again)."
+        return f"The lab user exists but {LAB_HOME} is not mounted. {LAB_USERS_OWN}"
     if subprocess.run(["sudo", "-n", "-u", LAB_USER, "true"], capture_output=True, stdin=subprocess.DEVNULL).returncode:
-        return f"sudo may not run commands as {LAB_USER} without a password: run {HERE}/lab/setup.sh again (it writes /etc/sudoers.d/hyperbeam-lab)."
+        return f"`sudo -n -u {LAB_USER} true` failed from this process. If you are inside a lab run this is expected (no nesting); otherwise {LAB_USERS_OWN}"
     return None
 
 
