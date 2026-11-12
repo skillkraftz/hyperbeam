@@ -45,6 +45,8 @@ If a manifest already exists, change only what is wrong and commit it the same w
    `compose.yml`, document the start order...). Do not edit the project's source files yourself.
 3. Anything you could not determine or could not get running.
 
+If the project needs a non-default way to install, update, test or restart (the defaults come from its lockfile), add a `[commands]` table to the manifest (`install = "..."`, `update = "..."`, `test = "..."`); `hyperbeam NAME help` shows what each verb will run.
+
 ## 4. Then align the project to hyperbeam
 After the manifest step (a configured project: after you checked the manifest is still right), follow ALIGN.md, which hyperbeam appends below this
 file. Do not start it before the manifest is settled, and do not change the project before the user approves the alignment proposal.
