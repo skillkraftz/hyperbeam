@@ -30,7 +30,7 @@ Works locally; the phone (SSH from Termux over Tailscale) attaches to the same s
 ## Where things are
 - `install.sh`: installs hyperbeam (see Rules). `hyperbeam`: the whole app, one uv script (Textual menu, CLI commands, lab, verify, shot, digest, tools). `guard.py`: the Claude Bash hook. `hyperbeam.conf`: tmux keys and hooks.
 - Prompts injected into Claude: `ONBOARDING.md`, `ALIGN.md`, `RECOVER.md`, `WRAPUP.md`, `TOOLS_PROPOSE.md`, `REVIEW.md`, `START.md`. `projects/<name>.toml`: a project's manifest (format in the reference).
-- `lab/` (setup, remove, podman, rsync shell), `tools/` (tested scripts, listed in `TOOLS.md`), `docs/` (`SYSTEM.md` the one-page map of how it all fits, `decisions/` the why, one file per decision, `DECISIONS.md` their generated index, `REFERENCE.md` the details, `UI.md`, `PODMAN.md`), `IDEAS.md` the roadmap, `README.md` the why and the goals.
+- `lab/` (setup, remove, podman, rsync shell), `tools/` (tested scripts, listed in `TOOLS.md`), `docs/` (`SYSTEM.md` the one-page map of how it all fits, `DESIGN.md` the same walked through part by part (read this to check the design), `decisions/` the why, one file per decision, `DECISIONS.md` their generated index, `REFERENCE.md` the details, `UI.md`, `PODMAN.md`), `IDEAS.md` the roadmap, `README.md` the why and the goals.
 - State is in `~/.local/share/hyperbeam/` (per project: `projects/<name>-<hash>/`, linked into each project as `.hyperbeam`); settings in `~/.config/hyperbeam/config.toml`.
 
 ## Commands (details in the reference)
