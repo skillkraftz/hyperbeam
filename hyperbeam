@@ -1760,7 +1760,6 @@ def ensure_menu():
 def default_layout(sess, path, envargs):
     """New session with window `work`: Claude on the left (60%), a shell on the right (40%). Returns [(pane id, role, cwd)]."""
     claude = new_pane(["new-session", "-d", "-s", sess, "-n", "work", "-x", "200", "-y", "50", "-c", str(path), *envargs])
-    tmux("set-option", "-t", f"={sess}", "detach-on-destroy", "off", check=False)   # if it ends any way, its clients move to another session
     publish_claude_pane(sess, claude)
     shell = new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(path)])
     tmux("select-pane", "-t", claude)
@@ -1774,7 +1773,6 @@ def restore_layout(sess, path, lay, envargs):
         cwds = [p["cwd"] if Path(p["cwd"]).is_dir() else str(path) for p in w["panes"]]
         if i == 0:
             first = new_pane(["new-session", "-d", "-s", sess, "-n", w["name"], "-x", "200", "-y", "50", "-c", cwds[0], *envargs])
-            tmux("set-option", "-t", f"={sess}", "detach-on-destroy", "off", check=False)
         else:
             first = new_pane(["new-window", "-d", "-t", f"{sess}:", "-n", w["name"], "-c", cwds[0]])
         ids = [first]
@@ -1824,6 +1822,7 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
             say(f"{name}: could not restore the layout ({(e.stderr or '').strip()}); using the default one")
     if plan is None:
         plan = default_layout(sess, path, envargs)
+    tmux("set-option", "-t", f"={sess}", "detach-on-destroy", "off", check=False)   # if it ends any way, its clients move to another session
     tag_session(sess)
     claude_panes = [p for p in plan if p[1] == "claude"] or plan[:1]
     first_claude = claude_panes[0][0]
@@ -1919,8 +1918,7 @@ def stop_project(name, man, say=print):
     if session_exists(sess):
         save_layout(name, clean=True)
         clear_status(name)
-        for line in tmux("list-clients", "-F", "#{client_tty} #{client_session}", check=False).stdout.splitlines():
-            tty, _, cs = line.partition(" ")
+        for tty, cs in client_sessions().items():
             if cs == sess:                                  # whoever is looking at it goes to the manager session, not away (a detached client closes kitty's right split)
                 tmux("switch-client", "-c", tty, "-t", home_target(tty), check=False)
         tmux("kill-session", "-t", f"={sess}", check=False)
@@ -2007,6 +2005,11 @@ def sidebar_client():
     """The tmux client of the sidebar's right side (its tty, recorded by `hyperbeam _right` before it execs `tmux attach`), '' if it isn't attached."""
     tty = sidebar_read().get("tty")
     return tty if tty and tty in tmux("list-clients", "-F", "#{client_tty}", check=False).stdout.split() else ""
+
+
+def client_sessions():
+    """{client tty: the session it looks at} for every tmux client."""
+    return dict(l.split(" ", 1) for l in tmux("list-clients", "-F", "#{client_tty} #{client_session}", check=False).stdout.splitlines() if " " in l)
 
 
 def home_target(client):
@@ -2590,6 +2593,10 @@ def cmd_tool(a):
 
 
 # ---------- verify: one command that checks what only the user's own accounts and machine can show ----------
+def user_runs(script):
+    return f"(the user runs this, never an agent) sudo bash {HERE / 'lab' / script}"
+
+
 def verify_checks(which="all"):
     """[(status, text, how)] with status PASS / FAIL / YOU (only the user can do it; `how` is the exact command). Run as the user."""
     out = []
@@ -2636,10 +2643,10 @@ def verify_checks(which="all"):
     if which in ("all", "lab"):
         msg = lab_ready()
         if msg:
-            add("FAIL", "lab: " + msg.splitlines()[0], "(the user runs this, never an agent) sudo bash " + str(HERE / "lab/setup.sh"))
+            add("FAIL", "lab: " + msg.splitlines()[0], user_runs("setup.sh"))
         else:
             ps = subprocess.run(lab_sudo("true"), capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
-            add("PASS" if ps else "FAIL", "lab: runs commands as hblab" if ps else "lab: sudo as hblab does not work", "" if ps else "(the user runs this, never an agent) sudo bash " + str(HERE / "lab/setup.sh"))
+            add("PASS" if ps else "FAIL", "lab: runs commands as hblab" if ps else "lab: sudo as hblab does not work", "" if ps else user_runs("setup.sh"))
             u = shutil.disk_usage(LAB_HOME)
             add("PASS" if u.free > 2 ** 30 else "FAIL", f"lab: disk {u.used / 2**30:.1f} of {u.total / 2**30:.1f} GB used", "" if u.free > 2 ** 30 else "hyperbeam lab status")
         mode = Path.home().stat().st_mode & 0o777
@@ -2648,7 +2655,7 @@ def verify_checks(which="all"):
         else:
             add("PASS", f"{home_rel(Path.home())} is mode {mode:o}: the lab user can't read your home")
         add("PASS" if shutil.which("podman") else "YOU", "podman " + ("is installed" if shutil.which("podman") else "is not installed: Docker-based tests can't run in the lab yet (docs/PODMAN.md)"),
-            "" if shutil.which("podman") else "(the user runs this, never an agent) sudo bash " + str(HERE / "lab/podman-setup.sh"))
+            "" if shutil.which("podman") else user_runs("podman-setup.sh"))
     return out
 
 
@@ -5454,8 +5461,7 @@ class Menu(App):
             if keep and keep["name"] in names:
                 ol.highlighted = names.index(keep["name"])
             else:                                           # fresh list: the project the main area shows, else the manager session (row 0)
-                shown = next((l.split(" ", 1)[1] for l in tmux("list-clients", "-F", "#{client_tty} #{client_session}", check=False).stdout.splitlines()
-                              if l.split(" ", 1)[0] == sidebar_read().get("tty") and " " in l), "")
+                shown = client_sessions().get(sidebar_read().get("tty"), "")
                 ol.highlighted = next((i for i, p in enumerate(rows) if sanitize(p["name"]) == shown), 0)
         self.show_why()
 
