@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, asyncio, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, tomllib, types
+import argparse, asyncio, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, tomllib, types
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -68,6 +68,7 @@ CFG = load_cfg()
 ROOT = Path(os.path.expanduser(os.environ.get("HB_PROJECTS_DIR") or CFG.get("projects_dir", "~/projects")))
 MANIFESTS = Path(os.environ.get("HB_MANIFESTS", HERE / "projects"))   # (override is for tests)
 ACCOUNTS = {a.lower() for a in CFG["accounts"]}
+IGNORE_OWNERS = {o.lower() for o in CFG.get("ignore_owners", [])}        # GitHub owners hyperbeam leaves alone: no PR badge, no Merge, not in `verify`
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "hyperbeam"     # global files; per project: DATA_DIR/projects/<name>-<hash>/
 STATE_DIR = DATA_DIR
 OLD_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "hyperbeam"   # before the foundation PR; migrated once
@@ -2291,9 +2292,7 @@ def verify_checks(which="all"):
             prs = open_prs("hyperbeam", hp, force=True)
             err = (json.loads(pr_cache_file("hyperbeam", hp).read_text()).get("error") if pr_cache_file("hyperbeam", hp).exists() else "")
             add("FAIL" if err else "PASS", f"gh: listing your open PRs in {slug}" + (f" failed: {err}" if err else f" works ({len(prs)} open)"), "gh pr list -R " + slug if err else "")
-        add("YOU", "Merge (the one thing only you can test: it merges a real PR)",
-            "cd ~/projects/hyperbeam && git switch -c verify-merge-test origin/main && git commit --allow-empty -m 'verify merge' && git push -u origin verify-merge-test && gh pr create --fill --base main && git switch main\n"
-            "      then in the sidebar select hyperbeam, press Merge (m), answer Yes: the PR merges, the checkout stays on main and the magenta branch goes away")
+        add("YOU", "Merge has not been tested end to end (it merges a real PR; the throwaway PR is opened for you, you only click Merge)", "hyperbeam verify merge")
     if which in ("all", "hooks"):
         sf = Path(os.environ.get("HB_SETTINGS") or Path.home() / ".claude/settings.json")
         try:
@@ -2325,8 +2324,41 @@ def verify_checks(which="all"):
     return out
 
 
+def verify_merge():
+    """Open a throwaway PR in hyperbeam's own repo (an empty commit on a branch, pushed from a temporary clone so your checkout is untouched), so the
+    only thing left for the user is the Merge button. A PR from an earlier run that is still open is reused. -> [(status, text, how)]."""
+    path = known_path("hyperbeam")
+    slug = github_slug(path)
+    if not slug or not gh_account(slug.split("/")[0]):
+        return [("FAIL", "hyperbeam has no GitHub origin, or no gh login for its owner", "gh auth login")]
+    left = [x for x in open_prs("hyperbeam", path, force=True) if x["branch"].startswith("verify-merge-test")]
+    if left:
+        return [("YOU", f"a throwaway PR is already open: #{left[0]['number']} {left[0]['url']}", "in the sidebar: select hyperbeam, press Merge (m), answer Yes. The PR merges, the checkout stays on main, the magenta branch goes away")]
+    url = git_out(path, "config", "--get", "remote.origin.url")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="verify-merge.", dir=str(DATA_DIR)))
+    br = "verify-merge-test-" + time.strftime("%Y%m%d-%H%M%S")
+    try:
+        for cmd in (["git", "clone", "-q", "--depth", "1", url, str(tmp / "r")], ["git", "-C", str(tmp / "r"), "checkout", "-q", "-b", br],
+                    ["git", "-C", str(tmp / "r"), "-c", "user.name=hyperbeam verify", "-c", "user.email=noreply@hyperbeam.invalid", "commit", "-q", "--allow-empty", "-m", "verify merge (throwaway)"],
+                    ["git", "-C", str(tmp / "r"), "push", "-q", "-u", "origin", br]):
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+            if r.returncode:
+                return [("FAIL", f"could not prepare the throwaway branch: {(r.stderr or r.stdout).strip()[-160:]}", "")]
+        rc, out, err = gh_run(slug, "pr", "create", "--head", br, "--base", default_branch(path), "--title", "verify merge (throwaway)",
+                              "--body", "Opened by `hyperbeam verify merge`. Press Merge in the sidebar; nothing else changes.")
+        if rc:
+            subprocess.run(["git", "-C", str(tmp / "r"), "push", "-q", "origin", "--delete", br], capture_output=True)
+            return [("FAIL", f"could not open the PR: {(err or out).strip()[-160:]}", "")]
+        open_prs("hyperbeam", path, force=True)
+        return [("PASS", f"opened a throwaway PR: {out.strip().splitlines()[-1] if out.strip() else br}"),
+                ("YOU", "click Merge", "in the sidebar: select hyperbeam (its branch is magenta within a minute), press Merge (m), answer Yes")]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def cmd_verify(a):
-    rows = verify_checks(a.what)
+    rows = verify_merge() if a.what == "merge" else verify_checks(a.what)
     for st, text, how in rows:
         print(f"{st:<5} {text}")
         if how and st != "PASS":
@@ -2584,6 +2616,38 @@ def lab_xvfb():
     return False
 
 
+# podman and docker for lab runs (rootless podman, see docs/PODMAN.md). Ubuntu's AppArmor profile for pasta (podman's network helper) only lets it open
+# network namespaces under /tmp, so podman gets one runtime dir there, `/tmp/hblab-podman`, for all runs (podman records its runtime dir in its state, so a per-run dir breaks the second run). `docker` is a shim to a podman socket in that dir,
+# so `docker compose up` works unchanged and can never reach the user's real Docker.
+LAB_SHIM_PODMAN = """#!/bin/sh
+# hyperbeam-lab-shim v2: podman with a runtime dir under /tmp
+d=/tmp/hblab-podman
+mkdir -p -m 700 "$d"
+XDG_RUNTIME_DIR="$d" exec /usr/bin/podman "$@"
+"""
+LAB_SHIM_DOCKER = """#!/bin/sh
+# hyperbeam-lab-shim v2: docker through a podman socket
+d=/tmp/hblab-podman
+mkdir -p -m 700 "$d"
+if [ ! -S "$d/podman.sock" ]; then
+  (XDG_RUNTIME_DIR="$d" setsid /usr/bin/podman system service --time=0 "unix://$d/podman.sock" >/dev/null 2>&1 &)
+  i=0; while [ ! -S "$d/podman.sock" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done
+fi
+DOCKER_HOST="unix://$d/podman.sock" exec /usr/bin/docker "$@"
+"""
+
+
+def lab_ensure_shims():
+    """podman/docker shims in hblab's ~/.local/bin (first on PATH in a lab run); written once, only when podman is installed."""
+    if not shutil.which("podman"):
+        return
+    for name, body in (("podman", LAB_SHIM_PODMAN), ("docker", LAB_SHIM_DOCKER)):
+        f = f"{LAB_HOME}/.local/bin/{name}"
+        have = subprocess.run(lab_sudo("grep", "-qF", body.splitlines()[1], f), capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
+        if not have:
+            subprocess.run(lab_sudo("sh", "-c", f'mkdir -p "$(dirname "$1")" && cat > "$1" && chmod 755 "$1"', "_", f), input=body.encode(), capture_output=True)
+
+
 def cmd_lab(a):
     """hyperbeam lab run|reset|status. The code goes in as a copy; everything runs as hblab (it can't signal the user's processes)."""
     if a.action == "log":
@@ -2682,6 +2746,7 @@ def cmd_lab(a):
     if sync.returncode:
         print(f"lab: copying {src} failed:\n{sync.stderr.strip()[-400:]}", file=sys.stderr)
         return 1
+    lab_ensure_shims()
     if (TOOLS_SRC).is_dir():                   # tools/ goes in with every run: `hyperbeam tool NAME` (or $HB_TOOLS/NAME/NAME) works in the lab
         subprocess.run(["rsync", "-a", "--delete", "-e", str(HERE / "lab/sudo-hblab"), f"{TOOLS_SRC}/", f"lab:{LAB_HOME}/tools/"], capture_output=True, stdin=subprocess.DEVNULL)
     cache = f"{LAB_HOME}/cache"
@@ -3000,7 +3065,7 @@ def recent_history(path):
     return "\n".join(lines)
 
 
-def context_bundle(name, path=None):
+def context_bundle(name, path=None, full=False, parts_only=False):
     """One text to paste into a chat: header, RULES.md, the project's CLAUDE.md, docs/DECISIONS.md, README, hyperbeam manifest, recent history."""
     path = Path(path) if path else known_path(name)
 
@@ -3014,11 +3079,14 @@ def context_bundle(name, path=None):
     man = MANIFESTS / f"{name}.toml"
     parts = [("RULES.md", (HERE / "RULES.md").read_text().rstrip() if (HERE / "RULES.md").is_file() else None),
              ("CLAUDE.md", first("CLAUDE.md")),
+             *([("docs/REFERENCE.md", first("docs/REFERENCE.md"))] if full else []),
              ("docs/DECISIONS.md", first("docs/DECISIONS.md")),
              ("IDEAS.md", first("IDEAS.md")),
              (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
              (f"hyperbeam manifest (projects/{name}.toml)", man.read_text().rstrip() if man.is_file() else None),
              ("Recent history", recent_history(path) if path.is_dir() else None)]
+    if parts_only:
+        return parts
     out = [f"# Context for {name}", f"path: {home_rel(path)}", f"date: {time.strftime('%Y-%m-%d')}", "",
            "Paste this at the start of a chat. It is the project's own docs, current as of the date above."]
     for title, body in parts:
@@ -3045,8 +3113,8 @@ def deliver_text(text, label, remote):
     return f"{why}saved {n} lines: {home_rel(f)}"
 
 
-def copy_context(name, remote):
-    return deliver_text(context_bundle(name), f"{name}-context", remote)
+def copy_context(name, remote, full=False):
+    return deliver_text(context_bundle(name, full=full), f"{name}-context", remote)
 
 
 # ---------- Copy report: Claude's last message of the project's session ----------
@@ -3167,7 +3235,7 @@ def github_slug(path):
     """owner/repo of a project's origin if it is on GitHub (github.com or a github-<account> ssh alias), else None."""
     url = git_out(path, "config", "--get", "remote.origin.url") if (Path(path) / ".git").exists() else ""      # as written, not after url.*.insteadOf
     m = re.match(r"^(?:git@|ssh://git@|https://)(github\.com|github-[\w.-]+)[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url.strip())
-    return f"{m.group(2)}/{m.group(3)}" if m else None
+    return f"{m.group(2)}/{m.group(3)}" if m and m.group(2).lower() not in IGNORE_OWNERS else None
 
 
 _GH = {"accounts": None}
@@ -3319,10 +3387,17 @@ def cmd_context(a):
     name = a.project or os.environ.get("HB_PROJECT")
     if not name:
         sys.exit("hyperbeam context: no project (run it in a project session, or give a name)")
-    if a.print:
-        print(context_bundle(name), end="")
+    if a.size:
+        rows = [(t, len((b or "").encode()), len((b or "").encode()) // 4) for t, b in context_bundle(name, full=a.full, parts_only=True)]
+        print(f"{'part':<44}{'bytes':>9}{'~tokens':>9}")
+        for t, n, k in rows:
+            print(f"{t[:43]:<44}{n:>9}{k:>9}")
+        print(f"{'total':<44}{sum(r[1] for r in rows):>9}{sum(r[2] for r in rows):>9}   (tokens = bytes / 4, a rough guide; CLAUDE.md and RULES.md are what Claude loads at every session start)")
         return 0
-    print(f"{name}: {copy_context(name, is_remote())}")
+    if a.print:
+        print(context_bundle(name, full=a.full), end="")
+        return 0
+    print(f"{name}: {copy_context(name, is_remote(), a.full)}")
     return 0
 
 
@@ -3870,9 +3945,9 @@ class Confirm(ModalScreen):
     BINDINGS = [Binding("y,enter", "answer(True)", "Yes"), Binding("n,escape", "answer(False)", "No")]
     DEFAULT_CSS = """
     Confirm { align: center middle; }
-    Confirm > Vertical { width: 64; height: auto; border: round $accent; background: $surface; padding: 1 2; }
-    Confirm Horizontal { height: 1; margin-top: 1; }
-    Confirm Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 10; }
+    Confirm > Vertical { width: 100%; max-width: 64; height: auto; max-height: 100%; border: round $accent; background: $surface; padding: 1 1; }
+    Confirm #cbtns { height: auto; margin-top: 1; }
+    Confirm Button { width: 100%; height: 1 !important; border: none !important; }
     """
 
     def __init__(self, text):
@@ -3882,7 +3957,7 @@ class Confirm(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static(self.text, markup=False)
-            with Horizontal():
+            with Vertical(id="cbtns"):
                 yield Button("Yes (y)", id="yes")
                 yield Button("No (n)", id="no")
 
@@ -3898,10 +3973,10 @@ class Choice(ModalScreen):
     """Several buttons; `options` is [(id, label, key)]. The last one is also Escape."""
     DEFAULT_CSS = """
     Choice { align: center middle; }
-    Choice > Vertical { width: 84; height: auto; max-height: 90%; border: round $accent; background: $surface; padding: 1 2; }
+    Choice > Vertical { width: 100%; max-width: 84; height: auto; max-height: 100%; border: round $accent; background: $surface; padding: 1 1; }
     Choice VerticalScroll { height: auto; max-height: 24; }
-    Choice Horizontal { height: 1; margin-top: 1; }
-    Choice Button { height: 1 !important; border: none !important; margin-right: 2; min-width: 10; }
+    Choice #cbtns { height: auto; margin-top: 1; }
+    Choice Button { width: 100%; height: 1 !important; border: none !important; }
     """
 
     def __init__(self, text, options, enter=None):
@@ -3923,7 +3998,7 @@ class Choice(ModalScreen):
         with Vertical():
             with VerticalScroll():
                 yield Static(self.text, markup=False)
-            with Horizontal():
+            with Vertical(id="cbtns"):
                 for oid, label, _ in self.options:
                     yield Button(label, id=f"c-{oid}")
 
@@ -4010,8 +4085,8 @@ class SettingsScreen(ModalScreen):
     SettingsScreen #wnote { height: 1; color: $text-muted; }
     SettingsScreen #close { height: 1 !important; border: none !important; }
     """
-    LABELS = [("open_mode", "open mode"), ("claude_model", "claude model"), ("claude_effort", "claude effort"),
-              ("menu_width", "menu width"), ("recent_days", "recent (days)"), ("on_problem", "on problem")]
+    LABELS = [("open_mode", "open mode"), ("claude_model", "model"), ("claude_effort", "effort"),
+              ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
 
     def __init__(self):
         super().__init__()
@@ -4047,7 +4122,7 @@ class SettingsScreen(ModalScreen):
 
     def show(self):
         for i, (key, label) in enumerate(self.LABELS):
-            self.query_one(f"#v-{key}", Static).update(f" {label:<14}{cfg_get(key)}")
+            self.query_one(f"#v-{key}", Static).update(f" {label:<11}{cfg_get(key)}")
             self.query_one(f"#row-{key}").set_class(i == self.sel, "sel")
 
     def change(self, key, step):
@@ -4927,6 +5002,8 @@ def main():
     cx = sub.add_parser("context", help="copy a context bundle (RULES, CLAUDE.md, DECISIONS, README, manifest, recent history) to paste into a chat; default project $HB_PROJECT")
     cx.add_argument("project", nargs="?")
     cx.add_argument("--print", action="store_true", help="print it instead of copying")
+    cx.add_argument("--size", action="store_true", help="show the size of each part (bytes, rough tokens) instead of the bundle")
+    cx.add_argument("--full", action="store_true", help="also include docs/REFERENCE.md (the long reference moved out of CLAUDE.md)")
     cx.set_defaults(f=cmd_context)
     mg = sub.add_parser("_migrate-config", help="copy an old repo config.toml's values to ~/.config/hyperbeam/config.toml (once)")
     mg.add_argument("legacy", nargs="?")
@@ -4966,7 +5043,7 @@ def main():
     tl.add_argument("args", nargs=argparse.REMAINDER)
     tl.set_defaults(f=cmd_tool)
     vf = sub.add_parser("verify", help="check what only your own accounts and machine can show (gh logins, hooks, lab, home permissions); prints PASS/FAIL/YOU with the exact command")
-    vf.add_argument("what", nargs="?", choices=["all", "github", "hooks", "lab"], default="all")
+    vf.add_argument("what", nargs="?", choices=["all", "github", "hooks", "lab", "merge"], default="all")
     vf.set_defaults(f=cmd_verify)
     sh_ = sub.add_parser("shot", help="pictures of the sidebar at a given width, made in the lab and brought back to ~/.cache/hyperbeam-shots/")
     sh_.add_argument("--cols", type=int, default=35, help="menu width in columns (default 35)")

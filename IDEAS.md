@@ -10,6 +10,6 @@
 - ~~Daily lab digest -> tool proposals at Done; TOOLS.md; flaky tests.~~ Done (PR #23). Later: tools the digest suggests for non-lab work, a weekly view.
 - Sidebar redesign for 35 columns and the phone (from docs/UI.md): modals that fit, Settings values visible, fewer buttons, a card-style Project screen.
 - Usage window: tokens per 5-hour window from the conversation files (`message.usage` + timestamps), the limit calibrated from past "Usage limit reached" events, a sidebar segment (`5h: ~62%, resets 3:10pm`) and a nudge to plan cleanup when few exchanges remain. Estimates only.
-- Compact local context: trim hyperbeam's CLAUDE.md (64 KB, ~16k tokens per session) to a short core with detail in docs/; generated per-project `.hyperbeam/MAP.md` (file map, recent changes, open PR) so a session reads one file.
+- Compact local context, next step (the CLAUDE.md trim is done, PR #26): trim the other projects' CLAUDE.md the same way (dotwork 13 KB); generated per-project `.hyperbeam/MAP.md` (file map, recent changes, open PR) so a session reads one file.
 - Merge-time docs gate (stale docs: ask Claude to update / merge anyway), Done never stopping a project whose Claude is working or waiting, "Mark docs reviewed" snooze for the stale-docs note, a Promote prompt that rewrites a settled prototype's README for an end user.
-- Docker in the lab: see docs/PODMAN.md.
+- Docker in the lab: works for single containers and host-network compose (docs/PODMAN.md); compose's own networks need `sudo loginctl enable-linger hblab` (untested) when a project needs them.
