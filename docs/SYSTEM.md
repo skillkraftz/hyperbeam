@@ -1,6 +1,6 @@
 # How hyperbeam works (the map)
 
-One page to check against what you meant. Details are in `docs/REFERENCE.md`; the why is in `docs/decisions/`.
+One page to check against what you meant. The walk through it, part by part, is `docs/DESIGN.md`; every detail is in `docs/REFERENCE.md`; the why is in `docs/decisions/`.
 Marked **[gap]** = known difference between what was intended and what is built. **[planned]** = not built yet (see the end).
 
 ## The picture
