@@ -16,10 +16,10 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - When a Claude session starts and ends beyond token cost: tie it to the work loop instead of conversation size.
 - README and screenshots rebuilt from the implemented decisions and the Done list (the condensing tool the decision records are meant for).
 - Exporting the parts: the machine keeps every record; a reference-carrying summary is what Claude reads when it needs context.
-- A Review button in the Project screen (today: `hyperbeam review`, and Done offers it after `review_after` merged PRs).
 - Swap a fresh plan-mode Claude (with a snapshot and Previous Claude) for the other propose-then-wait steps too (Onboard, Fix, wrap-up, tools): today they inject `/plan` into the running Claude, which keeps its history but depends on the session being idle.
 
 ## Done
+- ~~Every project in the review loop (count from onboarding), a Review button in the Project screen~~ Done (PR #51, decision review-every-project).
 - ~~Review loop: Copy report, a PR badge, a Merge button.~~ Done (PR #20).
 - ~~Project screen and drift detection.~~ Done (PR #22), kept simple: the polish phase will redesign the sidebar.
 - ~~README-staleness check.~~ Done (PR #24): commands, paths and age against the run setup. Later: version numbers and ports mentioned in the docs.

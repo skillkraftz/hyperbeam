@@ -5,6 +5,10 @@ project are at the bottom: the PRs with the files each changed, decision records
 recent history, and what the previous session last said; read README.md and docs/REFERENCE.md yourself when you need them). Fast work layers up: this is the pass that checks it as a whole
 and fixes it in **one** cleanup PR, so the next session starts from something simple and correct.
 
+**First review of a project:** when the facts say `Last review record: none`, there is no earlier review: the count started when hyperbeam onboarded the project,
+so this is its first pass. Be gentle with what was there before; look at the merged PRs and what they touched, and at whether the README and CLAUDE.md still
+match. Write the record `docs/reviews/` the same way (create the folder): from then on the project is counted from it.
+
 ## 1. Look (read-only), then propose
 Read the diff of what was merged (`git diff <since>..origin/main`, the files named below), the project's CLAUDE.md and README, and the decision records. Look for:
 - **Duplicated or grown code**: the same thing done twice, functions whose parameters keep growing, two mechanisms doing one job.
