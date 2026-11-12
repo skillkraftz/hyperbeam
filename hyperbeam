@@ -492,11 +492,15 @@ def pane_tail(target, n=50):
     return "\n".join(out[-n:])
 
 
+PLAN_FIRST = ("**Plan mode first.** If plan mode is not active, call EnterPlanMode before anything else: this step is planned by Opus, and nothing is changed "
+              "until the user approves your plan.\n\n")
+
+
 def write_prompt(sess, text):
     d = project_dir(session_project(sess)) / "prompts"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{sess}-{time.strftime('%Y%m%d-%H%M%S')}.md"
-    f.write_text(text)
+    f.write_text(PLAN_FIRST + text)
     f.chmod(0o600)
     return f
 
@@ -585,11 +589,17 @@ def inject_prompt(pane, f, add_dirs=()):
     if pane_command(pane) == "claude":
         send_line(pane, f"/plan Read {f} and follow it.")
         return "injected"
+    start_claude_with_prompt(pane, f, add_dirs)
+    return "started"
+
+
+def start_claude_with_prompt(pane, f, add_dirs=(), cont=True):
+    """Type the command that starts Claude in plan mode with the prompt file as its first message. cont: `claude --continue` (the last conversation of this
+    directory), falling back to a fresh one when there is none; otherwise always a fresh Claude."""
     dirs = "".join(f" --add-dir {shlex.quote(str(d))}" for d in add_dirs)
     arg = f' "$(cat {shlex.quote(str(f))})"{dirs}'
     base = claude_base(plan=True)
-    send_line(pane, f"{base} --continue{arg} || {base}{arg}")
-    return "started"
+    send_line(pane, f"{base} --continue{arg} || {base}{arg}" if cont else f"{base}{arg}")
 
 
 def send_line(target, text):
@@ -789,44 +799,121 @@ def review_facts(path, since):
     return "\n".join(L) + "\n"
 
 
+SNAPSHOT_CAP = 12000          # characters per part of the snapshot
+
+
+def review_snapshot(name, path):
+    """What a fresh Claude needs to not start blind, without the whole repo: CLAUDE.md, the decisions index, IDEAS.md, the last review, the recent history,
+    and what the previous session last said (read before the swap). README.md and docs/REFERENCE.md are left for it to read on demand."""
+    want = ("CLAUDE.md", "docs/DECISIONS.md", "IDEAS.md", "Last review", "Recent history")
+    out = ["## Snapshot of the project (you start from this; read README.md and docs/REFERENCE.md yourself when you need them)"]
+    for title, body in context_bundle(name, path, parts_only=True):
+        if title in want and body:
+            out += ["", f"### {title}", body[:SNAPSHOT_CAP] + ("\n... (cut; read the file)" if len(body) > SNAPSHOT_CAP else "")]
+    try:
+        last = report_text(name).strip()
+        if last:
+            out += ["", "### What the previous session last said", last[:2000] + (" ..." if len(last) > 2000 else "")]
+    except Exception:
+        pass
+    return "\n".join(out) + "\n"
+
+
+def review_text(name, path, since):
+    """REVIEW.md, the facts, and the snapshot: everything the review starts from."""
+    return (HERE / "REVIEW.md").read_text() + "\n\n---\n" + review_facts(path, since) + "\n---\n" + review_snapshot(name, path)
+
+
 def review_prompt(name, path, since):
-    """REVIEW.md plus the facts, written to the prompts folder. -> the file."""
-    return write_prompt(sanitize(name), (HERE / "REVIEW.md").read_text() + "\n\n---\n" + review_facts(path, since))
+    """review_text written to the prompts folder (with the plan-first line). -> the file."""
+    return write_prompt(sanitize(name), review_text(name, path, since))
 
 
 def review_offered(name):
-    """True once per day per project: Done offers the review once, not at every press (the answer is remembered either way)."""
+    """True when Done already offered (or the user postponed) this project's review today."""
+    try:
+        return json.loads((DATA_DIR / "review-offered.json").read_text()).get(name) == time.strftime("%Y-%m-%d")
+    except (OSError, ValueError):
+        return False
+
+
+def review_mark_offered(name):
     f = DATA_DIR / "review-offered.json"
     try:
         d = json.loads(f.read_text())
     except (OSError, ValueError):
         d = {}
-    today = time.strftime("%Y-%m-%d")
-    if d.get(name) == today:
-        return True
-    d[name] = today
+    d[name] = time.strftime("%Y-%m-%d")
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps(d))
     except OSError:
         pass
-    return False
 
 
-def start_review(name, path, since):
-    """Inject the review prompt into the project's Claude (plan mode, inject_prompt). -> a sentence saying what happened."""
+def previous_claude(name):
+    """The conversation `swap_claude` set aside for this project ({session_id, time, why}), or None."""
+    try:
+        d = json.loads(pfile(name, "previous-claude").read_text())
+        return d if re.fullmatch(r"[0-9a-fA-F-]{8,40}", str(d.get("session_id", ""))) else None
+    except (OSError, ValueError):
+        return None
+
+
+def swap_claude(name, path, prompt_file, why, add_dirs=()):
+    """Replace the project's Claude with a fresh one in plan mode (opusplan: Opus proposes, Sonnet builds after approval) that starts from `prompt_file`.
+    The conversation it replaces is remembered (`previous-claude`) so `back_claude` can resume it. Refuses while Claude is working (it would be killed).
+    -> (started, message)."""
     sess = sanitize(name)
     pane = find_claude_pane(sess) if session_exists(sess) else None
     if not pane:
-        return f"{name} is not running: open it, then ask again"
-    inject_prompt(pane, review_prompt(name, path, since), [])
+        return False, f"{name} is not running: open it, then ask again"
+    if claude_state(name)[0] == "working":
+        return False, f"Claude is working in {name}: wait until it is idle, then ask again"
+    sf = claude_session_file(pane)
+    if sf:
+        try:
+            pfile(name, "previous-claude").write_text(json.dumps({"session_id": sf.stem, "time": time.time(), "why": why}))
+        except OSError:
+            pass
+    tmux("respawn-pane", "-k", "-t", pane, "-c", str(path), check=False)
+    start_claude_with_prompt(pane, prompt_file, add_dirs, cont=False)
     tmux("select-window", "-t", pane, check=False)
     tmux("select-pane", "-t", pane, check=False)
-    return f"Claude is reviewing {name} in its session (plan mode): it proposes one cleanup PR first"
+    return True, "a fresh Claude in plan mode" + (" (the previous conversation is kept: Previous Claude brings it back)" if sf else "")
+
+
+def back_claude(name):
+    """Resume the conversation `swap_claude` set aside, in the same pane (the swapped-in Claude ends). -> (done, message)."""
+    rec = previous_claude(name)
+    if not rec:
+        return False, "no previous Claude conversation to go back to"
+    sess = sanitize(name)
+    pane = find_claude_pane(sess) if session_exists(sess) else None
+    if not pane:
+        return False, f"{name} is not running: open it first"
+    if claude_state(name)[0] == "working":
+        return False, f"Claude is working in {name}: wait until it is idle"
+    tmux("respawn-pane", "-k", "-t", pane, "-c", str(known_path(name)), check=False)
+    send_line(pane, f"{claude_base()} --resume {rec['session_id']}")
+    pfile(name, "previous-claude").unlink(missing_ok=True)
+    tmux("select-window", "-t", pane, check=False)
+    tmux("select-pane", "-t", pane, check=False)
+    return True, "back in the previous conversation"
+
+
+def start_review(name, path, since):
+    """The review in a fresh plan-mode Claude (swap_claude) that starts from REVIEW.md, the facts and a snapshot. -> (started, message)."""
+    f = review_prompt(name, path, since)               # built first: the snapshot includes what the Claude being replaced last said
+    ok, msg = swap_claude(name, path, f, "review", [HERE] if name == "hyperbeam" else [])
+    if not ok:
+        return False, msg
+    return True, f"{msg}; it starts from about {len(f.read_text()) // 4000}k tokens of context and proposes one cleanup PR first"
 
 
 def cmd_review(a):
-    """hyperbeam review [PROJECT] [--since COMMIT] [--print]: the review prompt for a project (default $HB_PROJECT) into its Claude, or printed."""
+    """hyperbeam review [PROJECT] [--since COMMIT] [--print]: the review for a project (default $HB_PROJECT) in a fresh plan-mode Claude that replaces the
+    project's Claude (`hyperbeam back` returns to the old conversation), or the prompt printed."""
     name = a.project or os.environ.get("HB_PROJECT")
     if not name:
         sys.exit("hyperbeam review: no project (run it in a project session, or give a name)")
@@ -836,10 +923,21 @@ def cmd_review(a):
     if not since:
         sys.exit(f"hyperbeam review: {name} has no review record (docs/reviews/): say where to start, e.g. --since <the merge commit before the first PR to review>")
     if a.print:
-        print((HERE / "REVIEW.md").read_text() + "\n\n---\n" + review_facts(path, since))
+        print(PLAN_FIRST + review_text(name, path, since))
         return 0
-    print(f"{name}: {start_review(name, path, since)}")
-    return 0
+    ok, msg = start_review(name, path, since)
+    print(f"{name}: {msg}")
+    return 0 if ok else 1
+
+
+def cmd_back(a):
+    """hyperbeam back [PROJECT]: resume the conversation a review (swap_claude) set aside."""
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam back: no project (run it in a project session, or give a name)")
+    ok, msg = back_claude(name)
+    print(f"{name}: {msg}")
+    return 0 if ok else 1
 
 
 def drift_notes(name, path):
@@ -4821,9 +4919,10 @@ class ProjectScreen(ModalScreen):
     ProjectScreen Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
 
-    def __init__(self, text):
+    def __init__(self, text, back=False):
         super().__init__()
         self.text = text
+        self.back = back             # a conversation was set aside by a review: show Previous Claude
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -4834,7 +4933,7 @@ class ProjectScreen(ModalScreen):
             with Container(id="pbuttons"):
                 for bid, label in [("update", "Update"), ("install", "Install"), ("test", "Test (lab)"), ("version", "Version"), ("help_verbs", "Help"), ("onboard", "Onboard"),
                                    ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"), ("info", "Info window"),
-                                   ("mark_onboarded", "Mark onboarded"), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
+                                   ("mark_onboarded", "Mark onboarded"), *([("back", "Previous Claude")] if self.back else []), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
                                    ("close", "Close")]:
                     b = Button(label, id=f"pb-{bid}")
                     b.can_focus = False
@@ -5399,7 +5498,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "project", "more", "keys", "edit_manifest", "mark_onboarded", "install", "test", "version", "help_verbs", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "project", "more", "keys", "edit_manifest", "mark_onboarded", "back", "install", "test", "version", "help_verbs", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -5552,11 +5651,18 @@ class Menu(App):
                     continue
             except Exception:
                 continue
-            if self.choose(f"{n}: {due[0]} PRs merged since the last review ({due[1]['date']}).\n\nReview them now? Claude (plan mode) checks the whole batch and "
-                           "proposes ONE cleanup PR first.", [("ask", "Ask Claude to review (r)", "r"), ("later", "Later (l)", "l")]) == "ask":
-                msg = start_review(n, path, due[1]["through"])
-                self.say_from_thread(f"Done for now: {msg}. Press Done again when it says \"Review done.\"")
-                return True
+            if self.choose(f"{n}: {due[0]} PRs merged since the last review ({due[1]['date']}).\n\nReview them now? A fresh Claude in plan mode (Opus) replaces the one "
+                           "in that session, checks the whole batch and proposes ONE cleanup PR first. The old conversation comes back with Previous Claude.",
+                           [("ask", "Ask Claude to review (r)", "r"), ("later", "Later (l)", "l")]) != "ask":
+                review_mark_offered(n)
+                continue
+            ok, msg = start_review(n, path, due[1]["through"])
+            if not ok:
+                self.say_from_thread(f"Done for now: no review started: {msg}")
+                continue
+            review_mark_offered(n)
+            self.say_from_thread(f"Done for now: {n}: {msg}. Press Done again when it says \"Review done.\"")
+            return True
         return False
 
     def action_done(self):
@@ -5759,8 +5865,17 @@ class Menu(App):
                 text = project_summary(name, path, prs=prs)
             except Exception as e:
                 text = f"{name}\n\ncould not read the project: {e}"
-            self.call_from_thread(lambda: self.push_screen(ProjectScreen(text), lambda r: self.run_project_action(r)))
+            back = previous_claude(name) is not None
+            self.call_from_thread(lambda: self.push_screen(ProjectScreen(text, back=back), lambda r: self.run_project_action(r)))
         self.run_worker(work, thread=True)
+
+    def action_back(self):
+        """Previous Claude: the conversation a review set aside, resumed in the same pane."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        ok, msg = back_claude(p["name"])
+        self.say(f"{p['name']}: {msg}")
 
     def run_project_action(self, what):
         if what and hasattr(self, "action_" + what):
@@ -6130,6 +6245,9 @@ def main():
     rv.add_argument("--since", help="the commit to review from (default: the last review record's `through`)")
     rv.add_argument("--print", action="store_true")
     rv.set_defaults(f=cmd_review)
+    bk = sub.add_parser("back", help="resume the conversation a review set aside (the review's Claude ends); default project $HB_PROJECT")
+    bk.add_argument("project", nargs="?")
+    bk.set_defaults(f=cmd_back)
     rf = sub.add_parser("refresh-prs", help="fetch a project's open PRs now so the sidebar's Merge button is right at once; run it after gh pr create (with the number) and after a merge; default project $HB_PROJECT")
     rf.add_argument("project", nargs="?")
     rf.add_argument("numbers", nargs="*", help="PR numbers just opened (looked up directly: GitHub's list lags a few seconds)")

@@ -137,6 +137,7 @@ class OfferedOnce(unittest.TestCase):
         hb.DATA_DIR = Path(tempfile.mkdtemp())
         try:
             self.assertFalse(hb.review_offered("p"))
+            hb.review_mark_offered("p")
             self.assertTrue(hb.review_offered("p"))
             self.assertFalse(hb.review_offered("q"))
         finally:
@@ -144,17 +145,21 @@ class OfferedOnce(unittest.TestCase):
 
 
 class DoneStep(unittest.TestCase):
-    """Menu.review_step on a fake menu: offers once, injects the prompt when asked, and stops Done."""
+    """Menu.review_step on a fake menu: offers once, starts the review when asked, stops Done only when it started, and uses up the offer only then."""
 
     def setUp(self):
         self.repo = Repo()
         through = self.repo.merge_pr(1)
         self.repo.review_record("2026-11-12", through)
-        self.saved = {k: getattr(hb, k) for k in ("load_journal", "known_path", "review_offered", "start_review")}
+        self.saved = {k: getattr(hb, k) for k in ("load_journal", "known_path", "review_offered", "review_mark_offered", "start_review")}
         hb.load_journal = lambda: {"projects": {"proj": {}}}
         hb.known_path = lambda n: self.repo.r
-        self.offers, self.started = [], []
-        hb.start_review = lambda n, p, since: (self.started.append((n, since)), "started")[1]
+        hb.review_offered = lambda n: False
+        self.offers, self.started, self.marked, self.result = [], [], [], (True, "started")
+        hb.review_mark_offered = lambda n: self.marked.append(n)
+        hb.start_review = lambda n, p, since: (self.started.append((n, since)), self.result)[1]
+        for n in range(2, 7):
+            self.repo.merge_pr(n)
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -171,31 +176,32 @@ class DoneStep(unittest.TestCase):
         return Fake()
 
     def test_below_the_limit_nothing_is_offered(self):
-        hb.review_offered = lambda n: False
-        self.repo.merge_pr(2)
+        hb.known_path = lambda n: Repo().r
         self.assertFalse(self.menu("ask").review_step())
         self.assertEqual(self.offers, [])
 
     def test_at_the_limit_it_offers_and_starts(self):
-        hb.review_offered = lambda n: False
-        for n in range(2, 7):
-            self.repo.merge_pr(n)
         self.assertTrue(self.menu("ask").review_step())
         self.assertEqual(len(self.offers), 1)
         self.assertIn("5 PRs merged since the last review", self.offers[0])
+        self.assertIn("Previous Claude", self.offers[0])
         self.assertEqual(self.started, [("proj", hb.reviews_due(self.repo.r)[1]["through"])])
+        self.assertEqual(self.marked, ["proj"])
 
-    def test_later_does_not_start_and_does_not_stop_done(self):
-        hb.review_offered = lambda n: False
-        for n in range(2, 7):
-            self.repo.merge_pr(n)
+    def test_later_does_not_start_does_not_stop_done_and_is_remembered(self):
         self.assertFalse(self.menu("later").review_step())
         self.assertEqual(self.started, [])
+        self.assertEqual(self.marked, ["proj"])
+
+    def test_a_review_that_could_not_start_does_not_use_up_the_offer(self):
+        self.result = (False, "proj is not running: open it, then ask again")
+        m = self.menu("ask")
+        self.assertFalse(m.review_step())
+        self.assertEqual(self.marked, [])
+        self.assertTrue(any("no review started" in x for x in m.say))
 
     def test_already_offered_today_is_quiet(self):
         hb.review_offered = lambda n: True
-        for n in range(2, 7):
-            self.repo.merge_pr(n)
         self.assertFalse(self.menu("ask").review_step())
         self.assertEqual(self.offers, [])
 

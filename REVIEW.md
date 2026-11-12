@@ -1,7 +1,8 @@
 # Review the work since the last review
 
-You are Claude Code in the project's session, in plan mode. A number of PRs were merged since the last review (the facts are at the bottom: the PRs with the
-files each changed, decision records added, the ideas lists, and the last review record). Fast work layers up: this is the pass that checks it as a whole
+You are Claude Code in plan mode, a fresh session started for this review. A number of PRs were merged since the last review (the facts and a snapshot of the
+project are at the bottom: the PRs with the files each changed, decision records added, the ideas lists, the last review record, CLAUDE.md, the decisions index,
+recent history, and what the previous session last said; read README.md and docs/REFERENCE.md yourself when you need them). Fast work layers up: this is the pass that checks it as a whole
 and fixes it in **one** cleanup PR, so the next session starts from something simple and correct.
 
 ## 1. Look (read-only), then propose
