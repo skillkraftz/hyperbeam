@@ -8,7 +8,7 @@
 CLI (for scripts and SSH): hyperbeam scan | open NAME [-d] | stop NAME | list | phone
 (_menu, _stack, _copy-pane, _clip, _warn are internal: tmux bindings and windows call them)
 """
-import argparse, asyncio, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, tomllib, types
+import argparse, asyncio, datetime, hashlib, uuid, json, os, pwd, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, textwrap, threading, time, tomllib, types
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -2292,7 +2292,11 @@ def verify_checks(which="all"):
             prs = open_prs("hyperbeam", hp, force=True)
             err = (json.loads(pr_cache_file("hyperbeam", hp).read_text()).get("error") if pr_cache_file("hyperbeam", hp).exists() else "")
             add("FAIL" if err else "PASS", f"gh: listing your open PRs in {slug}" + (f" failed: {err}" if err else f" works ({len(prs)} open)"), "gh pr list -R " + slug if err else "")
-        add("YOU", "Merge has not been tested end to end (it merges a real PR; the throwaway PR is opened for you, you only click Merge)", "hyperbeam verify merge")
+        mv = DATA_DIR / "merge-verified"
+        if mv.is_file():
+            add("PASS", f"Merge worked end to end ({mv.read_text().strip()})")
+        else:
+            add("YOU", "Merge has not been used yet: the first real Merge click makes this PASS (or open a throwaway PR to try it)", "hyperbeam verify merge")
     if which in ("all", "hooks"):
         sf = Path(os.environ.get("HB_SETTINGS") or Path.home() / ".claude/settings.json")
         try:
@@ -2569,6 +2573,415 @@ def cmd_lab_collect(name_dest, src_in_lab):
         print(f"lab: could not collect {src_in_lab}: {r.stderr.strip()[-200:]}", file=sys.stderr)
         return None
     return dest, sum(1 for _ in dest.rglob("*") if _.is_file())
+
+
+# ---------- conventions: the same verbs in every project (install, update, test, version, help, restart) ----------
+VERBS = ("install", "update", "test", "version", "help", "restart")
+LOCKFILES = ("package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "uv.lock", "pyproject.toml", "requirements.txt", "Cargo.toml", "Cargo.lock")
+
+
+def detect_pm(path):
+    """The project's package manager: pnpm / yarn / npm / uv / pip / cargo, or None."""
+    path = Path(path)
+    for f, pm in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("package-lock.json", "npm"), ("uv.lock", "uv"), ("Cargo.toml", "cargo")):
+        if (path / f).exists():
+            return pm
+    if (path / "package.json").exists():
+        return "npm"
+    if (path / "pyproject.toml").exists():
+        return "uv"
+    if (path / "requirements.txt").exists():
+        return "pip"
+    return None
+
+
+def _pkg_scripts(path):
+    try:
+        return json.loads((Path(path) / "package.json").read_text()).get("scripts", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def verb_command(name, path, verb):
+    """-> (shell command or None, where it comes from). The project's own wins: the manifest's [commands] table, then a package.json script or a Makefile
+    target of that name, then a default derived from what is in the folder. None = hyperbeam does it itself (update, version, help, restart)."""
+    path = Path(path)
+    man = load_manifests().get(name) or {}
+    own = (man.get("commands") or {}).get(verb)
+    if own:
+        return own, "manifest [commands]"
+    pm = detect_pm(path)
+    scripts = _pkg_scripts(path)
+    if verb in scripts and verb not in ("install",):
+        return (f"{pm or 'npm'} run {verb}" if pm in ("pnpm", "yarn", "npm", None) else f"npm run {verb}"), f"package.json script {verb}"
+    if (path / "Makefile").is_file() and verb in fingerprint(path).get("Makefile", {}).get("targets", []):
+        return f"make {verb}", f"Makefile target {verb}"
+    if verb == "install":
+        cmd = {"pnpm": "pnpm install", "yarn": "yarn install", "npm": "npm install", "uv": "uv sync", "pip": "python3 -m pip install -r requirements.txt", "cargo": "cargo fetch"}.get(pm)
+        return cmd, f"default ({pm})" if cmd else "none: no package manager found"
+    if verb == "test":
+        if "test" in scripts:
+            return f"{pm} test", "default (package.json test script)"
+        if pm == "uv" or (path / "tests").is_dir():
+            return ("uv run pytest -q" if pm == "uv" else "python3 -m pytest -q"), "default (pytest)"
+        if pm == "cargo":
+            return "cargo test", "default (cargo)"
+        return None, "none: no tests found"
+    return None, "hyperbeam"
+
+
+def run_cmd_stream(cmd, cwd, say):
+    p = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, errors="replace")
+    for line in p.stdout:
+        say(line.rstrip("\n"))
+    return p.wait()
+
+
+def restart_services(name, say):
+    """Re-run each service of the manifest in its window of the running session (C-c, then the command again). -> number restarted."""
+    man = load_manifests().get(name) or {}
+    sess, n = sanitize(name), 0
+    if not session_exists(sess):
+        return 0
+    for svc in man.get("service", []):
+        if tmux("list-windows", "-t", f"={sess}", "-F", "#{window_name}", check=False).stdout.split().count(svc["name"]):
+            target = f"={sess}:={svc['name']}"
+            tmux("send-keys", "-t", target, "C-c", check=False)
+            time.sleep(0.8)
+            send_line(target, f'{svc["cmd"]}; echo "[hyperbeam] exited: $?"')
+            n += 1
+    if n:
+        say(f"restarted {n} service window{'s' * (n != 1)}")
+    return n
+
+
+def verb_update(name, path, say):
+    """Pull the project's default branch and bring it up to date: refuse on uncommitted tracked changes; fetch; check out the default branch;
+    `pull --ff-only`; install only if a lockfile or manifest changed; restart the services of a running session. -> exit code."""
+    path = Path(path)
+    if name == "hyperbeam":
+        return run_cmd_stream(f"{SELF} update --yes", path, say)
+    if not (path / ".git").exists():
+        say("not a git project: nothing to update")
+        return 1
+    dirty = git_out(path, "status", "--porcelain", "--untracked-files=no").splitlines()
+    if dirty:
+        say(f"refused: {len(dirty)} uncommitted change{'s' * (len(dirty) != 1)} ({', '.join(l[3:] for l in dirty[:3])}); commit or stash first")
+        return 1
+    git_fetch(path)
+    base = default_branch(path)
+    before_branch, old = branch_of(path), git_out(path, "rev-parse", "HEAD")
+    if before_branch != base:
+        co = subprocess.run(["git", "-C", str(path), "checkout", "-q", base], capture_output=True, text=True)
+        if co.returncode:
+            say(f"could not check out {base}: {co.stderr.strip()[:120]}")
+            return 1
+    pull = subprocess.run(["git", "-C", str(path), "pull", "-q", "--ff-only"], capture_output=True, text=True, timeout=120,
+                          env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5"))
+    if pull.returncode:
+        say(f"pull failed: {pull.stderr.strip()[:160]}")
+        return 1
+    new = git_out(path, "rev-parse", "HEAD")
+    changed = git_out(path, "diff", "--name-only", f"{old}..{new}").splitlines() if old != new else []
+    if old == new and before_branch == base:
+        say(f"{base} is already up to date")
+    else:
+        say(f"{base}: {old[:7]} -> {new[:7]} ({len(changed)} file{'s' * (len(changed) != 1)} changed)")
+    if any(Path(f).name in LOCKFILES for f in changed):
+        cmd, src = verb_command(name, path, "install")
+        if cmd:
+            say(f"dependencies changed: {cmd}")
+            if run_cmd_stream(cmd, path, say):
+                say("install failed")
+                return 1
+    if changed:
+        restart_services(name, say)
+    return 0
+
+
+def verb_version(name, path, say):
+    path = Path(path)
+    parts = []
+    try:
+        v = json.loads((path / "package.json").read_text()).get("version")
+        if v:
+            parts.append(f"package.json {v}")
+    except (OSError, ValueError):
+        pass
+    for fn, keys in (("pyproject.toml", ("project", "version")), ("Cargo.toml", ("package", "version"))):
+        try:
+            d = tomllib.loads((path / fn).read_text())
+            v = d.get(keys[0], {}).get(keys[1])
+            if v:
+                parts.append(f"{fn} {v}")
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    desc = git_out(path, "describe", "--tags", "--always", "--dirty") if (path / ".git").exists() else ""
+    when = git_out(path, "log", "-1", "--format=%cs") if desc else ""
+    say(f"{name} " + (" / ".join(parts) or "(no version file)") + (f"  git {desc}" if desc else "") + (f"  last commit {when}" if when else ""))
+    return 0
+
+
+def verb_help(name, path, say):
+    say(f"{name}: hyperbeam {name} VERB   (hyperbeam {name} alone opens it)")
+    for v in VERBS:
+        cmd, src = verb_command(name, path, v)
+        what = {"update": "pull the default branch, install if dependencies changed, restart services",
+                "version": "version, git describe, last commit", "help": "this list",
+                "restart": "re-run the project's services in its session"}.get(v)
+        say(f"  {v:<8} {cmd if cmd else (what or 'unavailable')}   [{src}]")
+    mp = MANIFESTS / f"{name}.toml"
+    say(f"  manifest {home_rel(mp) if mp.is_file() else 'none yet (Onboard)'}   data {home_rel(project_dir(name, path))}   (.hyperbeam in the project)")
+    return 0
+
+
+def run_verb(name, verb, path=None, say=print):
+    """One of the standard verbs for a project, with its output through `say`. `test` always runs in the lab. -> exit code."""
+    path = Path(path) if path else known_path(name)
+    if verb not in VERBS:
+        say(f"unknown verb {verb}; verbs: {', '.join(VERBS)}")
+        return 2
+    if not path.is_dir():
+        say(f"{path} does not exist")
+        return 1
+    if verb == "update":
+        return verb_update(name, path, say)
+    if verb == "version":
+        return verb_version(name, path, say)
+    if verb == "help":
+        return verb_help(name, path, say)
+    if verb == "restart":
+        return 0 if restart_services(name, say) else (say("no running service windows to restart") or 1)
+    cmd, src = verb_command(name, path, verb)
+    if not cmd:
+        say(f"{verb}: {src}")
+        return 1
+    if verb == "test":
+        ns = types.SimpleNamespace(action="run", dir=str(path), name=None, why=f"{name} test", fresh=False, timeout=900, cmd=["--", cmd], quiet=False, collect=None)
+        return cmd_lab(ns)
+    say(f"{verb}: {cmd}   [{src}]")
+    return run_cmd_stream(cmd, path, say)
+
+
+def cmd_project_verb(name, verb):
+    return run_verb(name, verb, say=print)
+
+
+def project_exists(name):
+    return (MANIFESTS / f"{name}.toml").is_file() or (ROOT / name).is_dir()
+
+
+def verbs_facts(path, name):
+    """For align-facts: which verbs the project provides itself and which hyperbeam only defaults."""
+    out = []
+    for v in VERBS[:-1]:
+        cmd, src = verb_command(name, path, v)
+        out.append(f"{v}: {src.split(' (')[0] if src.startswith(('manifest', 'package', 'Makefile')) else 'default only (' + (cmd or src) + ')'}")
+    return "; ".join(out)
+
+
+# ---------- usage: what the 5-hour windows cost (from Claude Code's own conversation files; plain script, no tokens) ----------
+WINDOW_SECONDS = 5 * 3600
+USAGE_FILE = lambda: DATA_DIR / "usage-limit.json"
+
+
+def fmt_tok(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(int(n))
+
+
+def usage_project_name(folder):
+    """A conversation folder (the project path with every non-alphanumeric as '-') as a project name."""
+    try:
+        for r in scan():
+            if re.sub(r"[^A-Za-z0-9]", "-", str(r["path"])) == folder:
+                return r["name"]
+    except OSError:
+        pass
+    if "hyperbeam-work" in folder:
+        return "hyperbeam (worktrees)"
+    return folder.split("-projects-")[-1] if "-projects-" in folder else folder
+
+
+def usage_records(since=0.0):
+    """(usage records, human prompt times, limit-hit times) from ~/.claude/projects/*/*.jsonl modified after `since`. A record: dict(t, model, proj, sid, in, out, cc, cr)."""
+    recs, prompts, hits = [], [], []
+    names = {}
+    for f in sorted((CLAUDE_DIR / "projects").glob("*/*.jsonl")):
+        try:
+            if f.stat().st_mtime < since:
+                continue
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        folder = f.parent.name
+        proj = names.setdefault(folder, usage_project_name(folder))
+        for line in text.splitlines():
+            if '"usage"' not in line and '"user"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            ts = o.get("timestamp")
+            if not ts:
+                continue
+            try:
+                t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if o.get("type") == "assistant":
+                u = (o.get("message") or {}).get("usage")
+                if u:
+                    recs.append(dict(t=t, model=(o["message"].get("model") or "?"), proj=proj, sid=f.stem, **{"in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0),
+                                     "cc": u.get("cache_creation_input_tokens", 0), "cr": u.get("cache_read_input_tokens", 0)}))
+            elif o.get("type") == "user":
+                if is_human_prompt(o):
+                    prompts.append(t)
+                else:
+                    c = (o.get("message") or {}).get("content")
+                    if isinstance(c, str) and c.startswith("[Usage limit reached"):
+                        hits.append(t)
+    recs.sort(key=lambda r: r["t"])
+    return recs, sorted(prompts), sorted(hits)
+
+
+def usage_windows(recs):
+    """Group records into 5-hour windows: a window starts at the first request after the previous window ended; it ends 5 hours after its start."""
+    out = []
+    for r in recs:
+        if not out or r["t"] >= out[-1]["end"]:
+            out.append(dict(start=r["t"], end=r["t"] + WINDOW_SECONDS, recs=[]))
+        out[-1]["recs"].append(r)
+    return out
+
+
+def sums(recs):
+    return {k: sum(r[k] for r in recs) for k in ("in", "out", "cc", "cr")} | {"requests": len(recs)}
+
+
+USAGE_METRICS = {"requests": lambda s: s["requests"], "work": lambda s: s["in"] + s["out"] + s["cc"], "output": lambda s: s["out"],
+                 "weighted": lambda s: s["in"] + s["out"] + s["cc"] + s["cr"] * 0.1}
+
+
+def usage_limit_state(wins, hits):
+    """Record each limit hit with its window's sums (usage-limit.json); with 3+ hits pick the metric whose value at the hits varies least and take the median as
+    the limit; a limit set by hand (`--set-limit N`, in requests) wins. -> dict(metric, limit, hits) or {} when there is nothing to estimate from."""
+    try:
+        st = json.loads(USAGE_FILE().read_text())
+    except (OSError, ValueError):
+        st = {}
+    known = {round(h["time"]) for h in st.get("hits", [])}
+    for h in hits:
+        w = next((w for w in wins if w["start"] <= h <= w["end"]), None)
+        if w and round(h) not in known:
+            st.setdefault("hits", []).append(dict(time=h, **sums([r for r in w["recs"] if r["t"] <= h])))
+            known.add(round(h))
+    if st.get("manual"):
+        st["metric"], st["limit"] = "requests", st["manual"]
+    elif len(st.get("hits", [])) >= 3:
+        best = None
+        for name, fn in USAGE_METRICS.items():
+            vals = sorted(fn(h) for h in st["hits"])
+            mean = sum(vals) / len(vals)
+            cv = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5 / mean if mean else 9
+            if best is None or cv < best[0]:
+                best = (cv, name, vals[len(vals) // 2])
+        st["metric"], st["limit"] = best[1], best[2]
+    try:
+        USAGE_FILE().parent.mkdir(parents=True, exist_ok=True)
+        USAGE_FILE().write_text(json.dumps(st))
+    except OSError:
+        pass
+    return st
+
+
+def usage_report(span="today"):
+    """-> (text lines, current window dict or None, limit state). span: today | week | all."""
+    now = time.time()
+    since = {"today": now - 36 * 3600, "week": now - 8 * 86400}.get(span, 0.0)
+    recs, prompts, hits = usage_records(since)
+    wins = usage_windows(recs)
+    st = usage_limit_state(wins, hits)
+    cur = wins[-1] if wins and wins[-1]["end"] > now else None
+    day0 = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+    L = [f"usage  (now {time.strftime('%H:%M')}; a window starts at your first request and ends 5 hours later)"]
+    shown = [w for w in wins if (span != "today" or w["end"] > day0)]
+    if cur:
+        s = sums(cur["recs"])
+        ex = sum(1 for t in prompts if cur["start"] - 300 <= t <= cur["end"])          # the prompt that starts a window comes just before its first request
+        left = int(cur["end"] - now)
+        pct = ""
+        if st.get("limit"):
+            fn = USAGE_METRICS.get(st["metric"], USAGE_METRICS["requests"])
+            pct = f", ~{min(999, round(100 * fn(s) / st['limit']))}% of the estimated limit ({st['metric']})"
+        L += ["", f"current window: {time.strftime('%H:%M', time.localtime(cur['start']))} -> ends {time.strftime('%H:%M', time.localtime(cur['end']))} (in {left // 3600}h {left % 3600 // 60:02d}m)",
+              f"  {s['requests']} requests, {ex} exchanges{pct}", f"  tokens: output {fmt_tok(s['out'])}, new context {fmt_tok(s['cc'] + s['in'])}, re-read context {fmt_tok(s['cr'])}",
+              f"  per exchange: {fmt_tok((s['out'] + s['cc'] + s['in']) / ex) if ex else '-'} new, {fmt_tok(s['cr'] / ex) if ex else '-'} re-read"]
+        by = {}
+        for r in cur["recs"]:
+            by.setdefault(r["proj"], []).append(r)
+        for proj, rs in sorted(by.items(), key=lambda kv: -len(kv[1]))[:5]:
+            q = sums(rs)
+            L.append(f"  {proj:<24} {q['requests']:>4} requests  output {fmt_tok(q['out']):>6}  re-read {fmt_tok(q['cr']):>6}")
+    else:
+        L += ["", "current window: none (the next request starts one)"]
+    L += ["", f"windows ({span})"]
+    for w in shown[-8:]:
+        s = sums(w["recs"])
+        hit = any(w["start"] <= h <= w["end"] for h in hits)
+        L.append(f"  {time.strftime('%m-%d %H:%M', time.localtime(w['start']))}  {s['requests']:>4} requests  output {fmt_tok(s['out']):>6}  re-read {fmt_tok(s['cr']):>6}" + ("   <- hit the limit" if hit else ""))
+    sess = {}
+    for r in (cur["recs"] if cur else (shown[-1]["recs"] if shown else [])):
+        sess.setdefault((r["proj"], r["sid"]), []).append(r)
+    heavy = sorted(((sums(rs)["cr"] / len(rs), k, len(rs)) for k, rs in sess.items() if len(rs) >= 5), reverse=True)[:3]
+    if heavy:
+        L += ["", "heaviest conversations (context re-read per request: long ones cost the most; start a fresh one when a task is done)"]
+        L += [f"  {k[0]:<24} {fmt_tok(avg):>6} per request over {n} requests" for avg, k, n in heavy]
+    n_hits = len(st.get("hits", []))
+    L += ["", "limit: " + (f"~{st['limit']:,.0f} ({st['metric']}), from {'your setting' if st.get('manual') else f'{n_hits} limit hits'}" if st.get("limit") else
+                         f"not known yet ({n_hits} limit hit{'s' * (n_hits != 1)} recorded; at 3 the estimate starts; or `hyperbeam usage --set-limit N` in requests)")]
+    return L, cur, st
+
+
+_USAGE_CACHE = {"t": 0.0, "line": ""}
+
+
+def usage_line():
+    """One short line for the Project screen and the title: when the window ends and what it holds (cached for a minute)."""
+    if time.time() - _USAGE_CACHE["t"] < 60:
+        return _USAGE_CACHE["line"]
+    L, cur, st = usage_report("today")
+    line = ""
+    if cur:
+        s = sums(cur["recs"])
+        pct = ""
+        if st.get("limit"):
+            pct = f" ~{min(999, round(100 * USAGE_METRICS.get(st['metric'], USAGE_METRICS['requests'])(s) / st['limit']))}%"
+        line = f"5h window ends {time.strftime('%H:%M', time.localtime(cur['end']))} - {s['requests']} requests{pct}"
+    _USAGE_CACHE.update(t=time.time(), line=line)
+    return line
+
+
+def usage_nudge():
+    """A note when the estimate says the window is nearly used up (never red); '' otherwise or when there is no estimate."""
+    L, cur, st = usage_report("today")
+    if not cur or not st.get("limit"):
+        return ""
+    pct = 100 * USAGE_METRICS.get(st["metric"], USAGE_METRICS["requests"])(sums(cur["recs"])) / st["limit"]
+    return f"the 5-hour window is ~{round(pct)}% used (ends {time.strftime('%H:%M', time.localtime(cur['end']))}): plan the cleanup and docs now" if pct >= 85 else ""
+
+
+def cmd_usage(a):
+    if a.set_limit:
+        recs, prompts, hits = usage_records(time.time() - 8 * 86400)
+        st = usage_limit_state(usage_windows(recs), hits)
+        st["manual"] = a.set_limit
+        USAGE_FILE().write_text(json.dumps(st))
+        print(f"limit set to {a.set_limit} requests per 5-hour window")
+        return 0
+    L, cur, st = usage_report("week" if a.week else "all" if a.all else "today")
+    print("\n".join(L))
+    return 0
 
 
 def lab_ready():
@@ -3032,6 +3445,7 @@ def align_facts(path):
             for i, l in enumerate(f.read_text(errors="replace").splitlines(), 1):
                 if re.search(r"\b(not public|private repo|private repository|closed[- ]source|internal only|public repo|open[- ]source|is public|is private)\b", l, re.I):
                     claims.append(f"{fn}:{i}: {l.strip()[:140]}")
+    out.append("standard verbs (install, update, test, version, help; a project's own script/target beats hyperbeam's default): " + verbs_facts(path, path.name))
     stale = stale_doc_items(path)
     out.append("docs that may be stale (commands/paths that don't exist, docs older than the setup): " + ("; ".join(f"{d} {w}" for d, w in stale[:8]) or "none found"))
     out.append("lines that claim public/private" + (f" (real visibility: {vis})" if vis else "") + ": " + ("; ".join(claims[:6]) or "none"))
@@ -3876,34 +4290,40 @@ def cmd_warn(args):
 
 # ---------- the menu ----------
 def project_summary(name, path, st=None, prs=None):
-    """The text of the Project screen: where it is, how it runs, what needs attention, when it was onboarded. (Computed in a worker thread.)"""
+    """The Project screen as short lines (the screen truncates each with an ellipsis; the full texts are in the Info window and the notes folder).
+    (Computed in a worker thread.)"""
     path = Path(path)
     man = load_manifests().get(name)
     sess = sanitize(name)
     running = session_exists(sess)
-    L = [f"{name}", f"  path     {home_rel(path)}", f"  branch   {branch_of(path)}",
-         f"  port     {man.get('port') if man and man.get('port') else '-' if man else 'unset (no manifest)'}",
-         f"  session  {'running' if running else 'not running'}"]
+    br = branch_of(path)
+    L = [f"{name}" + (f"  {br}" if br not in ("-", "main", "master") else ""),
+         "  ".join(x for x in (str(man["port"]) if man and man.get("port") else "", "running" if running else "stopped", "" if man else "no manifest") if x)]
     if man and man.get("service"):
         ports = {p: (proc, lo) for p, proc, lo in session_listeners(sess)} if running else {}
-        L += ["", "services"] + [f"  {n:<12} {s_:<8} {d}" for n, s_, d in service_states(sess, man, ports)]
-    elif man:
-        L += ["", "services: none"]
+        L.append("services: " + ", ".join(f"{n} {s_}" for n, s_, d in service_states(sess, man, ports)))
     prs = prs if prs is not None else open_prs(name, path)
-    L += ["", "open PR" + ("s" if len(prs) > 1 else "")] + ([f"  #{x['number']}  {x['title']}" + (f"  [stale: {pr_age_days(x)} days old]" if pr_stale(x) else "") for x in prs] if prs else ["  none"])
+    L.append("PR: " + (f"#{prs[0]['number']} {prs[0]['title']}" + (" [stale]" if pr_stale(prs[0]) else "") + (f" (+{len(prs) - 1})" if len(prs) > 1 else "") if prs else "none"))
     red = red_findings(name, man) if running else []
     notes = note_findings(name) if running else []
-    L += ["", "problems"] + ([f"  ! {x}" for x in red] if red else ["  none"])
-    L += ["", "notes"] + ([f"  - {x}" for x in notes] if notes else ["  none"])
+    L.append("problems: " + ("none" if not red else ""))
+    L += [f"  ! {x}" for x in red]
+    L.append(f"notes: {len(notes) or 'none'}")
+    L += [f"  - {x}" for x in notes[:3]] + ([f"  ... +{len(notes) - 3} more (Info window)"] if len(notes) > 3 else [])
     when = onboarded_on(name, path)
-    L += ["", f"onboarded: {when or ('never (no manifest)' if not man else 'not yet recorded')}"]
     drift = next((x for x in (notes if running else drift_notes(name, path)) if x.startswith("setup changed")), "")
-    L += [f"drift: {drift if drift else 'none'}"] if man else []
     stale = next((x for x in (notes if running else stale_doc_notes(name, path)) if x.startswith("docs may be stale")), "")
-    L += [f"docs: {stale if stale else 'look current'}"]
+    L.append("set up " + (when.split(" ")[0][5:] if when else ("never" if not man else "?")) + (" drift" if drift else "") + (" docs stale" if stale else ""))
     nd = project_dir(name, path) / "notes"
     nf = sorted(nd.glob("*.md")) if nd.is_dir() else []
-    L += [f"notes folder (.hyperbeam/notes): {len(nf)} file{'s' * (len(nf) != 1)}" + (f", latest {nf[-1].name}" if nf else "")]
+    if nf:
+        L.append(f"notes folder: {len(nf)}, latest {nf[-1].name}")
+    try:
+        u = usage_line()
+        if u:
+            L.append(u)
+    except Exception:
+        pass
     return "\n".join(L)
 
 
@@ -3914,6 +4334,7 @@ class ProjectScreen(ModalScreen):
     ProjectScreen { align: center top; }
     ProjectScreen > Vertical { width: 100%; max-width: 80; height: 100%; background: $surface; padding: 0 1; }
     ProjectScreen #ptext { height: 1fr; }
+    ProjectScreen .pline { height: 1; }
     ProjectScreen #pbuttons { layout: grid; grid-size: 2; grid-gutter: 0 1; height: auto; margin-top: 1; }
     ProjectScreen Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
@@ -3925,10 +4346,14 @@ class ProjectScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical():
             with VerticalScroll(id="ptext"):
-                yield Static(self.text, markup=False)
+                w = max(20, self.app.size.width - 4)
+                for line in self.text.split("\n"):
+                    yield Static(clip(line, w), classes="pline", markup=False)          # cut with an ellipsis ourselves: a wrapped line would hide its tail in a 1-row Static
             with Container(id="pbuttons"):
-                for bid, label in [("onboard", "Onboard"), ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"),
-                                   ("info", "Info window"), ("mark_onboarded", "Mark as onboarded"), ("close", "Close (esc)")]:
+                for bid, label in [("update", "Update"), ("install", "Install"), ("test", "Test (lab)"), ("version", "Version"), ("help_verbs", "Help"), ("onboard", "Onboard"),
+                                   ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"), ("info", "Info window"),
+                                   ("mark_onboarded", "Mark onboarded"), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
+                                   ("close", "Close")]:
                     b = Button(label, id=f"pb-{bid}")
                     b.can_focus = False
                     yield b
@@ -4039,20 +4464,23 @@ def fit_row(name, branch, avail):
 
 
 def row_text(p, st, width, note=""):
-    """One list row: dot, project, branch, port. The dot and the port are never cut; the branch gives way first, then the name.
-    `width` is the room for the row."""
-    port = str(p["port"]) if p.get("port") else ("-" if p["manifest"] else "unset")
-    pstyle = ORANGE if not p["manifest"] else "dim" if not p.get("port") else "cyan"
-    if note:                    # the hyperbeam row when origin/main is ahead: "behind"
+    """One list row: dot, project, then (only when there is something to say) the branch and the port. The branch is shown only when it is not
+    main/master (magenta with an open PR of yours); the port only when set (`note` replaces it on the hyperbeam row: "behind"). The branch gives way first."""
+    port = str(p["port"]) if p.get("port") else ""
+    pstyle = "cyan"
+    if note:
         port, pstyle = note, "yellow"
     branch = p.get("branch", "-")
-    avail = max(4, width - 2 - len(port) - 2)           # dot, port and the two spaces around the branch
-    name, branch = fit_row(p["name"], branch, avail)
+    show_branch = branch not in ("-", "main", "master")
+    right = (" " + port) if port else ""
+    avail = max(4, width - 2 - len(right) - (1 if show_branch else 0))           # the dot, the port, the space before the branch
+    name, branch = fit_row(p["name"], branch if show_branch else "", avail)
     t = Text(no_wrap=True, overflow="crop")
     t.append("● " if st else "  ", style=DOT.get(st[0], "") if st else "")
     t.append(name.ljust(avail - len(branch)), style="bold white" if p["recent"] else "grey54")
-    t.append(" " + branch, style="magenta" if p.get("prs") else "dim" if branch in ("-", "main", "master") else "yellow")   # magenta: an open PR of yours
-    t.append(" " + port, style=pstyle)
+    if branch:
+        t.append(" " + branch, style="#ff79c6" if p.get("prs") else "yellow")           # a light pink stays readable on the blue selected row
+    t.append(right, style=pstyle)
     return t
 
 
@@ -4069,6 +4497,35 @@ class ProjectList(OptionList):
         event.stop()
 
 
+class KeysScreen(ModalScreen):
+    """The key cheat sheet (it used to be under the Settings rows, which made Settings two screens long at 35 columns)."""
+    BINDINGS = [Binding("escape", "close", "Close")]
+    DEFAULT_CSS = """
+    KeysScreen { align: center top; }
+    KeysScreen > Vertical { width: 100%; max-width: 70; height: 100%; background: $surface; padding: 0 1; }
+    KeysScreen #ksheet { height: 1fr; }
+    KeysScreen #kclose { height: 1 !important; border: none !important; }
+    """
+
+    def compose(self) -> ComposeResult:
+        lines = ["Keys are shortcuts; every action also has a button.", "", "hyperbeam keys (no prefix)"]
+        lines += [f"  {k}\n      {d}" for k, d in KEYS]
+        lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
+        lines += ["", "menu keys: o open, s stop, d done, u update, m merge PR, t settings, j project screen (More), b onboard, c copy context, p copy report, f fix, h hide, r refresh, q quit"]
+        with Vertical():
+            yield Static("Keys", id="ktitle")
+            with VerticalScroll(id="ksheet"):
+                yield Static("\n".join(lines), markup=False)
+            yield Button("Close (esc)", id="kclose")
+
+    def on_button_pressed(self, event):
+        event.stop()
+        self.dismiss("")
+
+    def action_close(self):
+        self.dismiss("")
+
+
 class SettingsScreen(ModalScreen):
     """Settings, a modal: it owns all input while open (App bindings don't reach past a modal; events are stopped here so they don't bubble
     to the Menu's handlers). Up/Down choose a setting, Left/Right or the - and + buttons change it, Esc or Close goes back. Values are written to config.toml."""
@@ -4081,8 +4538,8 @@ class SettingsScreen(ModalScreen):
     SettingsScreen .srow Static { width: 1fr; }
     SettingsScreen .srow.sel Static { background: $accent 40%; }
     SettingsScreen .srow Button { height: 1 !important; border: none !important; min-width: 5; width: 5; margin-left: 1; }
-    SettingsScreen #sheet { height: 1fr; margin-top: 1; }
-    SettingsScreen #wnote { height: 1; color: $text-muted; }
+    SettingsScreen #wnote { height: 2; margin-top: 1; color: $text-muted; }
+    SettingsScreen #whelp { height: 1; color: $text-muted; }
     SettingsScreen #close { height: 1 !important; border: none !important; }
     """
     LABELS = [("open_mode", "open mode"), ("claude_model", "model"), ("claude_effort", "effort"),
@@ -4100,22 +4557,14 @@ class SettingsScreen(ModalScreen):
                     yield Static("", id=f"v-{key}", markup=False)
                     yield Button("−", id=f"m-{key}")
                     yield Button("+", id=f"p-{key}")
-            with VerticalScroll(id="sheet"):
-                yield Static(self.cheat(), markup=False)
             yield Static(self.width_note(), id="wnote", markup=False)
+            yield Static("Left/Right or - +: change", id="whelp", markup=False)
             yield Button("Close (esc)", id="close")
 
     @staticmethod
     def width_note():
         live = os.environ.get("HB_SIDEBAR") and os.environ.get("KITTY_LISTEN_ON")
         return "menu width: applies at once in this sidebar window" if live else "menu width: applies when the sidebar window is opened again"
-
-    def cheat(self):
-        lines = ["Up/Down: choose  Left/Right or - +: change  Esc: close", "", "hyperbeam keys (no prefix)"]
-        lines += [f"  {k}\n      {d}" for k, d in KEYS]
-        lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, t settings, f fix, u update, b onboard, c copy context, p copy report, m merge PR, i or j project screen, r refresh, q quit"]
-        return "\n".join(lines)
 
     def on_mount(self):
         self.show()
@@ -4165,17 +4614,14 @@ class Menu(App):
     #title { height: 1; padding: 0 1; text-style: bold; color: $accent; }
     #list { height: 1fr; border: none; padding: 0; scrollbar-size-vertical: 1; }
     #why { height: 1; padding: 0 1; color: $text-muted; }
-    #notice { height: 2; padding: 0 1; }
-    #buttons { layout: grid; grid-size: 4; grid-gutter: 0 1; height: auto; }
-    #buttons { grid-size: 5; }
-    .fix #buttons { grid-size: 6; }
-    .narrow #buttons { grid-size: 2; }
-    .narrow.fix #buttons { grid-size: 2; }
-    #b-fix { display: none; }
+    #notice { height: 2; padding: 0 1; margin-bottom: 1; }
+    #buttons { layout: grid; grid-size: 2; grid-gutter: 0 1; height: auto; }
+    #b-fix { display: none; column-span: 2; }
     .fix #b-fix { display: block; }
-    #b-merge { display: none; }
+    #b-merge { display: none; column-span: 2; }
     .pr #b-merge { display: block; }
     #buttons Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
+    #b-merge { background: $success 60%; text-style: bold; }
     """
     BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("f", "fix", "Fix"), Binding("u", "update", "Update"), Binding("h", "hide", "Hide sidebar"),
                 Binding("b", "onboard", "Onboard"), Binding("c", "context", "Copy context"), Binding("p", "report", "Copy report"), Binding("m", "merge", "Merge PR"), Binding("i", "project", "Project"), Binding("j", "project", "Project"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
@@ -4193,7 +4639,7 @@ class Menu(App):
         yield Static("", id="why", markup=False)
         yield Static("Loading projects...", id="notice", markup=False)
         with Container(id="buttons"):
-            for bid, label in [("open", "Open (o)"), ("stop", "Stop (s)"), ("done", "Done (d)"), ("settings", "Settings (t)"), ("update", "Update (u)"), ("onboard", "Onboard (b)"), ("context", "Copy context (c)"), ("report", "Copy report (p)"), ("merge", "Merge (m)"), ("project", "Project (j)"), ("hide", "Hide (h)"), ("fix", "Fix (f)")]:
+            for bid, label in [("open", "Open"), ("stop", "Stop"), ("done", "Done"), ("update", "Update"), ("merge", "Merge"), ("fix", "Fix"), ("more", "More"), ("hide", "Hide")]:
                 if bid == "hide" and not os.environ.get("HB_SIDEBAR"):
                     continue
                 button = Button(label, id=f"b-{bid}")
@@ -4208,6 +4654,8 @@ class Menu(App):
         self.set_interval(600, self.fetch_repo)
         self.set_interval(60, self.recheck_running)
         self.set_interval(60, self.poll_prs)
+        self.set_interval(300, self.poll_usage)
+        self.set_timer(4, self.poll_usage)
         self.set_timer(3, self.poll_prs)
         self.set_timer(2, self.recheck_running)
         asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, lambda: self.exit(return_code=75))      # `hyperbeam update`: restart me
@@ -4217,8 +4665,13 @@ class Menu(App):
         journal_start()
         touch_opened("hyperbeam")       # the hyperbeam session is home: recent (bold) and part of the session record
 
+    HINTS = {"open": "o", "stop": "s", "done": "d", "update": "u", "merge": "m", "fix": "f", "more": "j", "hide": "h"}
+
     def on_resize(self, event):
         self.set_class(event.size.width < 50, "narrow")
+        for bid, key in self.HINTS.items():                   # key hints only where there is room: in a narrow sidebar the label is the whole button
+            for b in self.query(f"#b-{bid}"):
+                b.label = bid.capitalize() + (f" ({key})" if event.size.width >= 50 else "")
         self.call_after_refresh(self.refresh_list)
 
     def recheck_running(self):
@@ -4253,6 +4706,26 @@ class Menu(App):
 
     def set_repo(self):
         self.repo = repo_note()
+        self.refresh_title()
+
+    def refresh_title(self):
+        w = max(20, (self.query_one("#title", Static).size.width or 35) - 2)
+        extra = "update available (u)" if self.repo[0] == "behind" else getattr(self, "usage_text", "")
+        self.query_one("#title", Static).update(clip(("hyperbeam  " + extra).strip(), w))
+
+    def poll_usage(self):
+        """The 5-hour window line for the title, read in a worker thread every 5 minutes."""
+        def work():
+            try:
+                line = usage_line()
+                nudge = usage_nudge()
+            except Exception:
+                return
+            self.usage_text = (line.replace("5h window ends ", "5h ends ").replace(" requests", " req") if line else "")
+            self.call_from_thread(self.refresh_title)
+            if nudge:
+                self.say_from_thread(nudge)
+        self.run_worker(work, thread=True, group="usage", exclusive=True)
         self.refresh_list()
 
     # --- data ---
@@ -4390,7 +4863,13 @@ class Menu(App):
         self.query_one("#why", Static).update(clip(why, w - 2))
 
     def say(self, msg):
-        self.query_one("#notice", Static).update(msg)
+        w = max(12, (self.query_one("#notice", Static).size.width or 40) - 2)
+        lines = []
+        for part in str(msg).splitlines() or [""]:
+            lines += textwrap.wrap(part, w) or [""]
+        if len(lines) > 2:
+            lines = [lines[0], clip(" ".join(lines[1:]), w)]
+        self.query_one("#notice", Static).update("\n".join(lines))
 
     def say_from_thread(self, msg):
         self.call_from_thread(self.say, msg)
@@ -4411,7 +4890,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "project", "edit_manifest", "mark_onboarded", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "fix", "update", "hide", "onboard", "context", "report", "merge", "info", "project", "more", "keys", "edit_manifest", "mark_onboarded", "install", "test", "version", "help_verbs", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -4573,12 +5052,19 @@ class Menu(App):
                     start_wrapup(MENU, dirty)
                     return self.say_from_thread("Done for now: Claude is wrapping up in the hyperbeam session's Claude pane. Press Done again when it says it's done.")
                 return self.say_from_thread("Done for now: not clean, nothing stopped.")
-            running = [n for n in names if sanitize(n) != MENU and session_exists(sanitize(n))]
-            msg = f"All clean: {', '.join(names)}.\n\n" + (f"Stop these sessions? {', '.join(running)}" if running else "No session of them is running.")
+            all_running = [n for n in names if sanitize(n) != MENU and session_exists(sanitize(n))]
+            busy = {n: claude_state(n)[0] for n in all_running if claude_state(n)[0] in ("working", "waiting")}       # git-clean is not the same as finished
+            running = [n for n in all_running if n not in busy]
+            left = ", ".join(f"{n} (Claude {'is working' if k == 'working' else 'waits for you'})" for n, k in busy.items())
+            if busy and not running:
+                return self.say_from_thread(f"Done for now: all clean, but {left}. Nothing was stopped; the sidebar stays open.")
+            msg = f"All clean: {', '.join(names)}.\n\n" + (f"Stop these sessions? {', '.join(running)}" if running else "No session of them is running.") + (f"\n\nLeft running: {left}." if busy else "")
             if running and not self.ask(msg):
                 return self.say_from_thread("Done for now: all clean, nothing stopped.")
             for n in running:
                 stop_project(n, load_manifests().get(n), self.say_from_thread)
+            if busy:
+                return self.say_from_thread(f"Done for now: stopped {', '.join(running)}; left running: {left}. The session record and the sidebar stay.")
             journal_clear()
             self.say_from_thread("Done for now: all clean" + (f"; stopped {', '.join(running)}" if running else "") + ". Session record cleared.")
             if os.environ.get("HB_SIDEBAR"):        # close the whole sidebar window (this menu is inside it: a detached helper does it)
@@ -4673,12 +5159,28 @@ class Menu(App):
             p["prs"] = prs or None
             self.call_from_thread(self.refresh_list)
             self.say_from_thread(f"{name}: " + "; ".join(msgs))
+            if ok:
+                try:
+                    (DATA_DIR / "merge-verified").write_text(time.strftime("%Y-%m-%d %H:%M") + f" {name} #{pr['number']}\n")     # `verify` stops asking for a Merge test
+                except OSError:
+                    pass
             if ok and name == "hyperbeam" and any(m.startswith("local: on") and "failed" not in m for m in msgs):
-                self.call_from_thread(self.action_update)          # the menu restarts itself: this runs in a popup
+                self.call_from_thread(self.update_hyperbeam)       # the menu restarts itself: this runs in a popup
+            elif ok and any(m.startswith("local: on") and "failed" not in m for m in msgs):
+                lines = []                                         # merged and pulled: now the project's own update (install, restart services), one click in all
+                rc = run_verb(name, "update", p["path"], lines.append)
+                last = next((l for l in reversed(lines) if l.strip()), "")
+                self.say_from_thread(f"{name}: merged; update {'ok' if rc == 0 else 'FAILED'}: {last}")
         except Exception as e:
             self.say_from_thread(f"{name}: merge ERROR {e}")
         finally:
             self.busy.discard(name)
+
+    def action_more(self):
+        self.action_project()
+
+    def action_keys(self):
+        self.push_screen(KeysScreen())
 
     def action_project(self):
         """The Project screen for the selected project (also on i); its buttons run the matching actions after it closes."""
@@ -4752,6 +5254,57 @@ class Menu(App):
         self.run_worker(lambda: self.say_from_thread(sidebar_toggle()), thread=True)
 
     def action_update(self):
+        """Update the selected project through its `update` verb. The hyperbeam row (or nothing selected) runs `hyperbeam update` in a popup."""
+        p = self.current()
+        if p and p["name"] != "hyperbeam":
+            return self.run_verb_action(p, "update")
+        return self.update_hyperbeam()
+
+    def run_verb_action(self, p, verb):
+        """A standard verb of the selected project in a worker thread; the last line of its output is the result, all of it is saved to
+        <project data>/verb-<verb>.txt (the Project screen's Info window shows it)."""
+        name = p["name"]
+        if name == "hyperbeam" and verb == "update":
+            return self.update_hyperbeam()
+        if name in self.busy:
+            return self.say(f"{name} is busy.")
+        self.busy.add(name)
+        self.say(f"{name}: {verb}...")
+
+        def work():
+            lines = []
+            try:
+                rc = run_verb(name, verb, p["path"], lines.append)
+                try:
+                    (project_dir(name, p["path"]) / f"verb-{verb}.txt").write_text("\n".join(lines) + "\n")
+                except OSError:
+                    pass
+                last = next((l for l in reversed(lines) if l.strip()), "done" if rc == 0 else f"failed ({rc})")
+                self.say_from_thread(f"{name} {verb}: {'ok' if rc == 0 else 'FAILED'}: {last}")
+            except Exception as e:
+                self.say_from_thread(f"{name} {verb}: ERROR {e}")
+            finally:
+                self.busy.discard(name)
+                self.call_from_thread(self.reload, True)
+        self.run_worker(work, thread=True)
+
+    def action_install(self):
+        p = self.current()
+        return self.run_verb_action(p, "install") if p else self.say("Nothing selected.")
+
+    def action_test(self):
+        p = self.current()
+        return self.run_verb_action(p, "test") if p else self.say("Nothing selected.")
+
+    def action_version(self):
+        p = self.current()
+        return self.run_verb_action(p, "version") if p else self.say("Nothing selected.")
+
+    def action_help_verbs(self):
+        p = self.current()
+        return self.run_verb_action(p, "help") if p else self.say("Nothing selected.")
+
+    def update_hyperbeam(self):
         """A popup on the client that shows the main area runs `hyperbeam update` (it restarts this menu at the end, so it must not run here)."""
         c = sidebar_client() if os.environ.get("HB_SIDEBAR") else menu_client()
         if not c:
@@ -5045,6 +5598,12 @@ def main():
     vf = sub.add_parser("verify", help="check what only your own accounts and machine can show (gh logins, hooks, lab, home permissions); prints PASS/FAIL/YOU with the exact command")
     vf.add_argument("what", nargs="?", choices=["all", "github", "hooks", "lab", "merge"], default="all")
     vf.set_defaults(f=cmd_verify)
+    us = sub.add_parser("usage", help="what the 5-hour windows cost, from Claude Code's conversation files (plain script)")
+    us.add_argument("--today", action="store_true")
+    us.add_argument("--week", action="store_true")
+    us.add_argument("--all", action="store_true")
+    us.add_argument("--set-limit", type=int, metavar="N", help="the number of requests per 5-hour window at which you hit the limit")
+    us.set_defaults(f=cmd_usage)
     sh_ = sub.add_parser("shot", help="pictures of the sidebar at a given width, made in the lab and brought back to ~/.cache/hyperbeam-shots/")
     sh_.add_argument("--cols", type=int, default=35, help="menu width in columns (default 35)")
     sh_.add_argument("--rows", type=int, default=40)
@@ -5072,11 +5631,17 @@ def main():
         os.environ["HB_PROJECTS_DIR"] = str(ROOT)
         argv = argv[1:]
     try:
-        _done, _bad = migrate_state() if (not argv or argv[0] not in ("lab", "tool", "shot", "_shot-render")) else (0, [])      # `lab` commands run as the user: never touch state
+        _done, _bad = migrate_state() if (not argv or argv[0] not in ("lab", "tool", "shot", "_shot-render") and not (len(argv) > 1 and argv[1] == "test")) else (0, [])      # `lab` commands run as the user: never touch state
         if _bad:
             print("hyperbeam: could not migrate the old state folder; it was left in place:\n  " + "\n  ".join(_bad[:5]), file=sys.stderr)
     except OSError as e:
         print(f"hyperbeam: state migration failed: {e}", file=sys.stderr)
+    if argv and argv[0] not in sub.choices and not argv[0].startswith("-") and "/" not in argv[0] and project_exists(argv[0]):
+        name = argv[0]                          # `hyperbeam NAME VERB`: a standard verb of that project; `hyperbeam NAME`: open it
+        if len(argv) >= 2 and argv[1] in VERBS:
+            sys.exit(cmd_project_verb(name, argv[1]))
+        if len(argv) == 1:
+            argv = ["open", name]
     if Path(sys.argv[0]).name == "kk":      # ~/.local/bin/kk is a symlink to this script
         argv = ["info", *argv]
     a = ap.parse_args(argv)
