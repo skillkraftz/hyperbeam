@@ -87,13 +87,14 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "claude_permissions": "skip", "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "claude_permissions": "skip", "review_after": 5, "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
 CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["opusplan", "sonnet", "opus", "haiku", "fable"],
-           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "claude_permissions": ["skip", "ask"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
+           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "claude_permissions": ["skip", "ask"], "review_after": [3, 5, 8, 10], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
                 "claude_model": "model for every Claude hyperbeam starts (claude --model): opusplan (Opus plans in plan mode, Sonnet does the work), sonnet, opus, haiku, fable",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
                 "claude_permissions": '"skip": every Claude hyperbeam starts runs without permission prompts (claude --dangerously-skip-permissions; the guard hook still blocks the dangerous commands). "ask": Claude asks as usual.',
+                "review_after": "merged PRs after which Done offers a review pass (plan mode: Claude checks what was merged and proposes one cleanup PR); the project's last review is docs/reviews/*.md",
                 "menu_width": "columns of the menu sidebar (takes effect when the sidebar window is opened again)",
                 "on_problem": '"ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.',
                 "recent_days": "a project opened within this many days is 'recent' (bold white in the menu)"}
@@ -713,6 +714,134 @@ def take_fingerprint(name, path):
                                                         "parts": fingerprint(path)}, indent=1))
 
 
+# ---------- review pass: after N merged PRs a plan-mode review of what was merged (REVIEW.md). The record of the last one is docs/reviews/*.md ----------
+def read_front(text):
+    """The `key: value` lines between the two --- lines at the top of a record (a decision, a review) -> {key: value as a string}."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out = {}
+    for l in lines[1:]:
+        if l.strip() == "---":
+            break
+        k, _, v = l.partition(":")
+        if _:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def last_review(path):
+    """The newest review record of a project (docs/reviews/YYYY-MM-DD.md): its front matter plus `date`, or None."""
+    d = Path(path) / "docs" / "reviews"
+    files = sorted(d.glob("*.md")) if d.is_dir() else []
+    if not files:
+        return None
+    r = read_front(files[-1].read_text(errors="replace"))
+    r.setdefault("date", files[-1].stem[:10])
+    return r
+
+
+def reviews_due(path):
+    """(merged PRs since the last review's `through` commit, that review record), or None when the project has no review record (it isn't in the
+    review loop yet) or the commit isn't known."""
+    r = last_review(path)
+    if not r or not r.get("through"):
+        return None
+    n = git_out(path, "rev-list", "--merges", "--first-parent", "--count", f"{r['through']}..origin/{default_branch(path)}")
+    return (int(n), r) if n.isdigit() else None
+
+
+def review_notes(name, path):
+    """One quiet note on the project row: how far it is from the next review. Never red."""
+    due = reviews_due(path)
+    if not due or not due[0]:
+        return []
+    n, r = due
+    limit = cfg_get("review_after")
+    return [f"review due: {n} PRs merged since the last review ({r['date']}); Done offers it" if n >= limit else f"{n} of {limit} PRs since the last review"]
+
+
+def review_line(path):
+    """For `hyperbeam context`: where the project is in the review loop (a new session knows how much room is left), or None."""
+    due = reviews_due(path)
+    if not due:
+        return None
+    n, r = due
+    return (f"Last review {r['date']} (through {r['through']}" + (f", PRs {r['prs']}" if r.get("prs") else "") + f"); {n} PR{'s' * (n != 1)} merged since; "
+            f"a review is offered at {cfg_get('review_after')}.")
+
+
+def review_facts(path, since):
+    """What the review prompt shows: the PRs merged since `since` with the files each changed, decision records added, the size of the change, IDEAS.md."""
+    base = f"origin/{default_branch(path)}"
+    rows = [l.split(" ", 1) for l in git_out(path, "log", "--merges", "--first-parent", "--reverse", "--format=%h %s", f"{since}..{base}").splitlines() if l.strip()]
+    L = [f"Project path: {path}", f"Reviewing from: {since} (the last review's `through`, or the commit you were given)", f"Merged PRs since then: {len(rows)}", ""]
+    for h, subj in rows:
+        files = git_out(path, "diff", "--name-only", f"{h}^1", h).split()
+        L.append(f"- {subj}  [{h}]  files: " + (", ".join(files[:12]) + (f" (+{len(files) - 12} more)" if len(files) > 12 else "") or "none"))
+    L += ["", "Size of the change: " + (git_out(path, "diff", "--shortstat", f"{since}..{base}") or "unknown")]
+    rec = git_out(path, "diff", "--name-only", "--diff-filter=A", f"{since}..{base}", "--", "docs/decisions").split()
+    L += ["", "Decision records added: " + (", ".join(rec) or "none")]
+    ideas = Path(path) / "IDEAS.md"
+    L += ["", "IDEAS.md:", ideas.read_text(errors="replace").rstrip() if ideas.is_file() else "(none)"]
+    last = last_review(path)
+    L += ["", "Last review record: " + (json.dumps(last) if last else "none")]
+    return "\n".join(L) + "\n"
+
+
+def review_prompt(name, path, since):
+    """REVIEW.md plus the facts, written to the prompts folder. -> the file."""
+    return write_prompt(sanitize(name), (HERE / "REVIEW.md").read_text() + "\n\n---\n" + review_facts(path, since))
+
+
+def review_offered(name):
+    """True once per day per project: Done offers the review once, not at every press (the answer is remembered either way)."""
+    f = DATA_DIR / "review-offered.json"
+    try:
+        d = json.loads(f.read_text())
+    except (OSError, ValueError):
+        d = {}
+    today = time.strftime("%Y-%m-%d")
+    if d.get(name) == today:
+        return True
+    d[name] = today
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(d))
+    except OSError:
+        pass
+    return False
+
+
+def start_review(name, path, since):
+    """Inject the review prompt into the project's Claude (plan mode, inject_prompt). -> a sentence saying what happened."""
+    sess = sanitize(name)
+    pane = find_claude_pane(sess) if session_exists(sess) else None
+    if not pane:
+        return f"{name} is not running: open it, then ask again"
+    inject_prompt(pane, review_prompt(name, path, since), [])
+    tmux("select-window", "-t", pane, check=False)
+    tmux("select-pane", "-t", pane, check=False)
+    return f"Claude is reviewing {name} in its session (plan mode): it proposes one cleanup PR first"
+
+
+def cmd_review(a):
+    """hyperbeam review [PROJECT] [--since COMMIT] [--print]: the review prompt for a project (default $HB_PROJECT) into its Claude, or printed."""
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam review: no project (run it in a project session, or give a name)")
+    path = known_path(name)
+    r = last_review(path)
+    since = a.since or (r or {}).get("through")
+    if not since:
+        sys.exit(f"hyperbeam review: {name} has no review record (docs/reviews/): say where to start, e.g. --since <the merge commit before the first PR to review>")
+    if a.print:
+        print((HERE / "REVIEW.md").read_text() + "\n\n---\n" + review_facts(path, since))
+        return 0
+    print(f"{name}: {start_review(name, path, since)}")
+    return 0
+
+
 def drift_notes(name, path):
     """A quiet note when the run-defining files changed since the project was onboarded. Projects with a manifest but no fingerprint get a
     baseline now, without a note; a manifest written since the fingerprint counts as onboarding done (new fingerprint, no note). Never red."""
@@ -851,7 +980,7 @@ def recheck(name, path):
     if name == "hyperbeam":
         red = [*red, *tool_check_findings()]
     cn = context_note(name, path) if session_exists(sanitize(name)) else ""
-    write_status(name, red, [*drift_notes(name, path), *([cn] if cn else []), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
+    write_status(name, red, [*drift_notes(name, path), *review_notes(name, path), *([cn] if cn else []), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
 
 
 def claude_state(name):
@@ -3781,6 +3910,7 @@ def context_bundle(name, path=None, full=False, parts_only=False):
              *([("docs/REFERENCE.md", first("docs/REFERENCE.md"))] if full else []),
              ("docs/DECISIONS.md", first("docs/DECISIONS.md")),
              ("IDEAS.md", first("IDEAS.md")),
+             ("Last review", review_line(path) if path.is_dir() else None),
              (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
              (f"hyperbeam manifest (projects/{name}.toml)", man.read_text().rstrip() if man.is_file() else None),
              ("Recent history", recent_history(path) if path.is_dir() else None)]
@@ -4894,7 +5024,7 @@ class SettingsScreen(ModalScreen):
     SettingsScreen #close { height: 1 !important; border: none !important; }
     """
     LABELS = [("open_mode", "open mode"), ("claude_model", "model"), ("claude_effort", "effort"),
-              ("claude_permissions", "prompts"), ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
+              ("claude_permissions", "prompts"), ("review_after", "review at"), ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
 
     def __init__(self):
         super().__init__()
@@ -5406,6 +5536,28 @@ class Menu(App):
             self.say_from_thread(text.replace("\n", "  |  "))
         return False
 
+    def review_step(self):
+        """Done, second: a project worked on today with `review_after` or more PRs merged since its last review: offer the review pass (once a day per project).
+        Returns True if Claude was started (press Done again when it says "Review done.")."""
+        try:
+            names = sorted(load_journal()["projects"])
+        except Exception:
+            return False
+        for n in names:
+            try:
+                path = known_path(n)
+                due = reviews_due(path)
+                if not due or due[0] < cfg_get("review_after") or review_offered(n):
+                    continue
+            except Exception:
+                continue
+            if self.choose(f"{n}: {due[0]} PRs merged since the last review ({due[1]['date']}).\n\nReview them now? Claude (plan mode) checks the whole batch and "
+                           "proposes ONE cleanup PR first.", [("ask", "Ask Claude to review (r)", "r"), ("later", "Later (l)", "l")]) == "ask":
+                msg = start_review(n, path, due[1]["through"])
+                self.say_from_thread(f"Done for now: {msg}. Press Done again when it says \"Review done.\"")
+                return True
+        return False
+
     def action_done(self):
         if "@done" in self.busy:
             return self.say("Done for now is already running.")
@@ -5417,7 +5569,7 @@ class Menu(App):
         """Done for now: the wrap-up check on every project worked on since the menu started. All clean: offer to stop their sessions.
         Otherwise offer Claude (in the hyperbeam session's Claude pane); the user presses Done again when finished."""
         try:
-            if self.digest_step():
+            if self.digest_step() or self.review_step():
                 return
             names = sorted(load_journal()["projects"])
             if not names:
@@ -5972,6 +6124,11 @@ def main():
     af = sub.add_parser("align-facts", help="the facts ALIGN.md compares a project's docs against (visibility, docs layout, tests, ignores)")
     af.add_argument("path", nargs="?")
     af.set_defaults(f=cmd_align_facts)
+    rv = sub.add_parser("review", help="start the review pass for a project (REVIEW.md + the facts, in plan mode, into its Claude); default project $HB_PROJECT; --print prints the prompt")
+    rv.add_argument("project", nargs="?")
+    rv.add_argument("--since", help="the commit to review from (default: the last review record's `through`)")
+    rv.add_argument("--print", action="store_true")
+    rv.set_defaults(f=cmd_review)
     rf = sub.add_parser("refresh-prs", help="fetch a project's open PRs now so the sidebar's Merge button is right at once; run it after gh pr create (with the number) and after a merge; default project $HB_PROJECT")
     rf.add_argument("project", nargs="?")
     rf.add_argument("numbers", nargs="*", help="PR numbers just opened (looked up directly: GitHub's list lags a few seconds)")

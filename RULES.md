@@ -18,6 +18,8 @@
 - Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.
 - The sidebar's PR list refreshes by itself after `gh pr create|merge|close` (a hook installed by `hyperbeam update`): nothing to run. `hyperbeam refresh-prs`
   does it by hand.
+- IDEAS.md has `## Open` and `## Done`. The PR that finishes an item moves it to Done (PR number, decision id); new ideas go to Open. After a number of
+  merged PRs hyperbeam offers a review pass (`hyperbeam review`, REVIEW.md): one cleanup PR for the whole batch, and a record in docs/reviews/.
 - Work on a branch per task. Commit, push, open a PR. End the PR description with a short
   manual test checklist. Don't merge unless the user says so.
 - If you change user-facing behaviour, update the README in the same PR.
