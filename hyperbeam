@@ -1344,8 +1344,21 @@ def pane_role(cmd, win, first_in_window, services):
     return "claude" if cmd == "claude" else "shell" if cmd in SHELLS else "other"
 
 
+def pane_program(shell_pid):
+    """The command line of the program running in a pane's shell (its first child process), e.g. `nvim notes.md`, `tail -f log`; '' when the shell is idle,
+    the program is a shell or Claude (restored by their own rules) or `sudo` (never started again by itself)."""
+    try:
+        kids = Path(f"/proc/{shell_pid}/task/{shell_pid}/children").read_text().split()
+        argv = [a for a in Path(f"/proc/{kids[0]}/cmdline").read_bytes().decode(errors="replace").split("\0") if a]
+    except (OSError, IndexError):
+        return ""
+    if not argv or Path(argv[0]).name in SHELLS | {"claude", "sudo", "tmux"}:
+        return ""
+    return shlex.join(argv)
+
+
 def snapshot(sess, man):
-    """Windows (name, layout, active) and panes (cwd, role, active) of a session."""
+    """Windows (name, layout, active) and panes (cwd, role, active, prog) of a session; prog = the program running in an `other` pane."""
     services = {x["name"] for x in (man or {}).get("service", [])}
     wins = {}
     for line in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_index}\t#{window_name}\t#{window_layout}\t#{window_active}",
@@ -1353,21 +1366,28 @@ def snapshot(sess, man):
         i, name, layout, active = line.split("\t")
         wins[i] = dict(name=name, layout=layout, active=active == "1", panes=[])
     for line in tmux("list-panes", "-s", "-t", f"={sess}", "-F",
-                     "#{window_index}\t#{pane_index}\t#{pane_current_path}\t#{pane_active}\t#{pane_current_command}",
+                     "#{window_index}\t#{pane_index}\t#{pane_current_path}\t#{pane_active}\t#{pane_current_command}\t#{pane_pid}",
                      check=False).stdout.splitlines():
-        wi, pi, cwd, active, cmd = line.split("\t")
+        wi, pi, cwd, active, cmd, pid = line.split("\t")
         w = wins.get(wi)
         if w is not None:
-            w["panes"].append(dict(cwd=cwd, role=pane_role(cmd, w["name"], not w["panes"], services), active=active == "1"))
+            role = pane_role(cmd, w["name"], not w["panes"], services)
+            pane = dict(cwd=cwd, role=role, active=active == "1")
+            prog = pane_program(pid) if role == "other" else ""
+            if prog:
+                pane["prog"] = prog
+            w["panes"].append(pane)
     return [w for _, w in sorted(wins.items(), key=lambda kv: int(kv[0])) if w["panes"]]
 
 
 def save_layout(name, clean=False):
     """Write the session's layout. clean=True is Stop: it records 'stopped cleanly'."""
     sess = sanitize(name)
-    if sess == MENU or not session_exists(sess):
+    if not session_exists(sess):
         return False
     wins = snapshot(sess, load_manifests().get(name))
+    if sess == MENU:
+        wins = [w for w in wins if w["name"] != "menu"]        # the menu window is always rebuilt by ensure_menu
     if not wins:
         return False
     d = layout_file(name)
@@ -1386,7 +1406,7 @@ def save_all():
         sess, tag = (line.split("\t") + [""])[:2]
         if tag == "1":
             refresh_claude_pane(sess)       # HB_CLAUDE_PANE stays right (a no-op while the pane it names exists)
-        if tag == "1" and sess != MENU:
+        if tag == "1":
             n += save_layout(session_project(sess))
     return n
 
@@ -1480,7 +1500,7 @@ def crash_note(name):
     """A saved layout with no clean-stop record and no running session: the last session crashed, was killed, or the machine went down.
     Alone it is only a note (kk shows it until the project is opened); it is not a problem."""
     lay = load_layout(name)
-    if lay and not lay.get("clean") and not session_exists(sanitize(name)):
+    if lay and sanitize(name) != MENU and not lay.get("clean") and not session_exists(sanitize(name)):
         return f"last session did not stop cleanly (layout saved {ago_text(lay['saved'])}: crash, reboot or killed session)"
     return ""
 
@@ -1701,7 +1721,7 @@ def open_project(name, path, man, ask, say, onboard=False):
             investigate_window(name, path, "Onboard requested; the session was already running")
         return
     lay = load_layout(name)
-    restore = lay if lay and ask(f"Restore last layout of {name}?\n\n{describe_layout(lay)}") else None
+    restore = lay            # layouts always come back (windows, panes, programs); the Claude choice is its own step
     say(f"{name}: checking git state...")
     findings, notes = start_check(name, path)
     recover = False
@@ -1742,17 +1762,34 @@ def menu_cmd():
 
 def ensure_menu():
     """The `hyperbeam` session, two windows: `home` (Claude in the dev folder ~/projects/hyperbeam on the left, a shell on the right; what the sidebar shows
-    on its right) and `menu` (the menu, for SSH and the switch/window modes)."""
+    on its right) and `menu` (the menu, for SSH and the switch/window modes). `home` comes back as it was saved (windows, panes, the programs in them,
+    Claude with --continue); without a saved layout it is the default."""
     if session_exists(MENU):
         return
     clean_server_env()
     dev = known_path("hyperbeam")                 # Claude works in the dev folder; the app itself runs from HERE (the installed copy)
-    claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(dev),
-                       "-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', dev)}", "-e", "HOST=0.0.0.0", "-e", f"PATH={session_path()}"])
-    publish_claude_pane(MENU, claude)
-    new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(dev)])
-    send_line(claude, f"export HB_CLAUDE_PANE={claude}; " + claude_base())
-    tmux("select-pane", "-t", claude)
+    envargs = ["-e", "HB_PROJECT=hyperbeam", "-e", f"HB_STATE={project_dir('hyperbeam', dev)}", "-e", "HOST=0.0.0.0", "-e", f"PATH={session_path()}"]
+    lay = load_layout("hyperbeam")
+    plan = None
+    if lay:
+        try:
+            plan = restore_layout(MENU, dev, lay, envargs)
+        except subprocess.CalledProcessError:
+            tmux("kill-session", "-t", f"={MENU}", check=False)
+    if plan:
+        claudes = [p for p in plan if p[1] == "claude"] or plan[:1]
+        publish_claude_pane(MENU, claudes[0][0], plan)
+        seen = set()
+        for pid, _, cwd in claudes:
+            send_line(pid, claude_cmd(cont=cwd not in seen))
+            seen.add(cwd)
+        restart_programs(lay, plan)
+    else:
+        claude = new_pane(["new-session", "-d", "-s", MENU, "-n", "home", "-x", "200", "-y", "50", "-c", str(dev), *envargs])
+        publish_claude_pane(MENU, claude)
+        new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(dev)])
+        send_line(claude, f"export HB_CLAUDE_PANE={claude}; " + claude_base())
+        tmux("select-pane", "-t", claude)
     new_pane(["new-window", "-d", "-t", f"={MENU}:", "-n", "menu", "-c", str(HERE)], menu_cmd())
     tag_session(MENU)
 
@@ -1788,6 +1825,13 @@ def restore_layout(sess, path, lay, envargs):
     if active_win:
         tmux("select-window", "-t", active_win)
     return plan
+
+
+def restart_programs(lay, plan):
+    """Type each `other` pane's saved program into its shell (plan and lay list the panes in the same order). Ctrl-C leaves a shell."""
+    for pane, (pid, role, _) in zip([p for w in lay["windows"] for p in w["panes"]], plan):
+        if role == "other" and pane.get("prog"):
+            send_line(pid, pane["prog"])
 
 
 def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=()):
@@ -1843,6 +1887,8 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
         say(f"{name}: {win}: {result}")
         if result.startswith("WARNING"):
             failures.append(dict(name=win, result=result, tail=pane_tail(target)))
+    if restore and plan:
+        restart_programs(restore, plan)
     if shell:
         ff = ""
         if findings or notes:

@@ -8,13 +8,13 @@ Marked **[gap]** = known difference between what was intended and what is built.
 ```
  HOTKEY ─> sidebar window (kitty: menu left | tmux right)
             ├─ hyperbeam row (always first) = session "hyperbeam"
-            │     home: Claude in ~/projects/hyperbeam + shell   [gap] layout NOT saved: after a reboot it is rebuilt as the default
+            │     home: Claude in ~/projects/hyperbeam + shell   layout saved, restored after a reboot
             │     menu: the menu again (phone / SSH)
             └─ project row ── Open ──┐
                                      ▼
           no manifest? ──yes──> Onboard: ONBOARDING.md + ALIGN.md (plan, wait for approval, PR)
                 │no
-          saved layout? ──> "Restore last layout?" yes: windows + claude --continue (other panes: empty shells)
+          saved layout? ──> restored without asking: windows, panes, their programs, claude --continue
                 │
           services start in order ─> start check (git, crash) ─> shell runs kk
                 │                    red problem? → offer RECOVER.md
@@ -32,7 +32,7 @@ Marked **[gap]** = known difference between what was intended and what is built.
                              3. wrap-up check on every project touched → stop their sessions
 
  Background: minute recheck (dots, notes: drift, stale docs, review count, context size), PR poll,
- usage line (5h / week), daily tool check, layout save every 5 min (project sessions only).
+ usage line (5h / week), daily tool check, layout save every 5 min (every session, the hyperbeam one too).
 ```
 
 ## Which prompt runs where
@@ -53,7 +53,7 @@ Every injected prompt starts in plan mode (Opus plans, Sonnet builds).
 - After `review_after` (5) merged PRs since the record's `through` commit: a quiet note on the row, a line in `hyperbeam context`, and the offer at Done (once a day).
 
 ## Planned (not built; each PR updates this page)
-1. **Layouts come back whole**: the hyperbeam session is saved too; panes remember the program that ran in them (not just Claude) and it is started again; the "Restore?" question goes away.
+1. ~~Layouts come back whole~~ (built: the hyperbeam session is saved too; panes remember their program and start it again; no "Restore?" question).
 2. **Every project is in the review loop**: no record yet = count from onboarding; the offer also appears on Open, and the Project screen gets a Review button.
 3. **Work loop, step 1**: when a project's Claude starts, a choice: Continue last conversation / Fresh plan session (START.md: read the state, bring it to a good state, propose the next 1-3 items) / Review (when due). The same choice after a Merge finishes a task, so a conversation has an end.
 4. Later: a "presentable" check at the end of the day, the phone view, the sidebar redesign.
