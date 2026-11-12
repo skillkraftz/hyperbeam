@@ -31,16 +31,16 @@ class StopMovesClients(unittest.TestCase):
     def test_the_sidebars_client_goes_home_before_the_session_is_killed(self):
         hb.stop_project("proj", None, say=lambda *a: None)
         verbs = [c[0] for c in self.calls]
-        self.assertIn(("switch-client", "-c", "/dev/pts/7", "-t", "=hyperbeam:home"), self.calls)
+        self.assertIn(("switch-client", "-c", "/dev/pts/7", "-t", "=manager:home"), self.calls)
         self.assertEqual(sum(1 for c in self.calls if c[0] == "switch-client"), 1)     # only the client that was on proj
         self.assertLess(verbs.index("switch-client"), verbs.index("kill-session"))
 
 
 class Order(unittest.TestCase):
-    def test_hyperbeam_is_first_even_when_others_are_running_or_sort_before_it(self):
-        stub = type("S", (), {"projects": [dict(name=n, running=r, opened=0) for n, r in (("alpha", True), ("hyperbeam", False), ("zeta", True))]})()
+    def test_the_manager_is_first_even_when_others_are_running_or_sort_before_it(self):
+        stub = type("S", (), {"projects": [dict(name=n, running=r, opened=0) for n, r in (("alpha", True), ("manager", False), ("zeta", True), ("hyperbeam", True))]})()
         names = [p["name"] for p in hb.Menu.ordered(stub)]
-        self.assertEqual(names, ["hyperbeam", "alpha", "zeta"])
+        self.assertEqual(names, ["manager", "alpha", "hyperbeam", "zeta"])
 
 
 if __name__ == "__main__":
