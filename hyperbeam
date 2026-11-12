@@ -751,10 +751,28 @@ def last_review(path):
     return r
 
 
-def reviews_due(path):
-    """(merged PRs since the last review's `through` commit, that review record), or None when the project has no review record (it isn't in the
-    review loop yet) or the commit isn't known."""
+def review_baseline(name, path):
+    """A project with no review record yet counts from its onboarding: the last commit of the default branch at the fingerprint's date (the root commit if
+    every commit is newer) as a record-like dict {date, through, baseline: True}; None when the project was never onboarded or has no history."""
+    try:
+        date = json.loads((project_dir(name, path, create=False) / "fingerprint.json").read_text())["date"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    base = f"origin/{default_branch(path)}"
+    c = git_out(path, "rev-list", "-1", "--first-parent", f"--before={date}", base) or (git_out(path, "rev-list", "--max-parents=0", base).split() or [""])[-1]
+    return dict(date=date[:10], through=c[:7], baseline=True) if c else None
+
+
+def since_text(r):
+    return f"onboarding ({r['date']})" if r.get("baseline") else f"the last review ({r['date']})"
+
+
+def reviews_due(path, name=None):
+    """(merged PRs since the last review's `through` commit, that review record), or None when the commit isn't known or the project is in no loop at all
+    (no review record and never onboarded). With no record yet the count starts at onboarding (`review_baseline`); the first review writes the record."""
     r = last_review(path)
+    if not r or not r.get("through"):
+        r = review_baseline(name or Path(path).name, path)
     if not r or not r.get("through"):
         return None
     n = git_out(path, "rev-list", "--merges", "--first-parent", "--count", f"{r['through']}..origin/{default_branch(path)}")
@@ -763,20 +781,22 @@ def reviews_due(path):
 
 def review_notes(name, path):
     """One quiet note on the project row: how far it is from the next review. Never red."""
-    due = reviews_due(path)
+    due = reviews_due(path, name)
     if not due or not due[0]:
         return []
     n, r = due
     limit = cfg_get("review_after")
-    return [f"review due: {n} PRs merged since the last review ({r['date']}); Done offers it" if n >= limit else f"{n} of {limit} PRs since the last review"]
+    return [f"review due: {n} PRs merged since {since_text(r)}; Open and Done offer it (Project, Review)" if n >= limit else f"{n} of {limit} PRs since {'onboarding' if r.get('baseline') else 'the last review'}"]
 
 
-def review_line(path):
+def review_line(path, name=None):
     """For `hyperbeam context`: where the project is in the review loop (a new session knows how much room is left), or None."""
-    due = reviews_due(path)
+    due = reviews_due(path, name)
     if not due:
         return None
     n, r = due
+    if r.get("baseline"):
+        return f"No review yet; counting from onboarding ({r['date']}, commit {r['through']}): {n} PR{'s' * (n != 1)} merged since; a review is offered at {cfg_get('review_after')}."
     return (f"Last review {r['date']} (through {r['through']}" + (f", PRs {r['prs']}" if r.get("prs") else "") + f"); {n} PR{'s' * (n != 1)} merged since; "
             f"a review is offered at {cfg_get('review_after')}.")
 
@@ -920,9 +940,10 @@ def cmd_review(a):
         sys.exit("hyperbeam review: no project (run it in a project session, or give a name)")
     path = known_path(name)
     r = last_review(path)
-    since = a.since or (r or {}).get("through")
+    due = reviews_due(path, name)
+    since = a.since or (due[1]["through"] if due else None)
     if not since:
-        sys.exit(f"hyperbeam review: {name} has no review record (docs/reviews/): say where to start, e.g. --since <the merge commit before the first PR to review>")
+        sys.exit(f"hyperbeam review: {name} has no review record (docs/reviews/) and was never onboarded: say where to start, e.g. --since <the merge commit before the first PR to review>")
     if a.print:
         print(PLAN_FIRST + review_text(name, path, since))
         return 0
@@ -1536,7 +1557,7 @@ def start_check(name, path, fetch=True):
     """(red, notes) on Open. Only red problems make Open offer Claude; a crash (saved layout not clean) is a note, like the git state."""
     red, notes = git_red_notes(path, fetch)
     crash = crash_note(name)
-    return red, drift_notes(name, path) + stale_doc_notes(name, path) + ([crash] if crash else []) + notes
+    return red, drift_notes(name, path) + review_notes(name, path) + stale_doc_notes(name, path) + ([crash] if crash else []) + notes
 
 
 # ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
@@ -4072,7 +4093,7 @@ def context_bundle(name, path=None, full=False, parts_only=False):
              *([("docs/REFERENCE.md", first("docs/REFERENCE.md"))] if full else []),
              ("docs/DECISIONS.md", first("docs/DECISIONS.md")),
              ("IDEAS.md", first("IDEAS.md")),
-             ("Last review", review_line(path) if path.is_dir() else None),
+             ("Last review", review_line(path, name) if path.is_dir() else None),
              (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
              (f"hyperbeam manifest (projects/{name}.toml)", man.read_text().rstrip() if man.is_file() else None),
              ("Recent history", recent_history(path) if path.is_dir() else None)]
@@ -4996,7 +5017,7 @@ class ProjectScreen(ModalScreen):
             with Container(id="pbuttons"):
                 for bid, label in [("update", "Update"), ("install", "Install"), ("test", "Test (lab)"), ("version", "Version"), ("help_verbs", "Help"), ("onboard", "Onboard"),
                                    ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"), ("info", "Info window"),
-                                   ("mark_onboarded", "Mark onboarded"), *([("back", "Previous Claude")] if self.back else []), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
+                                   ("mark_onboarded", "Mark onboarded"), ("review", "Review"), *([("back", "Previous Claude")] if self.back else []), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
                                    ("close", "Close")]:
                     b = Button(label, id=f"pb-{bid}")
                     b.can_focus = False
@@ -5711,12 +5732,12 @@ class Menu(App):
         for n in names:
             try:
                 path = known_path(n)
-                due = reviews_due(path)
+                due = reviews_due(path, n)
                 if not due or due[0] < cfg_get("review_after") or daily_done(f"review:{n}"):
                     continue
             except Exception:
                 continue
-            if self.choose(f"{n}: {due[0]} PRs merged since the last review ({due[1]['date']}).\n\nReview them now? A fresh Claude in plan mode (Opus) replaces the one "
+            if self.choose(f"{n}: {due[0]} PRs merged since {since_text(due[1])}.\n\nReview them now? A fresh Claude in plan mode (Opus) replaces the one "
                            "in that session, checks the whole batch and proposes ONE cleanup PR first. The old conversation comes back with Previous Claude.",
                            [("ask", "Ask Claude to review (r)", "r"), ("later", "Later (l)", "l")]) != "ask":
                 daily_mark(f"review:{n}")
@@ -5944,6 +5965,20 @@ class Menu(App):
             return self.say("Nothing selected.")
         ok, msg = back_claude(p["name"])
         self.say(f"{p['name']}: {msg}")
+
+    def action_review(self):
+        """Review button (Project screen): the review pass for the selected project now, in a fresh plan-mode Claude that replaces its Claude (Previous Claude
+        brings the old conversation back). Counting starts at the last review, or at onboarding for a project with no record yet."""
+        p = self.current()
+        if not p:
+            return self.say("Nothing selected.")
+        due = reviews_due(p["path"], p["name"])
+        if not due:
+            return self.say(f"{p['name']}: no review record and never onboarded: use Onboard first.")
+        if not due[0]:
+            return self.say(f"{p['name']}: no PRs merged since {since_text(due[1])}: nothing to review.")
+        self.say(f"{p['name']}: starting the review ({due[0]} PRs since {since_text(due[1])})...")
+        self.run_worker(lambda: self.say_from_thread(f"{p['name']}: " + start_review(p["name"], Path(p["path"]), due[1]["through"])[1]), thread=True)
 
     def run_project_action(self, what):
         if what and hasattr(self, "action_" + what):

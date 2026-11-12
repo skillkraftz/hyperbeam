@@ -1,5 +1,6 @@
 """The review pass: counting merged PRs since the last review record, the row note, the context line, the facts for the prompt, the once-a-day offer,
 and the Done step. Runs in the lab: hyperbeam lab run --why "tests" -- uv run --quiet --with textual python3 -m unittest discover -s tests -v"""
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,6 +72,69 @@ class ReviewCounting(unittest.TestCase):
         self.assertIn("a.txt, docs/decisions/2026-11-12-x.md", facts)
         self.assertIn("Decision records added: docs/decisions/2026-11-12-x.md", facts)
         self.assertLess(facts.index("#7"), facts.index("#8"))            # oldest first
+
+
+class FromOnboarding(unittest.TestCase):
+    """A project with no review record counts from its onboarding (the fingerprint date); the first review writes the record and the normal count follows."""
+
+    def setUp(self):
+        self.repo = Repo()
+        self.path = self.repo.r
+        self.old = hb.DATA_DIR
+        hb.DATA_DIR = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        hb.DATA_DIR = self.old
+
+    def onboarded(self, date):
+        f = hb.project_dir("r", self.path) / "fingerprint.json"
+        f.write_text('{"date": "%s", "manifest_mtime": 0, "parts": {}}' % date)
+
+    def test_never_onboarded_is_in_no_loop(self):
+        self.repo.merge_pr(1)
+        self.assertIsNone(hb.reviews_due(self.path))
+
+    def test_counts_from_the_commit_at_onboarding(self):
+        os.environ["GIT_COMMITTER_DATE"] = "2020-01-01T00:00:00"          # this merge is older than the onboarding
+        try:
+            self.repo.merge_pr(1)
+        finally:
+            del os.environ["GIT_COMMITTER_DATE"]
+        self.onboarded("2020-06-01 00:00")
+        self.assertEqual(hb.reviews_due(self.path)[0], 0)
+        self.repo.merge_pr(2)
+        self.repo.merge_pr(3)
+        n, rec = hb.reviews_due(self.path)
+        self.assertEqual((n, rec["baseline"], rec["date"]), (2, True, "2020-06-01"))
+        self.assertEqual(hb.review_notes("r", self.path), ["2 of 5 PRs since onboarding"])
+        self.assertIn("No review yet; counting from onboarding (2020-06-01", hb.review_line(self.path, "r"))
+
+    def test_onboarded_before_any_commit_counts_all_merges(self):
+        self.repo.merge_pr(1)
+        self.repo.merge_pr(2)
+        self.onboarded("2000-01-01 00:00")
+        self.assertEqual(hb.reviews_due(self.path)[0], 2)
+
+    def test_due_note_names_onboarding_and_the_button(self):
+        for n in range(1, 6):
+            self.repo.merge_pr(n)
+        self.onboarded("2000-01-01 00:00")
+        note = hb.review_notes("r", self.path)[0]
+        self.assertTrue(note.startswith("review due: 5 PRs merged since onboarding (2000-01-01)"), note)
+        self.assertIn("Review", note)
+
+    def test_a_record_wins_over_onboarding(self):
+        self.repo.merge_pr(1)
+        self.onboarded("2000-01-01 00:00")
+        through = self.repo.merge_pr(2)
+        self.repo.review_record("2026-11-12", through)
+        n, rec = hb.reviews_due(self.path)
+        self.assertEqual((n, rec.get("baseline")), (0, None))
+
+    def test_start_check_carries_the_note(self):
+        self.onboarded("2000-01-01 00:00")
+        self.repo.merge_pr(1)
+        self.assertIn("1 of 5 PRs since onboarding", hb.review_notes("r", self.path))
 
 
 class FrontMatter(unittest.TestCase):
