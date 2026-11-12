@@ -121,6 +121,10 @@ class Fake:
     call_from_thread = lambda self, f, *a: f(*a)
     refresh_list = lambda self: None
     _merge_one = hb.Menu._merge_one
+    next_steps = None
+
+    def next_step(self, p, merged):                       # the fresh-start choice after a finished run (tests/test_start.py)
+        self.next_steps = (self.next_steps or []) + [[x["number"] for x in merged]]
 
     def _ask_update(self, p, pr, behind, base, conflicts=()):
         self.asked_update.append((pr["number"], list(conflicts)))
@@ -169,6 +173,7 @@ class MergeAll(unittest.TestCase):
         self.assertEqual(self.log, [33, 34, 35])
         self.assertEqual((len(f.asked), f.updated, self.left(p)), (1, 1, []))
         self.assertEqual(f.say[-1], "hyperbeam: merged #33, #34, #35")
+        self.assertEqual(f.next_steps, [[33, 34, 35]])                 # the work is done: the fresh-start choice comes once, before hyperbeam's update restarts the menu
 
     def test_a_conflict_stops_the_run_and_asks_claude_to_rebase(self):
         self.state = lambda n: {"behind": 1, "overlap": ["D.md"], "conflicts": ["D.md"]} if n == 34 else {"behind": 0, "overlap": [], "conflicts": []}
@@ -177,6 +182,7 @@ class MergeAll(unittest.TestCase):
         self.assertEqual(f.asked_update, [(34, ["D.md"])])
         self.assertEqual(self.left(p), [35, 34])
         self.assertIn("stopped at #34: asked Claude to rebase", f.say[-1])
+        self.assertIsNone(f.next_steps)                                # a stopped run is not a finished piece of work
 
     def test_overlap_asks_and_cancel_stops(self):
         self.state = lambda n: {"behind": 1, "overlap": ["hyperbeam"], "conflicts": []} if n == 34 else {"behind": 0, "overlap": [], "conflicts": []}

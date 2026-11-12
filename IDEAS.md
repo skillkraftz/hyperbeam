@@ -11,7 +11,7 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - Compact local context, next step (the CLAUDE.md trim is done, PR #27): trim the other projects' CLAUDE.md the same way (dotwork 13 KB); generated per-project `.hyperbeam/MAP.md` (file map, recent changes, open PR) so a session reads one file.
 - Merge-time docs gate (stale docs: ask Claude to update / merge anyway), "Mark docs reviewed" snooze for the stale-docs note, a Promote prompt that rewrites a settled prototype's README for an end user.
 - Docker in the lab: works for single containers and host-network compose (docs/PODMAN.md); compose's own networks need `sudo loginctl enable-linger hblab` (untested) when a project needs them.
-- **Work loop (to plan):** onboarding runs when a stopped session is started (a new Claude session, since changes are coming) and brings the project to a good state; then Claude recommends features or lists the still-relevant ideas to pick from; about 5 PRs; a review pass (refactor, README and the docs it touches); repeat until done. At the end the system is up to date and the project presentable; if not, that is the last work of the day.
+- **Work loop, step 2:** step 1 is built (PR #52: the start choice with a fresh plan session, the same choice after a Merge). Left: ask at the hyperbeam session's start too (the sidebar has no UI when it is created); the end of the day (system up to date, project presentable, else that is the last work of the day).
 - A "presentable" check at the end of the loop (README matches behaviour, screenshots current, no stale items) and how it feeds the day's close.
 - When a Claude session starts and ends beyond token cost: tie it to the work loop instead of conversation size.
 - README and screenshots rebuilt from the implemented decisions and the Done list (the condensing tool the decision records are meant for).
@@ -19,6 +19,7 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - Swap a fresh plan-mode Claude (with a snapshot and Previous Claude) for the other propose-then-wait steps too (Onboard, Fix, wrap-up, tools): today they inject `/plan` into the running Claude, which keeps its history but depends on the session being idle.
 
 ## Done
+- ~~Work loop step 1: a fresh plan session (START.md) / review / continue when Claude starts, and after a finished Merge run~~ Done (PR #52, decision work-loop-start-and-end).
 - ~~Every project in the review loop (count from onboarding), a Review button in the Project screen~~ Done (PR #51, decision review-every-project).
 - ~~Review loop: Copy report, a PR badge, a Merge button.~~ Done (PR #20).
 - ~~Project screen and drift detection.~~ Done (PR #22), kept simple: the polish phase will redesign the sidebar.

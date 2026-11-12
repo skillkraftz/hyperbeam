@@ -602,6 +602,60 @@ def start_claude_with_prompt(pane, f, add_dirs=(), cont=True):
     send_line(pane, f"{base} --continue{arg} || {base}{arg}" if cont else f"{base}{arg}")
 
 
+def latest_conversation(path):
+    """The newest conversation Claude Code kept for this folder (~/.claude/projects/<folder>/<session id>.jsonl), or None."""
+    d = CLAUDE_DIR / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(path))
+    try:
+        return max(d.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, default=None)
+    except OSError:
+        return None
+
+
+def set_aside(name, path, why):
+    """Remember the folder's newest conversation as the previous one (`Previous Claude` brings it back) before a fresh Claude starts in its place."""
+    f = latest_conversation(path)
+    if f:
+        try:
+            pfile(name, "previous-claude").write_text(json.dumps({"session_id": f.stem, "time": time.time(), "why": why}))
+        except OSError:
+            pass
+
+
+def start_text(name, path):
+    """START.md, the facts, and the snapshot: what a fresh plan-mode Claude starts a piece of work from."""
+    L = [f"Project: {name}", f"Project path: {path}", f"Today: {time.strftime('%Y-%m-%d')}", ""]
+    try:
+        prs = open_prs(name, path)
+    except Exception:
+        prs = []
+    L.append("Open PRs (yours): " + (", ".join(f"#{x['number']} {x['title']}" for x in prs) if prs else "none"))
+    return (HERE / "START.md").read_text() + "\n\n---\n" + "\n".join(L) + "\n---\n" + review_snapshot(name, path)
+
+
+def start_fresh(name, path):
+    """A fresh plan-mode Claude (START.md) replaces the project's running Claude (swap_claude). -> (started, message)."""
+    f = write_prompt(sanitize(name), start_text(name, path))          # built first: the snapshot includes what the Claude being replaced last said
+    return swap_claude(name, path, f, "fresh start", [HERE] if name == "hyperbeam" else [])
+
+
+def begin_claude(name, path, pane, begin, cont=False):
+    """Type the command that starts the project's Claude in `pane`. begin: "fresh" (a new plan-mode Claude from START.md), "review" (a new plan-mode Claude
+    from REVIEW.md, when one is due), "continue" (`claude --continue`); anything else: plain claude, continuing only when `cont`. A fresh or review start
+    sets the folder's last conversation aside (Previous Claude)."""
+    dirs = [HERE] if name == "hyperbeam" else []
+    due = reviews_due(path, name) if begin == "review" else None
+    if begin == "review" and not due:
+        begin = "fresh"
+    if begin == "fresh":
+        f = write_prompt(sanitize(name), start_text(name, path))
+    elif begin == "review":
+        f = review_prompt(name, path, due[1]["through"])
+    else:
+        return send_line(pane, claude_cmd(cont=cont or begin == "continue"))
+    set_aside(name, path, begin)
+    start_claude_with_prompt(pane, f, dirs, cont=False)
+
+
 def send_line(target, text):
     tmux("send-keys", "-t", target, "-l", text)
     tmux("send-keys", "-t", target, "Enter")
@@ -1730,9 +1784,32 @@ def ask_tty(text):
     return input("y/n: ").strip().lower().startswith("y")
 
 
-def open_project(name, path, man, ask, say, onboard=False):
-    """Everything Open does before showing the session: the session if it isn't running (asking about the saved layout and,
-    if the start check found something, about Claude), or the investigate window on Onboard."""
+def choose_tty(text, options, enter=None):
+    """Pick one of `options` [(id, label, key)] in the terminal; Enter takes `enter`. No terminal: continue the last conversation (what Open always did)."""
+    if not sys.stdin.isatty():
+        return "continue" if any(o[0] == "continue" for o in options) else enter
+    print(text)
+    for oid, label, key in options:
+        print(f"  {key}) {label}")
+    ans = input(f"[{next((k for o, _, k in options if o == enter), '')}]: ").strip().lower()
+    return next((o for o, _, k in options if k == ans), enter)
+
+
+def start_choice(name, path, conv, choose):
+    """How Claude starts in a project that has an earlier conversation: fresh plan session (the default), review (only when due), or continue. Escape = continue."""
+    due = reviews_due(path, name)
+    review = bool(due and due[0] >= cfg_get("review_after"))
+    text = (f"{name}: how should Claude start?\n\nFresh plan session: a new Claude in plan mode reads the project's state, brings it to a good state and proposes what to do "
+            f"next, then waits. The last conversation ({ago_text(conv.stat().st_mtime)}) is kept: Previous Claude brings it back.\nContinue: pick up that conversation.")
+    if review:
+        text += f"\n\nA review is due: {due[0]} PRs merged since {since_text(due[1])}."
+    opts = [("fresh", "Fresh plan session (f)", "f"), *([("review", "Review (r)", "r")] if review else []), ("continue", "Continue last conversation (c)", "c")]
+    return choose(text, opts, "fresh")
+
+
+def open_project(name, path, man, ask, say, onboard=False, choose=choose_tty):
+    """Everything Open does before showing the session: the session if it isn't running (the saved layout comes back; if the start check found something,
+    asking about Claude; with an earlier conversation, asking how Claude starts: fresh plan session, review, continue), or the investigate window on Onboard."""
     sess = sanitize(name)
     ensure_link(name, path)
     if sess == MENU:
@@ -1748,8 +1825,12 @@ def open_project(name, path, man, ask, say, onboard=False):
     recover = False
     if findings and man and not onboard:
         recover = ask("Start Claude to sort it out?\n\n" + "\n".join(f"- {f}" for f in findings))
+    begin = None
+    conv = latest_conversation(path)
+    if man and not onboard and not recover and conv:
+        begin = start_choice(name, path, conv, choose)
     start_session(name, man, say, path=path, reason="Onboard requested" if onboard else None,
-                  restore=restore, findings=findings, recover=recover, notes=notes)
+                  restore=restore, findings=findings, recover=recover, notes=notes, begin=begin)
 
 
 def publish_claude_pane(sess, pane, plan=()):
@@ -1855,7 +1936,7 @@ def restart_programs(lay, plan):
             send_line(pid, pane["prog"])
 
 
-def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=()):
+def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=(), begin=None):
     """Create the project's session: the default layout, or `restore` (a saved layout).
     Default: window `work` (Claude left, a shell right), then one window per service. Services start in manifest order, each after the
     previous one is ready. Then the first shell pane prints the start-check findings and real warnings and runs `kk`, and Claude starts:
@@ -1930,7 +2011,7 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
         inject_prompt(first_claude, recover_prompt(name, path, sess, findings))
         say(f"{name}: Claude starts with the recover prompt")
     else:
-        send_line(first_claude, claude_cmd(cont=cont))
+        begin_claude(name, path, first_claude, begin, cont)
     seen = {next(c for pid, _, c in plan if pid == first_claude)}
     for pid, role, cwd in claude_panes[1:]:          # more Claude panes: continue only if the directory differs (one conversation per directory)
         send_line(pid, claude_cmd(cont=cwd not in seen))
@@ -5636,7 +5717,7 @@ class Menu(App):
         Claude with the investigate prompt), then show it. Onboard forces the investigate prompt."""
         name, sess = p["name"], sanitize(p["name"])
         try:
-            open_project(name, p["path"], load_manifests().get(name), self.ask, self.say_from_thread, onboard)
+            open_project(name, p["path"], load_manifests().get(name), self.ask, self.say_from_thread, onboard, choose=self.choose)
             touch_opened(name)
             how = show_session(sess)
             self.say_from_thread(f"{name}: {how} ({HINT})")
@@ -5878,6 +5959,8 @@ class Menu(App):
             summary = (("merged " + ", ".join(f"#{x['number']}" for x in merged)) if merged else "nothing merged") + (f"; {stopped}" if stopped else "")
             if merged and name == "hyperbeam":
                 self.say_from_thread(f"{name}: {summary}")
+                if not stopped:
+                    self.next_step(p, merged)                      # before the update: it restarts this menu
                 self.call_from_thread(self.update_hyperbeam)       # the menu restarts itself: this runs in a popup
             elif merged and local_ok:
                 lines = []                                         # merged and pulled: now the project's own update (install, restart services), one click in all
@@ -5886,10 +5969,32 @@ class Menu(App):
                 self.say_from_thread(f"{name}: {summary}; update {'ok' if rc == 0 else 'FAILED'}: {last}")
             else:
                 self.say_from_thread(f"{name}: {summary}")
+            if merged and not stopped and name != "hyperbeam":
+                self.next_step(p, merged)
         except Exception as e:
             self.say_from_thread(f"{name}: merge ERROR {e}" + (f" (merged {', '.join('#' + str(x['number']) for x in merged)} before)" if merged else ""))
         finally:
             self.busy.discard(name)
+
+    def next_step(self, p, merged):
+        """A Merge run finished: that piece of work is done, so a conversation has an end. If the project's session runs, offer a fresh plan session (a new Claude in
+        plan mode proposes what to do next; Previous Claude keeps the old conversation), a review when one is due, or keeping the conversation."""
+        name = p["name"]
+        if not session_exists(sanitize(name)):
+            return
+        due = reviews_due(p["path"], name)
+        review = bool(due and due[0] >= cfg_get("review_after"))
+        opts = [("fresh", "Fresh plan session (f)", "f"), *([("review", "Review (r)", "r")] if review else []), ("keep", "Keep this conversation (k)", "k")]
+        pick = self.choose(f"{name}: merged {', '.join('#' + str(x['number']) for x in merged)}. That piece of work is done: start the next one fresh?\n\n"
+                           "Fresh plan session: a new Claude in plan mode reads the state and proposes what to do next, then waits; the old conversation comes back with "
+                           "Previous Claude." + (f"\n\nA review is due: {due[0]} PRs merged since {since_text(due[1])}." if review else ""), opts, "fresh")
+        if pick == "fresh":
+            ok, msg = start_fresh(name, Path(p["path"]))
+        elif pick == "review":
+            ok, msg = start_review(name, Path(p["path"]), due[1]["through"])
+        else:
+            return
+        self.say_from_thread(f"{name}: {msg}")
 
     def _ask_update(self, p, pr, behind, base, conflicts=()):
         """Ask the project's Claude to rebase the PR onto its base and re-test (update_prompt). -> the sentence that stops the merge run."""

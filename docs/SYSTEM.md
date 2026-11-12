@@ -14,16 +14,19 @@ Marked **[gap]** = known difference between what was intended and what is built.
                                      ▼
           no manifest? ──yes──> Onboard: ONBOARDING.md + ALIGN.md (plan, wait for approval, PR)
                 │no
-          saved layout? ──> restored without asking: windows, panes, their programs, claude --continue
+          saved layout? ──> restored without asking: windows, panes, their programs
                 │
           services start in order ─> start check (git, crash) ─> shell runs kk
                 │                    red problem? → offer RECOVER.md
                 ▼
-          WORK: you + Claude (opusplan) on a branch → PR      [gap] the conversation never ends by itself
+          Claude starts: earlier conversation? ask: Fresh plan session (START.md) / Review (if due) / Continue
+                ▼
+          WORK: you + Claude (opusplan) on a branch → PR
                 │   lab runs every test, guard blocks dangerous commands
                 │   dots: blue = waits for you, cyan = working; PR badge in the row
                 ▼
           Merge (button): every open PR, oldest first, stops at a conflict → the project's `update` runs
+                │   all merged: same choice again (Fresh plan session / Review / Keep) = the conversation's end
                 ▼
           Stop (one project): wrap-up check → clean: stop / not: WRAPUP.md
           Done (whole day):  1. lab digest → maybe "propose tools" (TOOLS_PROPOSE.md)
@@ -44,6 +47,7 @@ Marked **[gap]** = known difference between what was intended and what is built.
 | RECOVER.md | Open finds a red problem and you say yes | diagnoses read-only, proposes, waits |
 | WRAPUP.md | Stop/Done finds uncommitted work, secrets, steno files | sorts them out before stopping |
 | TOOLS_PROPOSE.md | Done, when the lab digest has candidates | proposes up to 3 small tools, waits |
+| START.md | Open (choice) and after a finished Merge run (choice) | fresh plan-mode Claude checks for half-done work, proposes the next 1-3 items, waits |
 | REVIEW.md | Done offers it, the Project screen's Review button, or `hyperbeam review` | fresh plan-mode Claude proposes ONE cleanup PR, then does it |
 
 Every injected prompt starts in plan mode (Opus plans, Sonnet builds).
@@ -55,5 +59,5 @@ Every injected prompt starts in plan mode (Opus plans, Sonnet builds).
 ## Planned (not built; each PR updates this page)
 1. ~~Layouts come back whole~~ (built: the hyperbeam session is saved too; panes remember their program and start it again; no "Restore?" question).
 2. ~~Every project is in the review loop~~ (built: counted from onboarding; the note shows on Open; Review button in the Project screen; Done offers it).
-3. **Work loop, step 1**: when a project's Claude starts, a choice: Continue last conversation / Fresh plan session (START.md: read the state, bring it to a good state, propose the next 1-3 items) / Review (when due). The same choice after a Merge finishes a task, so a conversation has an end.
+3. ~~Work loop, step 1~~ (built: the Fresh plan session / Review / Continue choice when Claude starts, and the same choice after a finished Merge run). Not asked: the hyperbeam session after a reboot (continues).
 4. Later: a "presentable" check at the end of the day, the phone view, the sidebar redesign.
