@@ -3,6 +3,7 @@
 One line each. A PR that finishes an item moves it to Done (PR number, decision id); new ideas go to Open.
 
 ## Open
+- **Whole-package audit (next after the current round):** hyperbeam's aim is ideas in, good code out, saving tokens without poor code; reviews, decision records and superseding exist because code grows faster than it is cleaned up. Read the whole package once (`hyperbeam`, `guard.py`, `hyperbeam.conf`, `lab/`, `tools/`, the prompts, the docs), write down what each part does and where the redundancies are, then delete or collapse them and supersede the matching decisions. Seeds, checked in the code: `guard.py` has 4 layers of `RULES = RULES + [...]` and 5 ways of parsing a command (`tmux_calls` regex, `split_commands`, per-line `shlex.split` in two rules, the segment regexes of the kill rule); kill commands are checked in 3 places (`tmux_kill`, `kill_tmux_or_kitty`, `kill_outside_lab`); `ask`/`ask_tty`/`choose`/`choose_tty` and the `Confirm`/`Choice` modals overlap; the script is 6.6k lines with 446 functions; README, CLAUDE.md, docs/REFERENCE.md (long lines per topic), docs/SYSTEM.md and docs/DESIGN.md describe the same things. The first finding was already fixed (lab nesting was checked in the guard and in the lab, PR #53). Run it as a whole-package review (REVIEW.md with no `through` commit): one cleanup PR, a record in docs/reviews/, superseded decisions collapsed.
 - Phone round: linked session, copy delivery, Tailscale rename. The user's notes: SSH from the phone attaches to the same busy sessions as the laptop, where many windows and panes are hard to use on a small screen. Needed: a phone view that makes a session usable there, e.g. one pane at a time, a list of panes to jump to. Unsolved; after the laptop is solid, near the polish phase.
 - stenographr: paused in its own repo. The integration contract is `HB_CLAUDE_PANE` (the tmux pane id of a session's Claude pane). Later, a Dictate toggle.
 - Polish phase.
@@ -19,6 +20,7 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - Swap a fresh plan-mode Claude (with a snapshot and Previous Claude) for the other propose-then-wait steps too (Onboard, Fix, wrap-up, tools): today they inject `/plan` into the running Claude, which keeps its history but depends on the session being idle.
 
 ## Done
+- ~~Lab refuses nesting itself, the guard stops guessing; `hyperbeam shot --dir`~~ Done (PR #53, decision lab-refuses-nesting, which collapses lab-setup-is-the-users).
 - ~~Work loop step 1: a fresh plan session (START.md) / review / continue when Claude starts, and after a finished Merge run~~ Done (PR #52, decision work-loop-start-and-end).
 - ~~Every project in the review loop (count from onboarding), a Review button in the Project screen~~ Done (PR #51, decision review-every-project).
 - ~~Review loop: Copy report, a PR badge, a Merge button.~~ Done (PR #20).

@@ -77,12 +77,18 @@ class LabRules(unittest.TestCase):
     def blocked(self, cmd):
         return self.g.check(cmd) is not None
 
-    def test_a_lab_command_inside_a_lab_run_is_blocked(self):
-        for cmd in ("hyperbeam lab run --why x -- uv run --quiet --script hyperbeam tool decisions check",
-                    "hyperbeam lab run --why x -- hyperbeam lab status",
+    def test_the_guard_does_not_judge_lab_nesting_the_lab_refuses_it_itself(self):
+        # a lab command inside a lab run used to be blocked here by searching the text, which also hit file contents, PR bodies and edit scripts
+        for cmd in ("hyperbeam lab run --why x -- hyperbeam tool decisions check",
                     "hyperbeam lab run -- hyperbeam dotwork test",
-                    "hyperbeam lab run -- hyperbeam shot --cols 35"):
-            self.assertEqual(self.g.check(cmd), self.g.NEST_MESSAGE, cmd)
+                    "cat > t.py <<'EOF'\n# run: hyperbeam lab run -- hyperbeam tool x, hyperbeam shot, hyperbeam dotwork test\nEOF\nhyperbeam lab run --why x -- python3 t.py",
+                    "gh pr create --body-file b.md --title 'mentions hyperbeam lab run and hyperbeam tool'"):
+            self.assertFalse(self.blocked(cmd), cmd)
+        self.assertFalse(hasattr(self.g, "nests_lab"))
+
+    def test_the_kill_message_says_what_to_do_with_text(self):
+        msg = self.g.check("kill 1")
+        self.assertIn("--body-file", msg)
 
     def test_normal_lab_runs_and_direct_tool_calls_are_not(self):
         for cmd in ("hyperbeam lab run --why x -- uv run --quiet --with textual python3 -m unittest discover -s tests",

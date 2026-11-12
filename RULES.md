@@ -15,7 +15,7 @@
   (`hyperbeam lab stop`); never run `hyperbeam lab reset` (user only).
 - The lab's setup (lab/setup.sh, remove.sh, podman-setup.sh, the sudoers rule, the disk image) is the user's: never run it, never use sudo, and never suggest the user rerun,
   undo or resize the lab because of an error message. When the lab fails, check read-only (`hyperbeam lab status`, `id hblab`, `df /srv/hblab`,
-  the end of ~/.local/share/hyperbeam/lab-runs.jsonl), report what you found, ask. Don't put `hyperbeam tool` or `NAME test` inside `hyperbeam lab run`: they run in the lab themselves.
+  the end of ~/.local/share/hyperbeam/lab-runs.jsonl), report what you found, ask. Don't put `hyperbeam tool` or `NAME test` inside `hyperbeam lab run`: they run in the lab themselves (inside it they refuse, and say so).
 - Before multi-step lab work, check TOOLS.md (`hyperbeam tool --list`) for a tool that does it, and use it
   (`hyperbeam tool NAME`) instead of redoing the steps.
 - Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.

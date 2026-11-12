@@ -171,7 +171,8 @@ RULES = RULES + [
      "BLOCKED by hyperbeam: kill, pkill and killall are not allowed here: they run as the user and can take down live sessions (a `pkill -f` once "
      "killed the whole tmux server). Run tests and anything that needs a kill in the lab: `hyperbeam lab run <command>` runs it as the user "
      "hblab, which cannot signal the user's processes (`hyperbeam lab status` shows whether the lab is set up). To stop your own test, give the "
-     "lab command a `--timeout`."),
+     "lab command a `--timeout`. If the word only appears in text (a PR body, a commit message), write that text to a file with the Write tool and pass it with "
+     "`--body-file` or `-F`."),
 ]
 
 
@@ -304,18 +305,6 @@ def deletes_dirty_worktree(cmd):
     return False
 
 
-def nests_lab(cmd):
-    """A `hyperbeam lab run` whose command is itself a lab command (`tool`, `lab`, `shot`, `NAME test`): that runs the lab inside the lab, where hblab has no sudo."""
-    for m in re.finditer(r"hyperbeam\S*\s+lab\s+run\b(.*)", cmd, re.S):
-        if re.search(r"\bhyperbeam\S*\s+(tool|lab|shot)\b|\bhyperbeam\S*\s+(?!lab\b)\S+\s+test\b", m.group(1)):
-            return True
-    return False
-
-
-NEST_MESSAGE = ("BLOCKED by hyperbeam: that puts a lab command inside `hyperbeam lab run`. `hyperbeam tool ...`, `hyperbeam shot` and `hyperbeam NAME test` already run in the lab "
-                "by themselves; inside it they fail ('sudo may not run commands as hblab'), which looks like a broken setup and is not one. Run the command directly, "
-                "without `hyperbeam lab run`. Nothing on the machine needs changing.")
-
 SETUP_SCRIPT = re.compile(r"(^|/)(setup|remove|podman-setup)\.sh$")
 
 
@@ -369,9 +358,8 @@ RULES = RULES + [
 
 
 def check(cmd):
-    """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at (except for nesting)."""
-    if nests_lab(cmd):
-        return NEST_MESSAGE
+    """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at. A lab command inside a lab run is not
+    the guard's business: the lab refuses it itself (`lab_ready` in hyperbeam, decision lab-refuses-nesting)."""
     cmd = outside_lab(cmd)
     for name, test, message in RULES:
         if test(cmd):
