@@ -1,6 +1,11 @@
 # Design decisions (newest first)
 Date, decision, why, what was rejected. Seeded from the merged PRs and git history on 2026-11-11; add new entries at the top, in the PR that makes the decision.
 
+## 2026-11-12 Claude runs without permission prompts by default (setting `claude_permissions`)
+- **Decision:** `claude_base()` adds `--dangerously-skip-permissions` (setting `claude_permissions = "skip"`, `"ask"` turns it off). A Claude started with an injected prompt gets `--permission-mode plan --allow-dangerously-skip-permissions` instead: plan mode first, bypass available once the plan is approved.
+- **Why:** hyperbeam never passed a permission flag; the user had been starting Claude with the bypass flag by hand, so sessions asked questions (edits outside the project folder, unlisted commands) while he was away. The lab covers running things, not Claude's file edits. The guard hook still runs in bypass mode and blocks the dangerous commands.
+- **Rejected:** per-directory allow rules for `~/.cache/hyperbeam-work` and each project (many rules to keep in sync, still prompts for new commands); `--dangerously-skip-permissions` together with `--permission-mode plan` (which wins is unclear).
+
 ## 2026-11-12 Merge merges every open PR, oldest first, and stops only at a real problem
 - **Decision:** the Merge button merges all of the project's open PRs oldest first after one confirmation; each is re-checked against main (files in common) just before it merges; the first one that needs a look stops the run; the project's update runs once at the end. The just-merged PRs are removed from the list directly (GitHub's list lags).
 - **Why:** Claude opens PRs in the background, so several are waiting; merging only the newest, with a question per PR, meant clicking Merge and answering for each. The user wants one click and a complaint only when something will need investigating.

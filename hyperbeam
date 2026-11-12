@@ -87,12 +87,13 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "claude_effort": "medium", "claude_permissions": "skip", "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
 CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["opusplan", "sonnet", "opus", "haiku", "fable"],
-           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
+           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "claude_permissions": ["skip", "ask"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
                 "claude_model": "model for every Claude hyperbeam starts (claude --model): opusplan (Opus plans in plan mode, Sonnet does the work), sonnet, opus, haiku, fable",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
+                "claude_permissions": '"skip": every Claude hyperbeam starts runs without permission prompts (claude --dangerously-skip-permissions; the guard hook still blocks the dangerous commands). "ask": Claude asks as usual.',
                 "menu_width": "columns of the menu sidebar (takes effect when the sidebar window is opened again)",
                 "on_problem": '"ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.',
                 "recent_days": "a project opened within this many days is 'recent' (bold white in the menu)"}
@@ -104,7 +105,7 @@ def cfg_get(key):
         v = load_cfg().get(key, DEFAULTS[key])
     except Exception:
         v = DEFAULTS[key]
-    return v if type(v) is type(DEFAULTS[key]) and (key not in ("claude_model", "claude_effort", "open_mode", "on_problem") or v in CHOICES[key]) else DEFAULTS[key]
+    return v if type(v) is type(DEFAULTS[key]) and (key not in ("claude_model", "claude_effort", "claude_permissions", "open_mode", "on_problem") or v in CHOICES[key]) else DEFAULTS[key]
 
 
 def set_config(key, value):
@@ -555,9 +556,12 @@ def start_wrapup(sess, results):
     return pane
 
 
-def claude_base():
-    """Every Claude hyperbeam starts uses the configured model and effort."""
-    return f"claude --model {cfg_get('claude_model')} --effort {cfg_get('claude_effort')}"
+def claude_base(plan=False):
+    """Every Claude hyperbeam starts uses the configured model, effort and permissions. plan: it starts in plan mode (injected prompts); with
+    permissions "skip" bypass is then only allowed, so approving the plan can switch to it (both flags together would leave the mode unclear)."""
+    skip = cfg_get("claude_permissions") == "skip"
+    mode = (" --permission-mode plan" + (" --allow-dangerously-skip-permissions" if skip else "")) if plan else (" --dangerously-skip-permissions" if skip else "")
+    return f"claude --model {cfg_get('claude_model')} --effort {cfg_get('claude_effort')}{mode}"
 
 
 def claude_cmd(prompt_file=None, cont=False, add_dir=False):
@@ -582,7 +586,7 @@ def inject_prompt(pane, f, add_dirs=()):
         return "injected"
     dirs = "".join(f" --add-dir {shlex.quote(str(d))}" for d in add_dirs)
     arg = f' "$(cat {shlex.quote(str(f))})"{dirs}'
-    base = claude_base() + " --permission-mode plan"
+    base = claude_base(plan=True)
     send_line(pane, f"{base} --continue{arg} || {base}{arg}")
     return "started"
 
@@ -4836,7 +4840,7 @@ class SettingsScreen(ModalScreen):
     SettingsScreen #close { height: 1 !important; border: none !important; }
     """
     LABELS = [("open_mode", "open mode"), ("claude_model", "model"), ("claude_effort", "effort"),
-              ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
+              ("claude_permissions", "prompts"), ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
 
     def __init__(self):
         super().__init__()
