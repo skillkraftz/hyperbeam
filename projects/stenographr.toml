@@ -1,3 +1,8 @@
 # stenographr is a CLI (local speech-to-text), nothing to serve: no port, no services.
 # `stenographr` runs from this checkout (uv tool install --editable .), so there is nothing to keep running.
 path = "~/projects/stenographr"
+
+[commands]
+install = 'uv tool install --editable ".[gpu]" --force'
+update = "stenographr update"
+test = "bash tests/run-tests.sh"
