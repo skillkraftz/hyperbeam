@@ -67,5 +67,53 @@ class InstalledRule(unittest.TestCase):
         self.assertFalse(self.blocked(dev, "./hyperbeam list", g))
 
 
+class LabRules(unittest.TestCase):
+    """No lab inside the lab, no lab setup and no sudo for agents (the 2026-11-12 incident: `lab run -- ... hyperbeam tool ...` failed with a sudo error that sent an agent to the setup script)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.g = load("guard_lab", "guard.py")
+        cls.g.CWD = "/tmp"
+
+    def blocked(self, cmd):
+        return self.g.check(cmd) is not None
+
+    def test_a_lab_command_inside_a_lab_run_is_blocked(self):
+        for cmd in ("hyperbeam lab run --why x -- uv run --quiet --script hyperbeam tool decisions check",
+                    "hyperbeam lab run --why x -- hyperbeam lab status",
+                    "hyperbeam lab run -- hyperbeam dotwork test",
+                    "hyperbeam lab run -- hyperbeam shot --cols 35"):
+            self.assertEqual(self.g.check(cmd), self.g.NEST_MESSAGE, cmd)
+
+    def test_normal_lab_runs_and_direct_tool_calls_are_not(self):
+        for cmd in ("hyperbeam lab run --why x -- uv run --quiet --with textual python3 -m unittest discover -s tests",
+                    "hyperbeam lab run --dir ~/projects/hyperbeam -- uv run --quiet --script hyperbeam list",
+                    "hyperbeam tool decisions check", "hyperbeam hyperbeam test", "hyperbeam lab status"):
+            self.assertFalse(self.blocked(cmd), cmd)
+
+    def test_the_setup_scripts_are_blocked_but_reading_them_is_not(self):
+        for cmd in ("sudo bash lab/setup.sh", "bash ~/projects/hyperbeam/lab/remove.sh", "sh lab/podman-setup.sh 100G", "./lab/setup.sh", "sudo -n bash /x/lab/setup.sh"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        for cmd in ("cat lab/setup.sh", "grep -n sudo lab/setup.sh", "sed -n 1,20p lab/remove.sh", "git diff lab/setup.sh"):
+            self.assertFalse(self.blocked(cmd), cmd)
+
+    def test_sudo_is_blocked_except_listing_the_rules(self):
+        for cmd in ("sudo apt-get install -y gh", "sudo -n -u hblab true", "env X=1 sudo reboot", "echo hi && sudo mount /srv/hblab"):
+            self.assertTrue(self.blocked(cmd), cmd)
+        for cmd in ("sudo -n -l", "sudo -n -l | head -3", "echo sudo is mentioned", "ls /etc/sudoers.d"):
+            self.assertFalse(self.blocked(cmd), cmd)
+
+    def test_the_lab_check_inside_the_lab_says_so_and_never_names_the_setup_script(self):
+        import os
+        from common import hb
+        os.environ["HB_LAB"] = "1"
+        try:
+            self.assertEqual(hb.lab_ready(), hb.LAB_NESTED)
+        finally:
+            del os.environ["HB_LAB"]
+        for msg in (hb.LAB_NESTED, hb.LAB_SETUP, hb.LAB_USERS_OWN):
+            self.assertNotIn("sudo bash", msg)
+            self.assertNotIn("run lab/setup.sh", msg)
+
+
 if __name__ == "__main__":
     unittest.main()
