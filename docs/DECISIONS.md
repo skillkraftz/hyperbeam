@@ -11,6 +11,11 @@ Date, decision, why, what was rejected. Seeded from the merged PRs and git histo
 - **Why:** projects ran tests on 1 core of 20, and dotwork's e2e takes minutes. The lab sets no CPU or memory limits, so the slowness is the projects' own configs.
 - **Rejected:** a lab CPU/RAM cap or exported worker hints (adds machinery while nothing limits the lab today); an interactive "unit or e2e?" prompt in `test` (the Test button and agents run it unattended).
 
+## 2026-11-12 Tools: Go for real work, a daily check, usage and bypass in the digest
+- **Decision:** tools that do real work are written in Go (`tools/<name>/main.go`, built by `hyperbeam tool` when the source changes; the binary is gitignored); bash/python only for glue. The sidebar runs every tool's test once a day and turns the hyperbeam row red for a failing one. The digest shows per tool how often it was used and failed, and how often its work (`tools/<name>/replaces`) was done by hand. First tool: `test-timing` (wall time and cores busy per command).
+- **Why:** tools are amortised over many runs, so a build step is cheap and a compiled tool is faster; a tool that silently breaks gets routed around by agents, which the user wants to see at the start of the day, not discover later.
+- **Rejected:** bash/python-only tools (the old rule); Rust (not installed, Go is); building inside the lab (`tools/` is re-synced with `--delete` before every run, so the binary would be rebuilt each time).
+
 ## 2026-11-12 Merge stops only when main changed the PR's own files
 - **Decision:** Merge's "behind main" modal (Ask Claude to update / Merge anyway) appears only when commits on main since the branch point touch files the PR also changes. Behind in other files: the plain Yes/No, with a one-line note.
 - **Why:** manifests go straight to main by design, and Claude opens PRs in the background, so main moves on all the time. PR #31 was flagged "1 commit behind" for a stenographr manifest commit. The user wants Merge to complain only when the default would leave something to investigate.

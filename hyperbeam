@@ -844,6 +844,8 @@ def write_wrapup_note(name, r):
 def recheck(name, path):
     """Refresh: run the git checks again and store the result, so a red dot clears when the problem is gone."""
     red, notes = git_red_notes(path, fetch=False, behind=False)
+    if name == "hyperbeam":
+        red = [*red, *tool_check_findings()]
     cn = context_note(name, path) if session_exists(sanitize(name)) else ""
     write_status(name, red, [*drift_notes(name, path), *([cn] if cn else []), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
 
@@ -2162,7 +2164,18 @@ def lab_digest(runs):
     sequences.sort(key=lambda d: -d["total"])
     cands = [dict(kind="command", project=r["project"], what=r["command"], count=r["count"], total=r["total"]) for r in repeated if r["total"] >= TRIVIAL_MIN_SECONDS] + \
             [dict(kind="sequence", project=q["project"], what=" -> ".join(q["commands"]), count=q["count"], total=q["total"]) for q in sequences if q["total"] >= TRIVIAL_MIN_SECONDS]
-    return dict(runs=len(runs), seconds=sum(r["seconds"] for r in runs), projects=proj, flaky=flaky, slow=slow, repeated=repeated, sequences=sequences, candidates=cands)
+    tools = {}
+    for n in tool_names():
+        pats = []
+        try:
+            pats = [re.compile(x.strip()) for x in (TOOLS_SRC / n / "replaces").read_text().splitlines() if x.strip()]
+        except (OSError, re.error):
+            pass
+        used = [r for r in runs if (r.get("why") or "") == f"tool {n}"]
+        by_hand = [r for r in runs if (r.get("why") or "") != f"tool {n}" and any(p.search(r["command"]) for p in pats)]
+        tools[n] = dict(used=len(used), failed=sum(1 for r in used if r["exit"] != 0), by_hand=len(by_hand))
+    return dict(runs=len(runs), seconds=sum(r["seconds"] for r in runs), projects=proj, flaky=flaky, slow=slow, repeated=repeated, sequences=sequences, candidates=cands,
+                tools=tools)
 
 
 def mins(sec):
@@ -2179,8 +2192,10 @@ def format_digest(d, tool_notes=(), title="Lab digest"):
     L += ["", "slowest"] + [f"  {mins(x['max']):>9}  {x['project']}: {x['command'][:80]}  ({x['count']}x, {mins(x['total'])} total)" for x in d["slow"]]
     L += ["", "tool candidates (repeated work that cost real time)"]
     L += [f"  {c['count']}x  {mins(c['total']):>9}  {c['project']}: {c['what'][:100]}  [{c['kind']}]" for c in d["candidates"]] or ["  none"]
-    if tool_notes:
-        L += ["", "tools"] + [f"  {n}" for n in tool_notes]
+    tl = [f"  {n}: used {v['used']}x, failed {v['failed']}" + (f", done by hand {v['by_hand']}x (use the tool)" if v["by_hand"] else "")
+          for n, v in d.get("tools", {}).items()]
+    if tl or tool_notes:
+        L += ["", "tools"] + tl + [f"  {n}" for n in tool_notes]
     return "\n".join(L)
 
 
@@ -2192,18 +2207,39 @@ def digest_summary(d, tool_notes=()):
     L = [f"Lab: {d['runs']} runs, {mins(d['seconds'])}, {sum(v['failed'] for v in d['projects'].values())} failed, {len(d['flaky'])} flaky",
          f"Tool candidates: {len(d['candidates'])}" + (f" (top: {top['count']}x {top['what'][:50]}, {mins(top['total'])})" if top else "")]
     L += [f"Tool note: {n}" for n in tool_notes]
+    L += [f"Tool {n}: failed {v['failed']} of {v['used']} runs" for n, v in d.get("tools", {}).items() if v["failed"]]
+    L += [f"Tool {n}: its work was done by hand {v['by_hand']}x" for n, v in d.get("tools", {}).items() if v["by_hand"]]
     return "\n".join(L)
 
 
 def tool_names():
+    """Tools: tools/NAME/ with an executable NAME, or a Go tool (go.mod) that is built on first use."""
     t = TOOLS_SRC
-    return [x.name for x in sorted(t.iterdir()) if x.is_dir() and (x / x.name).exists()] if t.is_dir() else []
+    return [x.name for x in sorted(t.iterdir()) if x.is_dir() and ((x / x.name).exists() or (x / "go.mod").exists())] if t.is_dir() else []
+
+
+def build_tool(n):
+    """A Go tool (tools/NAME/go.mod) is built to tools/NAME/NAME when a source is newer than the binary. Compiling is not a test: it runs as
+    the user, and the binary goes into the lab with tools/. -> None, or why the build failed."""
+    d = TOOLS_SRC / n
+    if not (d / "go.mod").exists():
+        return None
+    b = d / n
+    newest = max(f.stat().st_mtime for f in [d / "go.mod", *d.rglob("*.go")])
+    if b.exists() and b.stat().st_mtime >= newest:
+        return None
+    r = subprocess.run(["go", "build", "-o", n, "."], cwd=d, capture_output=True, text=True, timeout=300)
+    return None if r.returncode == 0 else "go build failed: " + ((r.stderr or r.stdout).strip().splitlines() or ["?"])[-1][:120]
 
 
 def run_tool_tests(names=None):
     """Run each tool's test (tools/NAME/test) in the lab. -> [(name, ok, last output line)]. Needs the lab; ([] and no error) without tools."""
     out = []
     for n in names or tool_names():
+        err = build_tool(n)
+        if err:
+            out.append((n, False, err))
+            continue
         if not (TOOLS_SRC / n / "test").exists():
             out.append((n, False, "no test file (tools/%s/test)" % n))
             continue
@@ -2221,6 +2257,33 @@ def tool_test_notes():
     if lab_ready():
         return ["tool tests not run: the lab is not ready"]
     return [f"tool {n}: its test FAILS ({tail})" for n, ok, tail in run_tool_tests() if not ok]
+
+
+TOOLS_CHECK = DATA_DIR / "tools-check.json"
+
+
+def daily_tool_check():
+    """Once a day (the first sidebar start): every tool's test in the lab, so a broken tool shows before agents route around it.
+    -> the failing [(name, why)], or None when it already ran today, there are no tools, or the lab isn't ready."""
+    try:
+        if json.loads(TOOLS_CHECK.read_text()).get("date") == time.strftime("%Y-%m-%d"):
+            return None
+    except (OSError, ValueError):
+        pass
+    if not tool_names() or lab_ready():
+        return None
+    failing = [(n, tail) for n, ok, tail in run_tool_tests() if not ok]
+    TOOLS_CHECK.write_text(json.dumps({"date": time.strftime("%Y-%m-%d"), "failing": failing}))
+    return failing
+
+
+def tool_check_findings():
+    """Red findings for the hyperbeam row from the last daily check (cleared by the next check, or by `hyperbeam tool --test` passing)."""
+    try:
+        failing = json.loads(TOOLS_CHECK.read_text()).get("failing", [])
+    except (OSError, ValueError):
+        return []
+    return [f"tool {n} fails its test: {why} (hyperbeam tool --test {n})" for n, why in failing if n in tool_names()]
 
 
 def cmd_lab_digest(a):
@@ -2260,6 +2323,12 @@ def cmd_tool(a):
         return 0
     if a.test:
         res = run_tool_tests([a.name] if a.name else None)
+        try:                                       # a passing test clears that tool's red finding
+            d = json.loads(TOOLS_CHECK.read_text())
+            d["failing"] = [f for f in d.get("failing", []) if not any(n == f[0] and ok for n, ok, _ in res)]
+            TOOLS_CHECK.write_text(json.dumps(d))
+        except (OSError, ValueError):
+            pass
         for n, ok, tail in res:
             print(f"{'PASS' if ok else 'FAIL'} {n}" + ("" if ok else f"  {tail}"))
         return 0 if all(ok for _, ok, _ in res) else 1
@@ -2269,6 +2338,10 @@ def cmd_tool(a):
     if a.name not in tool_names():
         print(f"hyperbeam tool: no tool called {a.name}. Tools: {', '.join(tool_names()) or 'none yet'}  (hyperbeam tool --list)")
         return 2
+    err = build_tool(a.name)
+    if err:
+        print(f"hyperbeam tool {a.name}: {err}  (hyperbeam tool --test {a.name})")
+        return 1
     ns = types.SimpleNamespace(action="run", dir=a.dir, name=None, why=f"tool {a.name}", fresh=False, timeout=a.timeout, cmd=["--", f"{LAB_HOME}/tools/{a.name}/{a.name}", *a.args])
     return cmd_lab(ns)
 
@@ -4878,6 +4951,7 @@ class Menu(App):
         self.set_timer(4, self.poll_usage)
         self.set_timer(3, self.poll_prs)
         self.set_timer(2, self.recheck_running)
+        self.set_timer(20, self.tool_check)
         asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, lambda: self.exit(return_code=75))      # `hyperbeam update`: restart me
         self.fetch_repo()
         self.set_timer(1.0, self.fit_width)
@@ -4893,6 +4967,18 @@ class Menu(App):
             for b in self.query(f"#b-{bid}"):
                 b.label = bid.capitalize() + (f" ({key})" if event.size.width >= 50 else "")
         self.call_after_refresh(self.refresh_list)
+
+    def tool_check(self):
+        """The daily tool check (daily_tool_check), in the background; a failing tool turns the hyperbeam row red at the next recheck."""
+        def work():
+            try:
+                failing = daily_tool_check()
+            except Exception as e:
+                failing = [("?", str(e))]
+            if failing:
+                self.say_from_thread("tools: " + "; ".join(f"{n} FAILS its test ({w[:60]})" for n, w in failing) + " - Fix on the hyperbeam row")
+                self.recheck_running()
+        self.run_worker(work, thread=True, group="toolcheck")
 
     def recheck_running(self):
         """Git notes and the red git checks of running projects, again (the stored result is what the dot, kk and the status segment read)."""

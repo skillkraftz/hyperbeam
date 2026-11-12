@@ -1,0 +1,15 @@
+#!/bin/bash
+# test-timing's test: a 1-process command reports about 1 core, a 4-process one more than 2.5, a failing one exits non-zero with its output.
+set -euo pipefail
+t="$(cd "$(dirname "$0")" && pwd)/test-timing"
+tmp=$(mktemp -d)
+spin='i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done'
+out=$("$t" "$spin" "for i in 1 2 3 4; do ( $spin ) & done; wait")
+echo "$out"
+one=$(echo "$out" | awk 'NR==2 {print $3}')
+four=$(echo "$out" | awk 'NR==3 {print $3}')
+awk -v a="$one" -v b="$four" 'BEGIN { exit !(a > 0.7 && a < 1.3 && b > 2.5) }' || { echo "FAIL: cores $one / $four"; exit 1; }
+if "$t" "echo boom; exit 3" > "$tmp/out" 2>&1; then echo "FAIL: exit 0 for a failing command"; exit 1; fi
+grep -q "exit 3" "$tmp/out" && grep -q boom "$tmp/out" || { echo "FAIL: no exit code or output"; cat "$tmp/out"; exit 1; }
+rm -rf "$tmp"
+echo "PASS test-timing"
