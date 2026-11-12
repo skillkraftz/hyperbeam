@@ -3,3 +3,8 @@ path = "~/projects/hyperbeam"
 port = 3100
 
 # no services: hyperbeam is a script, nothing to keep running
+
+[commands]
+test = "uv run --quiet --with textual python3 -m unittest discover -s tests"
+install = "bash install.sh"
+update = "hyperbeam update"
