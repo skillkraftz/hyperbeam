@@ -2212,8 +2212,8 @@ def cmd_lab_log(a):
     rep = [(k, v) for k, v in again.items() if len(v) > 1]
     if rep:
         print("repeated (candidates for a small tool):")
-        for (proj, c), v in sorted(rep, key=lambda kv: -len(kv[1])):
-            print(f"  {len(v)}x {proj}: {c[:90]}")
+        for (proj, c), v in sorted(rep, key=lambda kv: -sum(r["seconds"] for r in kv[1])):    # by total time, not by count
+            print(f"  {len(v)}x  {sum(r['seconds'] for r in v) / 60:.1f} min  {proj}: {c[:90]}")
     return 0
 
 
@@ -2383,7 +2383,7 @@ def lab_digest(runs):
                     flaky.append(dict(project=pj, command=n, day=day, failed=sum(1 for y in d if y["exit"] > 0 and not KILLED(y["exit"])), passed=sum(1 for y in d if y["exit"] == 0)))
                     break
     slow = sorted(({"project": pj, "command": n, "max": max(x["seconds"] for x in rs), "count": len(rs), "total": sum(x["seconds"] for x in rs)} for (pj, n), rs in groups.items()),
-                  key=lambda d: -d["max"])[:5]
+                  key=lambda d: -d["total"])[:5]                # where the time went: count x duration, so 6 x 15 min ranks above 1 x 45 min
     repeated = sorted(({"project": pj, "command": n, "count": len(rs), "total": sum(x["seconds"] for x in rs),
                         "failed": sum(1 for x in rs if x["exit"] > 0 and not KILLED(x["exit"]))} for (pj, n), rs in groups.items() if len(rs) >= 3), key=lambda d: -d["total"])
     seqs = {}
@@ -2411,6 +2411,7 @@ def lab_digest(runs):
     sequences.sort(key=lambda d: -d["total"])
     cands = [dict(kind="command", project=r["project"], what=r["command"], count=r["count"], total=r["total"]) for r in repeated if r["total"] >= TRIVIAL_MIN_SECONDS] + \
             [dict(kind="sequence", project=q["project"], what=" -> ".join(q["commands"]), count=q["count"], total=q["total"]) for q in sequences if q["total"] >= TRIVIAL_MIN_SECONDS]
+    cands.sort(key=lambda c: -c["total"])                       # commands and sequences together, biggest total cost first
     tools = {}
     for n in tool_names():
         pats = []
@@ -2436,7 +2437,8 @@ def format_digest(d, tool_notes=(), title="Lab digest"):
     for pj, v in sorted(d["projects"].items(), key=lambda kv: -kv[1]["seconds"]):
         L.append(f"  {pj:<16} {v['runs']:>3} runs  {mins(v['seconds']):>9}  {v['failed']} failed" + (f", {v['killed']} killed (stopped by a signal)" if v["killed"] else ""))
     L += ["", "flaky (the same command failed, then passed, the same day)"] + ([f"  {x['project']}: {x['command'][:90]}  ({x['failed']} failed, {x['passed']} passed, {x['day']})" for x in d["flaky"]] or ["  none"])
-    L += ["", "slowest"] + [f"  {mins(x['max']):>9}  {x['project']}: {x['command'][:80]}  ({x['count']}x, {mins(x['total'])} total)" for x in d["slow"]]
+    L += ["", "where the time went (total = count x average; the biggest total first, so a command run often can outrank one slow run)"]
+    L += [f"  {mins(x['total']):>9}  {x['project']}: {x['command'][:80]}  ({x['count']}x, avg {mins(x['total'] / x['count'])}, longest {mins(x['max'])})" for x in d["slow"]]
     L += ["", "tool candidates (repeated work that cost real time)"]
     L += [f"  {c['count']}x  {mins(c['total']):>9}  {c['project']}: {c['what'][:100]}  [{c['kind']}]" for c in d["candidates"]] or ["  none"]
     tl = [f"  {n}: used {v['used']}x, failed {v['failed']}" + (f", done by hand {v['by_hand']}x (use the tool)" if v["by_hand"] else "")
