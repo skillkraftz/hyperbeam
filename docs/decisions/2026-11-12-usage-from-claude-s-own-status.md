@@ -2,7 +2,7 @@
 id: 2026-11-12-usage-from-claude-s-own-status
 status: implemented
 prs: [30]
-topic: unsorted
+topic: claude
 ---
 # Usage from Claude's own status line; `dotwork help` in the session; `hyperbeam new`
 

@@ -2,7 +2,7 @@
 id: 2026-11-11-the-shared-lab-per-run-isolation
 status: implemented
 prs: [21]
-topic: unsorted
+topic: lab
 ---
 # The shared lab: per-run isolation; merge safety
 

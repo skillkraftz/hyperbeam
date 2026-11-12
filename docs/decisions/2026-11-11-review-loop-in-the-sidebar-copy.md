@@ -2,7 +2,7 @@
 id: 2026-11-11-review-loop-in-the-sidebar-copy
 status: implemented
 prs: [20]
-topic: unsorted
+topic: merge
 ---
 # Review loop in the sidebar: Copy report, PR badge, Merge
 

@@ -2,7 +2,7 @@
 id: 2026-11-11-per-project-data-folders-hyperbeam-link
 status: implemented
 prs: [17]
-topic: unsorted
+topic: projects
 ---
 # Per-project data folders, `.hyperbeam` link, shared RULES.md
 

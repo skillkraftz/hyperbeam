@@ -32,7 +32,7 @@ Mark the ones where the user must decide (for example how an existing decisions 
 Nothing is changed before that.
 
 ## 3. After approval
-Work in a worktree on a branch (`git fetch` first, branch from up-to-date main, never stack): `git worktree add -b align ~/.cache/hyperbeam-work/<project>-align main`
-(the project's own rules win if they say otherwise and the user approved that). Make exactly the approved changes, including the `@.hyperbeam/RULES.md`
+Work on a branch in the project's own folder (`git fetch` first, `git switch -c align origin/main`, never stack). Only if the checkout has other work in it, use a git worktree
+(`git worktree add -b align ~/.cache/hyperbeam-work/<project>-align main`); the project's own rules win if they say otherwise and the user approved that. Make exactly the approved changes, including the `@.hyperbeam/RULES.md`
 import and the Exceptions section if any. Test in the lab (`hyperbeam lab run --why ...`), commit, push, open a PR with a manual test checklist, remove the
-worktree, and report: branch, PR URL, what changed, what you could not do. Do not merge.
+worktree if you made one, and report: branch, PR URL, what changed, what you could not do. Do not merge.

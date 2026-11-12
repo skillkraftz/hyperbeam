@@ -2,7 +2,7 @@
 id: 2026-11-12-injected-prompts-start-in-plan-mode
 status: implemented
 prs: [31]
-topic: unsorted
+topic: claude
 ---
 # Injected prompts start in plan mode
 

@@ -27,3 +27,12 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - ~~Daily lab digest -> tool proposals at Done; TOOLS.md; flaky tests.~~ Done (PR #23). Later: tools the digest suggests for non-lab work, a weekly view.
 - ~~Usage window~~ Done (PR #28, exact numbers in PR #30): the 5-hour and weekly limits as claude.ai shows them, a note for huge conversations. Later: ask Claude to write a short hand-off when a conversation is huge, so the fresh one starts with it.
 - ~~`hyperbeam new`~~ Done (PR #30: `--cli`, `--web`). Next for verbs: `hyperbeam NAME version` in the sidebar title, `status` and `logs` verbs, per-project `[commands]` suggested by Align, a `new` verb that scaffolds a project with the verbs already in place.
+- ~~Plan mode for every prompt hyperbeam injects (Opus plans, Sonnet builds)~~ Done (PR #31, decision injected-prompts-start-in-plan-mode); the review now swaps in a fresh plan-mode Claude (PR #43, decision review-fresh-claude).
+- ~~Merge: oldest first, one click, stops only at a real problem~~ Done (PRs #32, #36, #38, #44; decision merge-flow): files-in-common check, conflicts handed to Claude to rebase, the installed copy always updates, the working branch is never switched.
+- ~~Tests run in parallel by default; Align times the suite~~ Done (PR #34, decision tests-run-in-parallel-by-default).
+- ~~Tools in Go, a daily tool check, `test-timing`~~ Done (PR #35, decision tools-go-for-real-work-a).
+- ~~Claude without permission prompts by default~~ Done (PR #37, decision claude-runs-without-permission-prompts-by).
+- ~~PR list refreshed at once after gh pr create/merge/close~~ Done (PR #39, decision hyperbeam-refresh-prs-an-agent-tells); hook installs no longer duplicate.
+- ~~hyperbeam installed at ~/.local/lib/hyperbeam, developed in ~/projects/hyperbeam~~ Done (PR #40, decision hyperbeam-is-installed-local-lib-hyperbeam).
+- ~~Decisions as one file each with a status and what they collapsed into; generated index; `decisions` tool~~ Done (PR #41, decision decision-records).
+- ~~Review pass after N merged PRs, review records~~ Done (PRs #42, #43, #44; decisions review-pass, review-fresh-claude).

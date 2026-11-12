@@ -2,7 +2,7 @@
 id: 2026-11-11-loud-problems-red-only-when-rare
 status: implemented
 prs: [14]
-topic: unsorted
+topic: ui
 ---
 # Loud problems, red only when rare
 

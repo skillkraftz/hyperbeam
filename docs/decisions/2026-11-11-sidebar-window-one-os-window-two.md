@@ -2,7 +2,7 @@
 id: 2026-11-11-sidebar-window-one-os-window-two
 status: implemented
 prs: [13, 15]
-topic: unsorted
+topic: ui
 ---
 # Sidebar window: one OS window, two splits
 

@@ -1,8 +1,10 @@
 ---
 id: 2026-11-12-merge-merges-every-open-pr-oldest
-status: implemented
+status: superseded
 prs: [36]
-topic: unsorted
+topic: merge
+collapsed_into: [2026-11-12-merge-flow]
+code: hyperbeam:_merge_all
 ---
 # Merge merges every open PR, oldest first, and stops only at a real problem
 

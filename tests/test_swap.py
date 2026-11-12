@@ -1,25 +1,13 @@
 """Swapping a fresh plan-mode Claude into a pane for the review (swap_claude), going back (back_claude), the review snapshot, the plan-first line in every
 prompt, and the guard rule that keeps `hyperbeam review --print` out of non-plan sessions. Runs in the lab:
 hyperbeam lab run --why "tests" -- uv run --quiet --with textual python3 -m unittest discover -s tests -v"""
-import importlib.machinery
-import importlib.util
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent.parent
+from common import hb, load
 
-
-def load(name, file):
-    loader = importlib.machinery.SourceFileLoader(name, str(HERE / file))
-    spec = importlib.util.spec_from_loader(name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
-
-
-hb = load("hb", "hyperbeam")
 guard = load("guard", "guard.py")
 
 SID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"

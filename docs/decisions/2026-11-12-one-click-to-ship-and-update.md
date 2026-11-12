@@ -2,7 +2,7 @@
 id: 2026-11-12-one-click-to-ship-and-update
 status: implemented
 prs: [28]
-topic: unsorted
+topic: workflow
 ---
 # One click to ship and update: standard verbs, Merge then update, a sidebar that fits, usage windows
 

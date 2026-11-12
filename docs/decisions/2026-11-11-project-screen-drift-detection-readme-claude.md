@@ -2,7 +2,7 @@
 id: 2026-11-11-project-screen-drift-detection-readme-claude
 status: implemented
 prs: [22]
-topic: unsorted
+topic: ui
 ---
 # Project screen, drift detection, README, Claude's default model
 

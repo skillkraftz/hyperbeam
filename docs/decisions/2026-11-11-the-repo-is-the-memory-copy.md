@@ -2,7 +2,7 @@
 id: 2026-11-11-the-repo-is-the-memory-copy
 status: implemented
 prs: [18]
-topic: unsorted
+topic: claude
 ---
 # The repo is the memory; Copy context; opusplan
 

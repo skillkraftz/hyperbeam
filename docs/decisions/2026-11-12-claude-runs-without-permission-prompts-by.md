@@ -2,7 +2,7 @@
 id: 2026-11-12-claude-runs-without-permission-prompts-by
 status: implemented
 prs: [37]
-topic: unsorted
+topic: claude
 ---
 # Claude runs without permission prompts by default (setting `claude_permissions`)
 

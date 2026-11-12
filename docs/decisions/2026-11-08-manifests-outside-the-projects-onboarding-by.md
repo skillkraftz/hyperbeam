@@ -2,7 +2,7 @@
 id: 2026-11-08-manifests-outside-the-projects-onboarding-by
 status: implemented
 prs: [1, 2, 3]
-topic: unsorted
+topic: projects
 ---
 # Manifests outside the projects; onboarding by Claude
 

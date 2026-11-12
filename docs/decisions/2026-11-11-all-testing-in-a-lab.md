@@ -2,7 +2,7 @@
 id: 2026-11-11-all-testing-in-a-lab
 status: implemented
 prs: [16]
-topic: unsorted
+topic: lab
 ---
 # All testing in a lab
 

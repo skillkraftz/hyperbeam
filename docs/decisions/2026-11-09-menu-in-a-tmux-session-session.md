@@ -2,7 +2,7 @@
 id: 2026-11-09-menu-in-a-tmux-session-session
 status: implemented
 prs: [5, 7]
-topic: unsorted
+topic: ui
 ---
 # Menu in a tmux session, session stack, M-keys
 

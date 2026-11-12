@@ -2,7 +2,7 @@
 id: 2026-11-12-tests-run-in-parallel-by-default
 status: implemented
 prs: [34]
-topic: unsorted
+topic: lab
 ---
 # Tests run in parallel by default; no lab CPU limits
 
