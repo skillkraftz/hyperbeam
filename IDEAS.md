@@ -37,4 +37,5 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - ~~Decisions as one file each with a status and what they collapsed into; generated index; `decisions` tool~~ Done (PR #41, decision decision-records).
 - ~~Sidebar core: Stop returns the right side to the hyperbeam session, hyperbeam row always first, width kept on resize, closed right split reopens~~ Done (PR #45, decision manager-session-is-home).
 - ~~Lab nesting and setup guard: no lab inside the lab, setup scripts and sudo are the user's, error messages state facts~~ Done (PR #46, decision lab-setup-is-the-users).
+- ~~Lab digest ranks by total time (count x duration) so frequent work bubbles up~~ Done (PR #47, decision digest-ranks-by-total-time).
 - ~~Review pass after N merged PRs, review records~~ Done (PRs #42, #43, #44; decisions review-pass, review-fresh-claude).

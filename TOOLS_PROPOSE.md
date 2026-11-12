@@ -5,7 +5,8 @@ A tool is a small, single-purpose script that does that work in one command, wit
 Read RULES.md and TOOLS.md first (`hyperbeam tool --list`): do not propose what an existing tool already does.
 
 ## 1. Propose (at most 3)
-From the digest's tool candidates, flaky commands and slowest commands, propose **at most 3** tools. For each:
+From the digest's tool candidates, flaky commands and "where the time went" list, propose **at most 3** tools. Both lists are ordered by total time
+(count x duration): start from the top, because six 15-minute runs cost more than one 45-minute run. For each:
 - **The work it replaces**: the exact repeated commands or sequence, and how often it ran.
 - **Its usage line**: `hyperbeam tool NAME [ARGS]`, with a real example.
 - **What it saves**: time per run, and tokens (the output an agent no longer has to read, the steps it no longer has to plan). A tool must save real time or
