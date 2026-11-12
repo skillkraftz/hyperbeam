@@ -46,3 +46,7 @@
 - Every project provides the same verbs: `install`, `update`, `test`, `version`, `help` (and `restart` for its services), run as `hyperbeam NAME VERB`.
   hyperbeam supplies defaults from what is in the folder (pnpm/npm/uv/pip/cargo); when the default doesn't fit, add the real thing (a package.json script,
   a Makefile target, or `[commands]` in the manifest) in the same PR. A prototype that is becoming a project gets these first.
+- Build it conforming: anything you build as a CLI or app has, from the first commit, `--version`, `help`, and a documented `update` and `install`
+  path; a web app answers `/version` (or shows its version in the footer). The project has a command named after itself, or a package.json
+  script / Makefile target / `[commands]` entry, answering the standard verbs above. Keep it the simplest thing that works. New project:
+  `hyperbeam new NAME --cli|--web` starts from this skeleton.
