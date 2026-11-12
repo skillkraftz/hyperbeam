@@ -13,5 +13,6 @@ id hblab >/dev/null 2>&1 && userdel hblab
 rmdir "$MNT" 2>/dev/null || true
 [ -e /etc/hyperbeam-lab.uv ] && rm -f /usr/local/bin/uv /etc/hyperbeam-lab.uv     # only the copy setup.sh made
 [ -e /etc/hyperbeam-lab.pnpm ] && rm -f /usr/local/bin/pnpm /etc/hyperbeam-lab.pnpm     # only the shim setup.sh made
+[ -e /etc/hyperbeam-lab.podman ] && rm -f /etc/hyperbeam-lab.podman     # podman itself stays installed (sudo apt remove podman uidmap passt); hblab's id ranges go with the user
 rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock
 echo "lab removed (a backup of the old fstab is /etc/fstab.hyperbeam-lab.bak)"
