@@ -6,3 +6,5 @@ path = "~/projects/stenographr"
 install = 'uv tool install --editable ".[gpu]" --force'
 update = "stenographr update"
 test = "bash tests/run-tests.sh"
+version = "stenographr --version"
+help = "stenographr --help"
