@@ -1013,7 +1013,7 @@ def project_status(name, man):
     return "green", "running, services up" if man and man.get("service") else "running"
 
 
-HOOK_MARKS = ("hyperbeam/waiting", "hyperbeam/claude", "hyperbeam-guard")     # how our hooks are recognised (the first is PR #10's)
+HOOK_MARKS = ("hyperbeam/waiting", "hyperbeam/claude", "$HB_STATE/claude", "hyperbeam-guard", "hyperbeam-prs")     # how our hooks are recognised (the first is PR #10's)
 # (event, matcher, state written). Plain shell, no Python: fast; nothing happens outside hyperbeam sessions (no $HB_PROJECT).
 HOOK_CMDS = [
     ("Stop", "", "waiting finished responding"),
@@ -1034,6 +1034,16 @@ def guard_command():
     return f': hyperbeam-guard; [ -n "$HB_PROJECT" ] || exit 0; exec /usr/bin/python3 {shlex.quote(str(HERE / "guard.py"))}'
 
 
+def prs_command():
+    """PostToolUse on Bash: after `gh pr create|merge|close` run `hyperbeam refresh-prs` (in the background) so the sidebar's Merge button is right at once.
+    Plain shell, nothing outside hyperbeam sessions. The new PR's number is the /pull/N in the tool output; merged/closed ones come from the command."""
+    return (': hyperbeam-prs; [ -n "$HB_PROJECT" ] || exit 0; in=$(cat); '
+            'case "$in" in *"gh pr create"*|*"gh pr merge"*|*"gh pr close"*) ;; *) exit 0;; esac; '
+            "new=$(printf %s \"$in\" | grep -o 'pull/[0-9]*' | cut -d/ -f2 | sort -un | tr '\\n' ' '); "
+            "gone=$(printf %s \"$in\" | grep -o 'gh pr \\(merge\\|close\\) [0-9]*' | grep -o '[0-9]*$' | sort -un | tr '\\n' ' '); "
+            'hyperbeam refresh-prs "$HB_PROJECT" $new ${gone:+--gone $gone} >/dev/null 2>&1 & exit 0')
+
+
 def install_hooks(settings=None):
     """Merge hyperbeam's hooks into the user's Claude settings; nothing else is changed. Idempotent: ours are recognised by HOOK_MARKS and replaced
     in place (PR #10's older ones too; ones no longer wanted are removed). A backup of the file is kept next to it once. Returns the events changed."""
@@ -1044,15 +1054,15 @@ def install_hooks(settings=None):
     if f.exists() and not bak.exists():
         bak.write_text(f.read_text())
     hooks = data.setdefault("hooks", {})
-    want = [(e, m, hook_command(st)) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command())]
-    is_guard = lambda c: "hyperbeam-guard" in c
+    want = [(e, m, hook_command(st)) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
+    kind = lambda c: "guard" if "hyperbeam-guard" in c else "prs" if "hyperbeam-prs" in c else "state"
     claimed = set()
     for event, matcher, cmd in want:
         groups = hooks.setdefault(event, [])
         entry = {"type": "command", "command": cmd, "timeout": 5}
         for gi, g in enumerate(groups):
             hit = [i for i, h in enumerate(g.get("hooks", [])) if (event, gi, i) not in claimed and any(m in h.get("command", "") for m in HOOK_MARKS)
-                   and is_guard(h["command"]) == is_guard(cmd)]
+                   and kind(h["command"]) == kind(cmd)]
             if hit:
                 g["hooks"][hit[0]] = entry
                 g["matcher"] = matcher
@@ -3900,6 +3910,23 @@ def report_text(name):
     return text
 
 
+def cmd_refresh_prs(a):
+    """hyperbeam refresh-prs [PROJECT] [NUMBER...]: fetch the project's open PRs now (the sidebar picks the result up within seconds). Run it after
+    `gh pr create` (with the new number) and after merging or closing one, so the Merge button is right at once."""
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam refresh-prs: no project (run it in a project session, or give a name)")
+    path = known_path(name)
+    if not github_slug(path):
+        sys.exit(f"hyperbeam refresh-prs: {name} has no GitHub remote")
+    prs = open_prs(name, path, force=True, add=[int(n) for n in a.numbers], gone={int(n) for n in a.gone})
+    nudge_menus()
+    missing = [n for n in a.numbers if int(n) not in [x["number"] for x in prs]]
+    print(f"{name}: {len(prs)} open PR{'s' if len(prs) != 1 else ''}" + "".join(f"\n  #{x['number']} {x['title']}" for x in prs)
+          + "".join(f"\n  #{n} is not open (merged, closed, or not yours)" for n in missing))
+    return 0
+
+
 def cmd_report(a):
     name = a.project or os.environ.get("HB_PROJECT")
     if not name:
@@ -3965,22 +3992,34 @@ def cached_prs(name, path):
         return None, 1e9, ""
 
 
-def open_prs(name, path, force=False, gone=()):
+PR_FIELDS = "number,title,url,headRefName,baseRefName,createdAt"
+
+
+def open_prs(name, path, force=False, gone=(), add=()):
     """Open PRs opened by the user (newest first): [{number, title, url, branch}]. Cached for PR_TTL seconds per project, errors too.
     gone: PR numbers just merged. `gh pr list --author` goes through GitHub's search index, which lags a few seconds, so right after a
-    merge it still lists the merged PR (the Merge button stayed until a second click)."""
+    merge it still lists the merged PR (the Merge button stayed until a second click). add: PR numbers just opened, looked up one by one
+    (`gh pr view` is not behind that index), so a PR created a second ago shows at once."""
     slug = github_slug(path)
     if not slug:
         return []
     prs, age, err = cached_prs(name, path)
     if not force and age < PR_TTL and (prs is not None or err):
         return prs or []
-    rc, out, e = gh_run(slug, "pr", "list", "--author", "@me", "--state", "open", "--json", "number,title,url,headRefName,baseRefName,createdAt")
+    rc, out, e = gh_run(slug, "pr", "list", "--author", "@me", "--state", "open", "--json", PR_FIELDS)
     try:
         prs = sorted(({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", ""), "base": x.get("baseRefName", ""),
                                                                                                         "created": x.get("createdAt", "")} for x in json.loads(out)),
                      key=lambda x: -x["number"]) if rc == 0 else None
         prs = [x for x in prs if x["number"] not in gone] if prs is not None else None
+        for n in add:
+            if prs is not None and n not in [x["number"] for x in prs]:
+                rc2, out2, _ = gh_run(slug, "pr", "view", str(n), "--json", PR_FIELDS + ",state")
+                x = json.loads(out2) if rc2 == 0 else {}
+                if x.get("state") == "OPEN":
+                    prs.append({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", ""), "base": x.get("baseRefName", ""),
+                                "created": x.get("createdAt", "")})
+        prs = sorted(prs, key=lambda x: -x["number"]) if prs is not None else None
     except (ValueError, KeyError, TypeError):
         prs, e = None, "unreadable gh output"
     try:
@@ -4965,12 +5004,14 @@ class Menu(App):
         self.set_interval(600, self.fetch_repo)
         self.set_interval(60, self.recheck_running)
         self.set_interval(60, self.poll_prs)
+        self.set_interval(5, self.poll_pr_cache)
         self.set_interval(60, self.poll_usage)
         self.set_timer(4, self.poll_usage)
         self.set_timer(3, self.poll_prs)
         self.set_timer(2, self.recheck_running)
         self.set_timer(20, self.tool_check)
         asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, lambda: self.exit(return_code=75))      # `hyperbeam update`: restart me
+        asyncio.get_running_loop().add_signal_handler(signal.SIGUSR2, self.poll_pr_cache)                      # `hyperbeam refresh-prs`: read the PR cache now
         self.fetch_repo()
         self.set_timer(1.0, self.fit_width)
         self.set_interval(300, self.save_layouts)
@@ -5132,6 +5173,20 @@ class Menu(App):
             if changed:
                 self.call_from_thread(self.refresh_list)
         self.run_worker(work, thread=True, group="prs", exclusive=True)
+
+    def poll_pr_cache(self):
+        """Disk only (no gh): a PR list written by `hyperbeam refresh-prs` shows within seconds instead of at the next poll_prs."""
+        def work():
+            changed = False
+            for p in list(self.projects):
+                if not p.get("slug"):
+                    continue
+                prs = cached_prs(p["name"], p["path"])[0]
+                if prs is not None and (prs or None) != (p.get("prs") or None):
+                    p["prs"], changed = prs or None, True
+            if changed:
+                self.call_from_thread(self.refresh_list)
+        self.run_worker(work, thread=True, group="prcache", exclusive=True)
 
     def set_status(self, st):
         self.status = st
@@ -5686,7 +5741,7 @@ def run_menu():
     """The menu process. It records itself (pid file) so `hyperbeam update` can restart it, and restarts on SIGUSR1 (exit code 75)."""
     MENU_PIDS.mkdir(parents=True, exist_ok=True)
     f = MENU_PIDS / str(os.getpid())
-    f.write_text(json.dumps({"home": str(HERE), "sidebar": bool(os.environ.get("HB_SIDEBAR"))}))
+    f.write_text(json.dumps({"home": str(HERE), "sidebar": bool(os.environ.get("HB_SIDEBAR")), "usr2": True}))       # usr2: handles SIGUSR2 (an older menu would be killed by it)
     app = Menu()
     try:
         app.run()
@@ -5711,6 +5766,16 @@ def repo_note():
     if behind:
         return "behind", f"origin/main is {behind} commit{'s' * (behind > 1)} ahead: press Update"
     return "", ""
+
+
+def nudge_menus():
+    """SIGUSR2 to every running menu that handles it: it re-reads the PR cache at once (`hyperbeam refresh-prs`)."""
+    for f in sorted(MENU_PIDS.glob("*")):
+        try:
+            if json.loads(f.read_text()).get("usr2") and pid_alive(int(f.name), "_menu"):
+                os.kill(int(f.name), signal.SIGUSR2)
+        except (OSError, ValueError):
+            pass
 
 
 def restart_menus(say=print):
@@ -5906,6 +5971,11 @@ def main():
     af = sub.add_parser("align-facts", help="the facts ALIGN.md compares a project's docs against (visibility, docs layout, tests, ignores)")
     af.add_argument("path", nargs="?")
     af.set_defaults(f=cmd_align_facts)
+    rf = sub.add_parser("refresh-prs", help="fetch a project's open PRs now so the sidebar's Merge button is right at once; run it after gh pr create (with the number) and after a merge; default project $HB_PROJECT")
+    rf.add_argument("project", nargs="?")
+    rf.add_argument("numbers", nargs="*", help="PR numbers just opened (looked up directly: GitHub's list lags a few seconds)")
+    rf.add_argument("--gone", nargs="*", default=[], metavar="NUMBER", help="PR numbers just merged or closed (GitHub's list still shows them for a few seconds)")
+    rf.set_defaults(f=cmd_refresh_prs)
     rp = sub.add_parser("report", help="copy Claude's last message of a project's session (the PR report) to the clipboard; default project $HB_PROJECT")
     rp.add_argument("project", nargs="?")
     rp.add_argument("--print", action="store_true")
