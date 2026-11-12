@@ -27,7 +27,8 @@ over adding. Say what you would leave alone and why. **Then stop and wait for ap
 Work on a branch from an up-to-date main, in the project's own folder (a git worktree only if the checkout has other work). Make exactly the approved changes.
 Test in the lab (`hyperbeam lab run --why ...`; see the project's CLAUDE.md for the test command). Then:
 1. Write the review record `docs/reviews/YYYY-MM-DD.md`, front matter `through:` (the last merge commit this review covered, short hash), `prs:` (the numbers),
-   `refactored:` / `docs_updated:` / `decisions_superseded:` (what changed, one line each), then a few lines of prose.
+   `refactored:` / `docs_updated:` / `decisions_superseded:` (what changed, one line each) and `left_alone:` (what you looked at and chose not to change, and why, so the
+   next review does not find it again), then a few lines of prose.
 2. Regenerate the decisions index: `hyperbeam tool decisions index > docs/DECISIONS.md`.
 3. Open one PR titled `Review: PRs #A to #B` whose description lists the same, with a manual test checklist. Do not merge it.
 4. Report: branch, PR URL, what changed, what you tested, what is untested. End with the words **"Review done."** once the PR is open.

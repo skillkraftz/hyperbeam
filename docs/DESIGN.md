@@ -133,4 +133,4 @@ Merge ─ confirm ─> for each open PR, oldest first:
 8. The guard's remaining rules are cautious text matches; the audit may replace them.
 
 ## 5. Known overlaps (to be cleaned in the audit)
-See the first item of `## Open` in IDEAS.md: the guard's stacked rules and parsers, kill checks in three places, `ask`/`choose` helpers and the two modals, a 6.6k-line script, and five documents describing the same system.
+`hyperbeam audit` starts it (process in the first item of `## Open` in IDEAS.md and in AUDIT.md: list findings, you triage, small PRs, close with a review record). Seeds: the guard's stacked rules and parsers, kill checks in three places, `ask`/`choose` helpers and the two modals, a 6.6k-line script, and five documents describing the same system.

@@ -986,6 +986,41 @@ def start_review(name, path, since):
     return True, f"{msg}; it starts from about {len(f.read_text()) // 4000}k tokens of context and proposes one cleanup PR first"
 
 
+def audit_text(name, path):
+    """AUDIT.md, a few facts about the size of the project, and the snapshot: what a fresh plan-mode Claude starts the audit from."""
+    files = [f for f in git_out(path, "ls-files").splitlines() if f]
+    sizes = []
+    for f in files:
+        try:
+            sizes.append((len((Path(path) / f).read_text(errors="strict").splitlines()), f))
+        except (OSError, UnicodeDecodeError):
+            pass
+    big = ", ".join(f"{f} ({n})" for n, f in sorted(sizes, reverse=True)[:10])
+    facts = [f"Project: {name}", f"Project path: {path}", f"Today: {time.strftime('%Y-%m-%d')}", f"Tracked files: {len(files)}; largest (lines): {big}"]
+    return (HERE / "AUDIT.md").read_text() + "\n\n---\n" + "\n".join(facts) + "\n---\n" + review_snapshot(name, path)
+
+
+def start_audit(name, path):
+    """The audit in a fresh plan-mode Claude that replaces the project's Claude (swap_claude; Previous Claude brings the old conversation back). -> (started, message)."""
+    f = write_prompt(sanitize(name), audit_text(name, path))           # built first: the snapshot includes what the Claude being replaced last said
+    ok, msg = swap_claude(name, path, f, "audit", [HERE] if name == "hyperbeam" else [])
+    return (True, f"{msg}; it starts from about {len(f.read_text()) // 4000}k tokens of context, reads the whole project and lists findings first") if ok else (False, msg)
+
+
+def cmd_audit(a):
+    """hyperbeam audit [PROJECT] [--print]: the whole-project audit (AUDIT.md) in a fresh plan-mode Claude that replaces the project's Claude, or the prompt printed."""
+    name = a.project or os.environ.get("HB_PROJECT")
+    if not name:
+        sys.exit("hyperbeam audit: no project (run it in a project session, or give a name)")
+    path = known_path(name)
+    if a.print:
+        print(PLAN_FIRST + audit_text(name, path))
+        return 0
+    ok, msg = start_audit(name, path)
+    print(f"{name}: {msg}")
+    return 0 if ok else 1
+
+
 def cmd_review(a):
     """hyperbeam review [PROJECT] [--since COMMIT] [--print]: the review for a project (default $HB_PROJECT) in a fresh plan-mode Claude that replaces the
     project's Claude (`hyperbeam back` returns to the old conversation), or the prompt printed."""
@@ -6457,6 +6492,10 @@ def main():
     rv.add_argument("--since", help="the commit to review from (default: the last review record's `through`)")
     rv.add_argument("--print", action="store_true")
     rv.set_defaults(f=cmd_review)
+    au = sub.add_parser("audit", help="start the whole-project audit (AUDIT.md, in plan mode, into the project's Claude); default project $HB_PROJECT")
+    au.add_argument("project", nargs="?")
+    au.add_argument("--print", action="store_true")
+    au.set_defaults(f=cmd_audit)
     bk = sub.add_parser("back", help="resume the conversation a review set aside (the review's Claude ends); default project $HB_PROJECT")
     bk.add_argument("project", nargs="?")
     bk.set_defaults(f=cmd_back)
