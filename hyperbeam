@@ -3926,8 +3926,9 @@ def pr_stale(pr):
 
 
 def pr_behind(path, pr):
-    """How many commits the PR's branch is behind its base branch (the tests ran against an older base), or None if it can't be told
-    (fork, no network): fetch both branches quietly and count `head..base`."""
+    """How far the PR's branch is behind its base: (commits, files both sides changed), or None if it can't be told (fork, no network).
+    Fetch both branches quietly, count `head..base`, and compare the files the base changed since the branch point with the PR's own.
+    Only an overlap is worth stopping the merge for: main moving on in other files (a manifest, another PR) can't change this PR's tests."""
     base = pr.get("base") or default_branch(path)
     head = pr.get("branch")
     if not head:
@@ -3937,8 +3938,15 @@ def pr_behind(path, pr):
                        capture_output=True, text=True, timeout=60, env=env)
     if f.returncode:
         return None
-    n = git_out(path, "rev-list", "--count", f"refs/hyperbeam/pr-head..refs/remotes/origin/{base}")
-    return int(n) if n.isdigit() else None
+    b, h = f"refs/remotes/origin/{base}", "refs/hyperbeam/pr-head"
+    n = git_out(path, "rev-list", "--count", f"{h}..{b}")
+    if not n.isdigit():
+        return None
+    if not int(n):
+        return 0, []
+    theirs = set(git_out(path, "diff", "--name-only", f"{h}...{b}").split("\n")) - {""}
+    ours = set(git_out(path, "diff", "--name-only", f"{b}...{h}").split("\n")) - {""}
+    return int(n), sorted(theirs & ours)
 
 
 def update_prompt(name, pr, behind, base):
@@ -5338,15 +5346,18 @@ class Menu(App):
         try:
             self.say_from_thread(f"{name}: checking PR #{pr['number']} against {pr.get('base') or 'main'}...")
             try:
-                behind = pr_behind(p["path"], pr)
+                behind, overlap = pr_behind(p["path"], pr) or (None, [])
             except (subprocess.SubprocessError, OSError):
-                behind = None
+                behind, overlap = None, []
             base = pr.get("base") or default_branch(p["path"])
             title = f"Merge PR #{pr['number']} in {name}?\n\n{pr['title']}\n\n"
             if pr_stale(pr):
                 title += f"This PR is {pr_age_days(pr)} days old (stale).\n\n"
-            if behind:
-                pick = self.choose(title + f"This PR is {behind} commit{'s' if behind != 1 else ''} behind {base}; its tests ran against an older {base}.\n\n"
+            if behind and not overlap:                # main moved on elsewhere (a manifest, another PR): nothing for the user to look at
+                title += f"{base} has {behind} newer commit{'s' if behind != 1 else ''}, none in this PR's files.\n\n"
+            if behind and overlap:
+                shown = ", ".join(overlap[:3]) + (f" and {len(overlap) - 3} more" if len(overlap) > 3 else "")
+                pick = self.choose(title + f"This PR is {behind} commit{'s' if behind != 1 else ''} behind {base}, and {base} also changed {shown}; its tests ran without those changes.\n\n"
                                    "Ask Claude to update it and re-test (Enter), or merge it as it is.", [
                     ("ask", "Ask Claude to update and re-test (a)", "a"), ("merge", "Merge anyway (m)", "m"), ("cancel", "Cancel (c)", "c")], enter="ask")
                 if pick == "ask":

@@ -1,6 +1,11 @@
 # Design decisions (newest first)
 Date, decision, why, what was rejected. Seeded from the merged PRs and git history on 2026-11-11; add new entries at the top, in the PR that makes the decision.
 
+## 2026-11-12 Merge stops only when main changed the PR's own files
+- **Decision:** Merge's "behind main" modal (Ask Claude to update / Merge anyway) appears only when commits on main since the branch point touch files the PR also changes. Behind in other files: the plain Yes/No, with a one-line note.
+- **Why:** manifests go straight to main by design, and Claude opens PRs in the background, so main moves on all the time. PR #31 was flagged "1 commit behind" for a stenographr manifest commit. The user wants Merge to complain only when the default would leave something to investigate.
+- **Rejected:** ignoring only manifest commits (two independent PRs merged in a row would still warn); asking GitHub for mergeability (it reports textual conflicts only, and an overlap without a conflict is still worth a re-test).
+
 ## 2026-11-12 Injected prompts start in plan mode
 - **Decision:** `inject_prompt` always puts Claude in plan mode: a running Claude gets `/plan Read <file> and follow it.`; a Claude it starts gets `--permission-mode plan`. ONBOARDING.md and ALIGN.md tell Claude to re-enter plan mode before the alignment proposal (the first approval leaves plan mode).
 - **Why:** with `opusplan`, Opus runs only in plan mode. Onboarding stenographr injected the prompt into a pane in the default mode, so Sonnet wrote the proposal. Every injected prompt is "propose, wait for approval, then act", which is what plan mode is for.
