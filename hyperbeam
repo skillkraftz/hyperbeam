@@ -1760,6 +1760,7 @@ def ensure_menu():
 def default_layout(sess, path, envargs):
     """New session with window `work`: Claude on the left (60%), a shell on the right (40%). Returns [(pane id, role, cwd)]."""
     claude = new_pane(["new-session", "-d", "-s", sess, "-n", "work", "-x", "200", "-y", "50", "-c", str(path), *envargs])
+    tmux("set-option", "-t", f"={sess}", "detach-on-destroy", "off", check=False)   # if it ends any way, its clients move to another session
     publish_claude_pane(sess, claude)
     shell = new_pane(["split-window", "-h", "-l", "40%", "-t", claude, "-c", str(path)])
     tmux("select-pane", "-t", claude)
@@ -1773,6 +1774,7 @@ def restore_layout(sess, path, lay, envargs):
         cwds = [p["cwd"] if Path(p["cwd"]).is_dir() else str(path) for p in w["panes"]]
         if i == 0:
             first = new_pane(["new-session", "-d", "-s", sess, "-n", w["name"], "-x", "200", "-y", "50", "-c", cwds[0], *envargs])
+            tmux("set-option", "-t", f"={sess}", "detach-on-destroy", "off", check=False)
         else:
             first = new_pane(["new-window", "-d", "-t", f"{sess}:", "-n", w["name"], "-c", cwds[0]])
         ids = [first]
@@ -1917,6 +1919,10 @@ def stop_project(name, man, say=print):
     if session_exists(sess):
         save_layout(name, clean=True)
         clear_status(name)
+        for line in tmux("list-clients", "-F", "#{client_tty} #{client_session}", check=False).stdout.splitlines():
+            tty, _, cs = line.partition(" ")
+            if cs == sess:                                  # whoever is looking at it goes to the manager session, not away (a detached client closes kitty's right split)
+                tmux("switch-client", "-c", tty, "-t", home_target(tty), check=False)
         tmux("kill-session", "-t", f"={sess}", check=False)
         say(f"{name}: session killed")
     deadline = time.time() + 6
@@ -3731,6 +3737,13 @@ def show_session(sess):
     (switch mode, and over SSH), or in window mode at the laptop open a new kitty window. Returns what it did."""
     if os.environ.get("HB_SIDEBAR"):
         c = sidebar_client()
+        if not c:                                           # the right split was closed: open it again in this window
+            kitten_sidebar("launch", "--location=vsplit", "--title", "main", "hyperbeam", "_right", check=False)
+            for _ in range(20):
+                time.sleep(0.25)
+                c = sidebar_client()
+                if c:
+                    break
         if not c:
             raise RuntimeError("the sidebar's main area is not attached (close this window and press the hotkey again)")
         tmux("switch-client", "-c", c, "-t", home_target(c) if sess == MENU else f"={sess}")
@@ -5248,6 +5261,10 @@ class Menu(App):
             for b in self.query(f"#b-{bid}"):
                 b.label = bid.capitalize() + (f" ({key})" if event.size.width >= 50 else "")
         self.call_after_refresh(self.refresh_list)
+        if os.environ.get("HB_SIDEBAR") and event.size.width != cfg_get("menu_width"):   # the window was resized: kitty keeps the split's proportion, so bring the width back
+            if getattr(self, "_fit_timer", None):
+                self._fit_timer.stop()
+            self._fit_timer = self.set_timer(0.5, self.fit_width)
 
     def tool_check(self):
         """The daily tool check (daily_tool_check), in the background; a failing tool turns the hyperbeam row red at the next recheck."""
@@ -5279,6 +5296,11 @@ class Menu(App):
             return
 
         def work():
+            try:                                            # hidden (stack layout): the menu is not beside anything, leave it
+                if any(t.get("layout") == "stack" for ow in json.loads(kitten_sidebar("ls").stdout) for t in ow.get("tabs", [])):
+                    return
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
             subprocess.run(["kitten", "@", "resize-window", "--self", "--axis", "horizontal", "--increment", str(delta)],
                            capture_output=True, timeout=5)
             self.call_from_thread(lambda: self.set_timer(0.6, lambda: self.fit_width(tries - 1)))
@@ -5409,7 +5431,7 @@ class Menu(App):
         now = time.time()
         for p in self.projects:
             p["recent"] = bool(p["opened"]) and now - p["opened"] < days * 86400
-        return sorted(self.projects, key=lambda p: (0 if p["running"] else 1 if p["recent"] else 2, p["name"].lower()))
+        return sorted(self.projects, key=lambda p: (-1 if p["name"] == MENU else 0 if p["running"] else 1 if p["recent"] else 2, p["name"].lower()))
 
     def refresh_list(self):
         ol = self.query_one("#list", OptionList)
@@ -5423,7 +5445,12 @@ class Menu(App):
             ol.add_option(Option(row_text(p, self.status.get(p["name"]) if p["running"] else None, width, note), id=p["name"]))
         if rows:
             names = [p["name"] for p in rows]
-            ol.highlighted = names.index(keep["name"]) if keep and keep["name"] in names else 0
+            if keep and keep["name"] in names:
+                ol.highlighted = names.index(keep["name"])
+            else:                                           # fresh list: the project the main area shows, else the manager session (row 0)
+                shown = next((l.split(" ", 1)[1] for l in tmux("list-clients", "-F", "#{client_tty} #{client_session}", check=False).stdout.splitlines()
+                              if l.split(" ", 1)[0] == sidebar_read().get("tty") and " " in l), "")
+                ol.highlighted = next((i for i, p in enumerate(rows) if sanitize(p["name"]) == shown), 0)
         self.show_why()
 
     def current(self):
