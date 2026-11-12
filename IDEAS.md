@@ -35,4 +35,5 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - ~~PR list refreshed at once after gh pr create/merge/close~~ Done (PR #39, decision hyperbeam-refresh-prs-an-agent-tells); hook installs no longer duplicate.
 - ~~hyperbeam installed at ~/.local/lib/hyperbeam, developed in ~/projects/hyperbeam~~ Done (PR #40, decision hyperbeam-is-installed-local-lib-hyperbeam).
 - ~~Decisions as one file each with a status and what they collapsed into; generated index; `decisions` tool~~ Done (PR #41, decision decision-records).
+- ~~Sidebar core: Stop returns the right side to the hyperbeam session, hyperbeam row always first, width kept on resize, closed right split reopens~~ Done (PR #45, decision manager-session-is-home).
 - ~~Review pass after N merged PRs, review records~~ Done (PRs #42, #43, #44; decisions review-pass, review-fresh-claude).
