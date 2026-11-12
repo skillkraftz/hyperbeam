@@ -1,6 +1,6 @@
 # Docker in the lab: rootless podman (investigation)
 
-**Status: waiting for the user to run `sudo bash lab/podman-setup.sh` once.** Nothing is installed or changed before that.
+**Status (2026-11-11): installed (the user ran `lab/podman-setup.sh`) and investigated. Works for single containers and for compose with host networking; compose's own networks need one more step (see Results).**
 
 ## Why
 The lab user `hblab` must not be in the `docker` group (that is root on this machine, and would let a test touch the user's real containers and files).
@@ -22,5 +22,24 @@ Projects whose services need Docker (algoviewz-platform: `pnpm supabase:start` =
 - **Works with a workaround** (for example only plain compose, not the Supabase CLI): document exactly what runs, keep the rest as an exception.
 - **Does not work:** the alternative is a libvirt/virsh VM: its own Docker, network and credentials, snapshot/revert (matches "undo a wrong iteration"). Costs: disk and RAM for a VM image, a sync step, and **no GPU** (passthrough of the only NVIDIA card is not realistic). Decide then.
 
-## Results
-(not run yet)
+## Results (lab runs on 2026-11-11; scripts were throwaway, the shims are in `lab_ensure_shims`)
+| Test | Result |
+|---|---|
+| `podman info` as hblab | rootless true, overlay storage, netavark; harmless warning "Failed to add pause process to systemd sandbox cgroup" (hblab has no systemd user session) |
+| `podman run hello-world` / alpine / nginx / redis, images pulled from docker.io | works; 65-105 MB of images in `/srv/hblab/.local/share/containers` |
+| hblab sees the user's containers? | no (0), and `/var/run/docker.sock` is root:docker, mode 660: hblab cannot reach the real Docker |
+| `podman run -p PORT:80` with the default runtime dir `/srv/hblab/rt/<id>` | **fails**: "pasta failed ... Couldn't open network namespace ... Permission denied". Cause (kernel log): Ubuntu's AppArmor profile for pasta only lets it open files under `/tmp/**` |
+| the same with `XDG_RUNTIME_DIR` under `/tmp` | **works**: published port answers 200, outbound network works, the container's uid 0 is hblab |
+| `podman run --network host` | works (the container shares the machine's network: use ports from `$LAB_PORT_MIN`-`$LAB_PORT_MAX`) |
+| a runtime dir that **changes per run** | breaks the second run: podman keeps the first run's runtime dir in its state (`rootless-netns` pid file under a deleted dir). Fix: one stable dir, `/tmp/hblab-podman` |
+| Docker API socket (`podman system service`) + `docker` CLI + `docker compose` v2 (installed plugin) | works: `docker version` answers podman 5.7.0 |
+| `docker compose up` with **host networking** (`network_mode: host`, a named volume, a port from the lab range) | **works**: redis answered PONG, `down -v` leaves nothing |
+| `docker compose up` with compose's **default network** (service-name DNS) | **fails**: "aardvark-dns failed to start: Failed to connect to user scope bus". netavark starts aardvark-dns through the user's systemd bus, which hblab (a system user) does not have |
+
+## What the lab does now
+`lab run` writes two shims into hblab's `~/.local/bin` (first on PATH): `podman` (runtime dir `/tmp/hblab-podman`) and `docker` (the same dir; starts `podman system service` there on first use and points `DOCKER_HOST` at it, so `docker ...` and `docker compose ...` work unchanged and cannot reach the real Docker). Containers are per user, not per run: they are shared between lab runs, and `docker compose down` / `podman rm -af` in a test cleans them up (a run's tagged processes are killed when it ends, which stops its containers).
+
+## Decision
+- **Supported now:** single containers (published ports from the lab range, volumes, outbound network) and compose files that use `network_mode: host`. A project's own CLAUDE.md can drop "Docker tests are not run in the lab" for those.
+- **Open:** compose's default bridge network (services reaching each other by name). Candidate fix, **needs the user (sudo)**: `sudo loginctl enable-linger hblab` so hblab has a user systemd/dbus (then the shims would use `/run/user/997`). Untested: hblab is a system user (uid 997), which systemd may not give a user manager. Only worth doing when a project needs it: no current project does (algoviewz is set aside).
+- **Fallback if that fails:** the libvirt/virsh VM (its own Docker, network and credentials, snapshot/revert; costs disk and RAM; no GPU).

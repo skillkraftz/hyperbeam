@@ -7,3 +7,5 @@ projects_dir = "~/projects"
 open_mode = "sidebar"
 # "ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.
 on_problem = "ask"
+# GitHub owners hyperbeam leaves alone (no PR badge, no Merge, not checked by `hyperbeam verify`). Put it in your own config, e.g. ["algoviewz"].
+ignore_owners = []
