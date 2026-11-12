@@ -1,6 +1,11 @@
 # Design decisions (newest first)
 Date, decision, why, what was rejected. Seeded from the merged PRs and git history on 2026-11-11; add new entries at the top, in the PR that makes the decision.
 
+## 2026-11-12 Injected prompts start in plan mode
+- **Decision:** `inject_prompt` always puts Claude in plan mode: a running Claude gets `/plan Read <file> and follow it.`; a Claude it starts gets `--permission-mode plan`. ONBOARDING.md and ALIGN.md tell Claude to re-enter plan mode before the alignment proposal (the first approval leaves plan mode).
+- **Why:** with `opusplan`, Opus runs only in plan mode. Onboarding stenographr injected the prompt into a pane in the default mode, so Sonnet wrote the proposal. Every injected prompt is "propose, wait for approval, then act", which is what plan mode is for.
+- **Rejected:** sending Shift+Tab to cycle modes (depends on the pane's current mode, fragile); a new Claude window for Onboard instead of injecting (extra window, loses the conversation); plan mode for normal opens (the user starts those and chooses).
+
 ## 2026-11-11 The shared lab: per-run isolation; merge safety (PR #21)
 - **Decision:** every `lab run` is its own session with an id, recorded in `/srv/hblab/runs/` and tagged with `HB_RUN_ID` in the environment of everything it starts; `lab stop` stops only a project's own runs; `lab reset` refuses while other projects have runs and its `--force` is for the user only; the guard blocks agents from `lab reset` and from `git worktree remove --force` / deleting a worktree with uncommitted work. Each run gets its own tmux and runtime dirs. Merge checks how far the PR is behind main: if behind, the modal offers "Ask Claude to update and re-test" (default) or "Merge anyway"; PRs older than 7 days are marked stale.
 - **Why:** a `lab reset` killed another project's e2e suite running in the same lab, and the other agent lost time chasing "random" SIGKILLs. A worktree with uncommitted work was force-removed once. A PR that passed its tests against an older main can break main when merged.

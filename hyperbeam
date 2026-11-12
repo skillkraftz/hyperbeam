@@ -574,14 +574,16 @@ def pane_command(pane):
 
 
 def inject_prompt(pane, f, add_dirs=()):
-    """The one way a prompt file reaches Claude (recover, wrap-up, onboarding). Claude already running in the pane: one line pointing at the
-    file, then Enter. Otherwise start `claude --continue` with the prompt, falling back to a fresh `claude` if there is no conversation."""
+    """The one way a prompt file reaches Claude (recover, wrap-up, onboarding). Always in plan mode, so with opusplan Opus makes the proposal and
+    Sonnet only builds after the user approves. Claude already running in the pane: `/plan` plus one line pointing at the file, then Enter.
+    Otherwise start `claude --permission-mode plan --continue` with the prompt, falling back to a fresh `claude` if there is no conversation."""
     if pane_command(pane) == "claude":
-        send_line(pane, f"Read {f} and follow it.")
+        send_line(pane, f"/plan Read {f} and follow it.")
         return "injected"
     dirs = "".join(f" --add-dir {shlex.quote(str(d))}" for d in add_dirs)
     arg = f' "$(cat {shlex.quote(str(f))})"{dirs}'
-    send_line(pane, f"{claude_base()} --continue{arg} || {claude_base()}{arg}")
+    base = claude_base() + " --permission-mode plan"
+    send_line(pane, f"{base} --continue{arg} || {base}{arg}")
     return "started"
 
 

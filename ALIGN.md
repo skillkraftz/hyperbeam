@@ -23,6 +23,7 @@ Compare the project's CLAUDE.md, README and docs/ against RULES.md **and against
 - **Hygiene**: steno files ignored, `.hyperbeam` not committed, README matches how the project behaves now.
 
 ## 2. Propose, then wait
+Be in plan mode when you write the proposal (EnterPlanMode if you are not): the proposal should come from the planning model.
 Write the proposal as a list. Each difference gets: what you found (with file:line), and either
 - **change the project** (what you would edit), or
 - **record an exception** (draft the line for `## Exceptions to hyperbeam rules`: the rule, what the project does instead, and the reason).
