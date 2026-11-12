@@ -223,6 +223,8 @@ def runs_worktree_script(cmd):
         for t in cand:
             if os.path.basename(t) != "hyperbeam":
                 continue
+            if t == toks[0] and "/" not in t:          # a bare `hyperbeam` is looked up on PATH (the installed one), not in the working directory
+                continue
             p = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(t))))
             if os.path.isfile(p) and is_worktree_dir(os.path.dirname(p)):
                 return True

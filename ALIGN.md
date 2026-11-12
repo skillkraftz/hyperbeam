@@ -11,10 +11,10 @@ Compare the project's CLAUDE.md, README and docs/ against RULES.md **and against
   public (check the facts; the lines that claim public/private are listed).
 - **Rules**: does CLAUDE.md import `@.hyperbeam/RULES.md`? Does it say anything that conflicts with a rule (branch/PR workflow, testing, secrets,
   steno files, README upkeep, final report)? Is there a PRIVATE.md for the real secrets, and does .gitignore cover exactly those?
-- **Docs layout**: CLAUDE.md = how the project works now (setup, run, test, layout); docs/DECISIONS.md = design decisions (newest first: date,
-  decision, why, what was rejected). Does DECISIONS.md exist? Is any decision text elsewhere?
+- **Docs layout**: CLAUDE.md = how the project works now (setup, run, test, layout); docs/decisions/ = one file per design decision (front matter: status,
+  topic, prs; Decision / Why / Rejected), docs/DECISIONS.md = its generated index. Does docs/decisions/ exist? Is any decision text elsewhere?
 - **Existing doc structures** (for example docs/product-model.md, ADR folders, SPEC.md, design notes): say what each is, and propose how it fits.
-  Options: keep it as is and link it from CLAUDE.md; split what is a decision (dated, with a why) into DECISIONS.md and leave the rest; or move it.
+  Options: keep it as is and link it from CLAUDE.md; split what is a decision (dated, with a why) into records under docs/decisions/ and leave the rest; or move it.
   Do not pick for the user: give a recommendation and the alternative, one line each.
 - **Tests**: how they run; which need Docker (those cannot run in the lab: propose listing them as an exception, with the reason), which need a browser
   or a GPU, which start servers (they must use a free port or the lab range `$LAB_PORT_MIN`-`$LAB_PORT_MAX`, never a project port 3100+).
@@ -28,7 +28,7 @@ Be in plan mode when you write the proposal (EnterPlanMode if you are not): the 
 Write the proposal as a list. Each difference gets: what you found (with file:line), and either
 - **change the project** (what you would edit), or
 - **record an exception** (draft the line for `## Exceptions to hyperbeam rules`: the rule, what the project does instead, and the reason).
-Mark the ones where the user must decide (for example how an existing decisions doc relates to DECISIONS.md). Show the list and **stop and wait for approval.**
+Mark the ones where the user must decide (for example how an existing decisions doc relates to docs/decisions/). Show the list and **stop and wait for approval.**
 Nothing is changed before that.
 
 ## 3. After approval

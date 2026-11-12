@@ -6,7 +6,7 @@ Personal launcher for Ubuntu 26.04 (GNOME/Wayland, kitty): a "senior engineer" f
 Hotkey -> a sidebar (a Textual menu) of every project in ~/projects -> one tmux session per project with Claude Code, a shell, services (auto-started in order) and logs.
 Works locally; the phone (SSH from Termux over Tailscale) attaches to the same sessions and gets its own round later.
 
-## Decisions (the short list; docs/DECISIONS.md has the why)
+## Decisions (the short list; docs/decisions/ has the why, one file per decision; docs/DECISIONS.md is the generated index)
 - Claude Code is the default agent, on `opusplan` (Opus plans, Sonnet builds, one session per project).
 - One tmux session per project.
 - Manifests (`projects/<name>.toml`, in this repo, not in the projects) say how a project starts: ordered services, ports, env.
@@ -29,7 +29,7 @@ Works locally; the phone (SSH from Termux over Tailscale) attaches to the same s
 ## Where things are
 - `install.sh`: installs hyperbeam (see Rules). `hyperbeam`: the whole app, one uv script (Textual menu, CLI commands, lab, verify, shot, digest, tools). `guard.py`: the Claude Bash hook. `hyperbeam.conf`: tmux keys and hooks.
 - Prompts injected into Claude: `ONBOARDING.md`, `ALIGN.md`, `RECOVER.md`, `WRAPUP.md`, `TOOLS_PROPOSE.md`. `projects/<name>.toml`: a project's manifest (format in the reference).
-- `lab/` (setup, remove, podman, rsync shell), `tools/` (tested scripts, listed in `TOOLS.md`), `docs/` (`DECISIONS.md` the why, `REFERENCE.md` the details, `UI.md`, `PODMAN.md`), `IDEAS.md` the roadmap, `README.md` the why and the goals.
+- `lab/` (setup, remove, podman, rsync shell), `tools/` (tested scripts, listed in `TOOLS.md`), `docs/` (`decisions/` the why, one file per decision, `DECISIONS.md` their generated index, `REFERENCE.md` the details, `UI.md`, `PODMAN.md`), `IDEAS.md` the roadmap, `README.md` the why and the goals.
 - State is in `~/.local/share/hyperbeam/` (per project: `projects/<name>-<hash>/`, linked into each project as `.hyperbeam`); settings in `~/.config/hyperbeam/config.toml`.
 
 ## Commands (details in the reference)
