@@ -125,7 +125,7 @@ def split_commands(cmd):
 
 def is_lab_run(toks):
     toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-    return len(toks) >= 2 and os.path.basename(toks[0]) == "hyperbeam" and (toks[1:3] == ["lab", "run"] or toks[1] == "tool")       # `tool` runs in the lab too
+    return len(toks) >= 2 and os.path.basename(toks[0]) == "hyperbeam" and (toks[1:3] == ["lab", "run"] or toks[1] in ("tool", "shot"))       # `tool` runs in the lab too
 
 
 def outside_lab(cmd):
@@ -206,7 +206,7 @@ def runs_worktree_script(cmd):
             continue
         # the script run directly, or by an interpreter / wrapper (`uv run --script ./hyperbeam`, `python3 hyperbeam`, `timeout 5 ./hyperbeam`);
         # a bare mention (`git add hyperbeam`, `py_compile hyperbeam`) is not a run
-        if re.search(r"\blab\s+(?:status|stop|log|digest)\b", " ".join(toks)) or re.search(r"\bhyperbeam\s+tool\b", " ".join(toks)):         # read-only / per-project lab commands never touch state
+        if re.search(r"\blab\s+(?:status|stop|log|digest)\b", " ".join(toks)) or re.search(r"\bhyperbeam\s+(?:tool|shot)\b", " ".join(toks)):         # read-only / per-project lab commands never touch state
             continue
         cand = [toks[0]]
         if re.fullmatch(r"(?:.*/)?(?:python[\d.]*|bash|sh)", toks[0]):          # the script is the first argument that isn't an option (not after -m / -c)
