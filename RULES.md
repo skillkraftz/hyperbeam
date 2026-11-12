@@ -7,6 +7,8 @@
 - Never commit steno-*.txt (personal dictation notes).
 - Testing: ALL testing runs in the lab, including unit tests and headless browser suites. Never run test
   servers, kills or GUI apps as the user. Use `hyperbeam lab run`. Never touch the user's tmux sessions.
+- Tests use the machine (20 cores, 64 GB): run them in parallel by default (the runner's automatic worker count: Playwright and vitest
+  defaults, `pytest -n auto`). A config pinned to 1 worker needs a reason in CLAUDE.md. When you change the test setup, say how long the suite took.
 - Give `hyperbeam lab run` a short `--why`. The lab shares the machine's network: use free ports (bind port 0,
   or `$LAB_PORT_MIN`-`$LAB_PORT_MAX`), never 3100+ project ports. Docker-based tests are not run in the lab;
   list them as an exception. The lab is shared with other projects: stop only your own runs

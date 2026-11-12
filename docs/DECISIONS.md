@@ -6,6 +6,11 @@ Date, decision, why, what was rejected. Seeded from the merged PRs and git histo
 - **Why:** Claude opens PRs in the background, so several are waiting; merging only the newest, with a question per PR, meant clicking Merge and answering for each. The user wants one click and a complaint only when something will need investigating.
 - **Rejected:** merging only the newest (what it did); no re-check between merges (two PRs touching the same file would merge untested together); updating after every merge (hyperbeam's update restarts the menu).
 
+## 2026-11-12 Tests run in parallel by default; no lab CPU limits
+- **Decision:** RULES.md: tests use the runner's automatic worker count, a single-worker config needs a reason in CLAUDE.md, and a change to the test setup reports the suite's time. ALIGN.md: onboarding times the suite and flags pinned worker counts; a suite still over ~2 minutes splits into a fast `test` and a slow script run before a PR.
+- **Why:** projects ran tests on 1 core of 20, and dotwork's e2e takes minutes. The lab sets no CPU or memory limits, so the slowness is the projects' own configs.
+- **Rejected:** a lab CPU/RAM cap or exported worker hints (adds machinery while nothing limits the lab today); an interactive "unit or e2e?" prompt in `test` (the Test button and agents run it unattended).
+
 ## 2026-11-12 Merge stops only when main changed the PR's own files
 - **Decision:** Merge's "behind main" modal (Ask Claude to update / Merge anyway) appears only when commits on main since the branch point touch files the PR also changes. Behind in other files: the plain Yes/No, with a one-line note.
 - **Why:** manifests go straight to main by design, and Claude opens PRs in the background, so main moves on all the time. PR #31 was flagged "1 commit behind" for a stenographr manifest commit. The user wants Merge to complain only when the default would leave something to investigate.
