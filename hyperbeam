@@ -3888,8 +3888,10 @@ def cached_prs(name, path):
         return None, 1e9, ""
 
 
-def open_prs(name, path, force=False):
-    """Open PRs opened by the user (newest first): [{number, title, url, branch}]. Cached for PR_TTL seconds per project, errors too."""
+def open_prs(name, path, force=False, gone=()):
+    """Open PRs opened by the user (newest first): [{number, title, url, branch}]. Cached for PR_TTL seconds per project, errors too.
+    gone: PR numbers just merged. `gh pr list --author` goes through GitHub's search index, which lags a few seconds, so right after a
+    merge it still lists the merged PR (the Merge button stayed until a second click)."""
     slug = github_slug(path)
     if not slug:
         return []
@@ -3901,6 +3903,7 @@ def open_prs(name, path, force=False):
         prs = sorted(({"number": x["number"], "title": x["title"], "url": x["url"], "branch": x.get("headRefName", ""), "base": x.get("baseRefName", ""),
                                                                                                         "created": x.get("createdAt", "")} for x in json.loads(out)),
                      key=lambda x: -x["number"]) if rc == 0 else None
+        prs = [x for x in prs if x["number"] not in gone] if prs is not None else None
     except (ValueError, KeyError, TypeError):
         prs, e = None, "unreadable gh output"
     try:
@@ -5373,7 +5376,7 @@ class Menu(App):
                 return self.say_from_thread(f"{name}: merge cancelled")
             self.say_from_thread(f"{name}: merging PR #{pr['number']}...")
             ok, msgs = merge_pr(name, p["path"], pr, self.say_from_thread)
-            prs = open_prs(name, p["path"], force=True)
+            prs = open_prs(name, p["path"], force=True, gone={pr["number"]} if ok else ())
             p["prs"] = prs or None
             self.call_from_thread(self.refresh_list)
             self.say_from_thread(f"{name}: " + "; ".join(msgs))
