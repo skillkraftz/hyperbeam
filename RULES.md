@@ -16,8 +16,8 @@
 - Before multi-step lab work, check TOOLS.md (`hyperbeam tool --list`) for a tool that does it, and use it
   (`hyperbeam tool NAME`) instead of redoing the steps.
 - Branch from an up-to-date main (`git fetch` first). Never stack a PR on another PR.
-- After `gh pr create` (and after a merge or close) run `hyperbeam refresh-prs NUMBER` (the PR number; no number after a merge): the sidebar's
-  Merge button then shows within seconds instead of minutes.
+- The sidebar's PR list refreshes by itself after `gh pr create|merge|close` (a hook installed by `hyperbeam update`): nothing to run. `hyperbeam refresh-prs`
+  does it by hand.
 - Work on a branch per task. Commit, push, open a PR. End the PR description with a short
   manual test checklist. Don't merge unless the user says so.
 - If you change user-facing behaviour, update the README in the same PR.
