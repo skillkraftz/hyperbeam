@@ -10,4 +10,5 @@ A tool lives in `tools/<name>/<name>` with `tools/<name>/test`. New ones come fr
 (TOOLS_PROPOSE.md). One line each: **name** - usage - the work it replaces.
 
 ## Tools
+- **decisions** - `hyperbeam tool decisions list|check|index` - reads docs/decisions/ (one file per decision): the implemented ones, a consistency check (status, supersedes, collapsed_into), the generated docs/DECISIONS.md index (Go)
 - **test-timing** - `hyperbeam tool test-timing "npx vitest run --maxWorkers=1" "npx vitest run"` - timing test runs by hand: prints wall time, average cores busy and exit code per command, so a suite stuck on 1 core of 20 shows at once (Go)

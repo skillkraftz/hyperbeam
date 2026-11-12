@@ -1,0 +1,49 @@
+#!/bin/bash
+# decisions' test: a valid set passes; each kind of problem fails with its own message; list shows the implemented ones; index groups by topic and shows collapses.
+set -euo pipefail
+t="$(cd "$(dirname "$0")" && pwd)/decisions"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+rec() { # dir id status topic [extra front matter lines...]
+  local d=$1 id=$2 st=$3 topic=$4; shift 4
+  mkdir -p "$d/docs/decisions"
+  { echo "---"; echo "id: $id"; echo "status: $st"; echo "topic: $topic"; for l in "$@"; do echo "$l"; done; echo "---"; echo "# Title of $id"; echo; echo "- **Decision:** x"; } > "$d/docs/decisions/$id.md"
+}
+expect_fail() { # dir text
+  local out
+  if out=$("$t" --dir "$1" check 2>&1); then echo "FAIL: expected a failure containing '$2', got success"; exit 1; fi
+  echo "$out" | grep -q "$2" || { echo "FAIL: expected '$2' in:"; echo "$out"; exit 1; }
+}
+
+ok="$tmp/ok"
+rec "$ok" 2026-11-01-old superseded merge "prs: [5]" "collapsed_into: [2026-11-02-new]"
+rec "$ok" 2026-11-02-new implemented merge "prs: [6, 7]" "supersedes: [2026-11-01-old]"
+rec "$ok" 2026-11-03-hooks implemented hooks "code: hyperbeam:install_hooks"
+rec "$ok" 2026-11-04-gone superseded hooks "code: hyperbeam:install_hooks"
+"$t" --dir "$ok" check | grep -q "ok: 4 decisions" || { echo "FAIL: valid set rejected"; exit 1; }
+
+list=$("$t" --dir "$ok" list)
+[ "$(echo "$list" | wc -l)" = 2 ] && echo "$list" | grep -q "2026-11-02-new" && ! echo "$list" | grep -q "2026-11-01-old" || { echo "FAIL: list: $list"; exit 1; }
+[ "$("$t" --dir "$ok" list --topic hooks | wc -l)" = 1 ] || { echo "FAIL: list --topic"; exit 1; }
+
+idx=$("$t" --dir "$ok" index)
+echo "$idx" | grep -q "^## merge" && echo "$idx" | grep -q "^## Superseded" && echo "$idx" | grep -q "collapsed into \[Title of 2026-11-02-new\]" || { echo "FAIL: index:"; echo "$idx"; exit 1; }
+
+bad="$tmp/a"; cp -r "$ok" "$bad"; rec "$bad" 2026-11-05-x superseded merge
+expect_fail "$bad" "does not say what it collapsed into"
+bad="$tmp/b"; cp -r "$ok" "$bad"; rec "$bad" 2026-11-05-x implemented merge "supersedes: [2026-11-02-new]"
+expect_fail "$bad" "still implemented"
+bad="$tmp/c"; cp -r "$ok" "$bad"; rec "$bad" 2026-11-05-x superseded merge "collapsed_into: [2026-11-09-missing]"
+expect_fail "$bad" "does not exist"
+bad="$tmp/d"; rm -rf "$bad"; rec "$bad" 2026-11-05-a superseded merge "collapsed_into: [2026-11-06-b]"; rec "$bad" 2026-11-06-b superseded merge "collapsed_into: [2026-11-05-a]"
+expect_fail "$bad" "cycle"
+bad="$tmp/e"; cp -r "$ok" "$bad"; rec "$bad" 2026-11-05-x maybe merge
+expect_fail "$bad" "status must be"
+bad="$tmp/f"; cp -r "$ok" "$bad"; rec "$bad" 2026-11-05-x implemented ""
+expect_fail "$bad" "topic is missing"
+bad="$tmp/g"; cp -r "$ok" "$bad"; echo "no front matter" > "$bad/docs/decisions/2026-11-05-x.md"
+expect_fail "$bad" "no front matter"
+bad="$tmp/h"; cp -r "$ok" "$bad"; rec "$bad" 2026-11-05-x implemented merge; sed -i 's/^id: .*/id: wrong/' "$bad/docs/decisions/2026-11-05-x.md"
+expect_fail "$bad" "must be the file name"
+echo "PASS decisions"

@@ -18,4 +18,4 @@ hyperbeam is a personal "senior engineer" for many AI-assisted prototype project
 - **Keys inside tmux:** `M-h` back to the menu, `M-[` and `M-]` previous and next session, `M-y` copy the Claude conversation (or the pane's whole scrollback), `M-s` hide or show the sidebar, `M-arrows` select a pane, `M-z` zoom. Shift+Tab is Claude Code's plan mode.
 - **The lab:** all agent testing runs there, as the separate user `hblab`: `hyperbeam lab run --why "unit tests" -- npm test`. Set it up once with `sudo bash lab/setup.sh`; then `hyperbeam lab status`, `hyperbeam lab stop`, `hyperbeam lab log --today`. Details in CLAUDE.md.
 
-Roadmap: IDEAS.md. Why things are the way they are: docs/DECISIONS.md. How it works now: CLAUDE.md. The rules every project follows: RULES.md.
+Roadmap: IDEAS.md. Why things are the way they are: docs/decisions/ (one file per decision; docs/DECISIONS.md is the index). How it works now: CLAUDE.md. The rules every project follows: RULES.md.

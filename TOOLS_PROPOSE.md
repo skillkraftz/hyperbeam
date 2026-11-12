@@ -28,4 +28,4 @@ For each approved tool, create `tools/<name>/`:
 - one line in `TOOLS.md`: `- **name** - usage line - the work it replaces`.
 Test each in the lab: `hyperbeam lab run --why "test tool NAME" -- hyperbeam tool --test NAME`, or run `bash tools/<name>/test` through `hyperbeam lab run`.
 Commit, push, open a PR with a manual test checklist of real commands, remove the worktree, and report: branch, PR URL, the tools, what they save, what is
-untested. Do not merge. Update docs/DECISIONS.md only if a real design decision was made.
+untested. Do not merge. Add a decision record (docs/decisions/, see RULES.md) only if a real design decision was made.
