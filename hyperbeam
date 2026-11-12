@@ -4029,11 +4029,25 @@ def pr_behind(path, pr):
     return int(n), sorted(theirs & ours)
 
 
-def update_prompt(name, pr, behind, base):
-    """What Claude is asked to do about a PR that is behind its base. Written to the prompts folder; returns the file."""
+def pr_conflicts(path, pr):
+    """The files the PR's branch conflicts with its base in (a dry-run merge of the refs pr_behind fetched, nothing is touched), [] if it merges cleanly or can't be told."""
+    base = pr.get("base") or default_branch(path)
+    r = subprocess.run(["git", "-C", str(path), "merge-tree", "--write-tree", "--name-only", "--no-messages", f"refs/remotes/origin/{base}", "refs/hyperbeam/pr-head"],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 1:
+        return []
+    return [l for l in r.stdout.splitlines()[1:] if l.strip()]
+
+
+def update_prompt(name, pr, behind, base, conflicts=()):
+    """What Claude is asked to do about a PR that is behind its base (or conflicts with it). Written to the prompts folder; returns the file."""
+    why = (f"The PR branch `{pr.get('branch')}` is {behind} commit{'s' if behind != 1 else ''} behind `{base}`, so its tests ran against an older {base}."
+           if not conflicts else
+           f"The PR branch `{pr.get('branch')}` conflicts with `{base}` ({behind} commit{'s' if behind != 1 else ''} behind) in: {', '.join(conflicts)}. "
+           "Merge was run for all the open PRs, oldest first, and stopped here. Files like docs/DECISIONS.md, where every PR adds an entry at the top, usually need both sides kept.")
     return write_prompt(sanitize(name), f"""# Update PR #{pr['number']} ({pr['title']}) and re-test it
 
-The PR branch `{pr.get('branch')}` is {behind} commit{'s' if behind != 1 else ''} behind `{base}`, so its tests ran against an older {base}.
+{why}
 Do this, in the project's folder (use a worktree if the checkout has other work):
 1. `git fetch`, then rebase the branch onto `origin/{base}` (or merge `origin/{base}` into it if a rebase is messy). Resolve conflicts carefully; ask me if a conflict is not obvious.
 2. Re-run the project's tests in the lab: `hyperbeam lab run --why "re-test PR #{pr['number']} on current {base}" ...` (see the project's CLAUDE.md for the test command).
@@ -5475,6 +5489,17 @@ class Menu(App):
         finally:
             self.busy.discard(name)
 
+    def _ask_update(self, p, pr, behind, base, conflicts=()):
+        """Ask the project's Claude to rebase the PR onto its base and re-test (update_prompt). -> the sentence that stops the merge run."""
+        name = p["name"]
+        sess = sanitize(name)
+        pane = find_claude_pane(sess) if session_exists(sess) else None
+        why = f"conflicts with {base}" if conflicts else f"behind {base}"
+        if not pane:
+            return f"{why}, and {name} is not running: Open it, then click Merge again (nothing more was merged)"
+        inject_prompt(pane, update_prompt(name, pr, behind, base, conflicts), [])
+        return f"{why}; asked Claude to rebase it and re-test: click Merge again when it has pushed"
+
     def _merge_one(self, p, pr):
         """Check one PR against its base and merge it. -> None when merged, else why the run stops (a sentence)."""
         name = p["name"]
@@ -5484,22 +5509,22 @@ class Menu(App):
         except (subprocess.SubprocessError, OSError):
             behind, overlap = None, []
         base = pr.get("base") or default_branch(p["path"])
+        conflicts = pr_conflicts(p["path"], pr) if behind else []
+        if conflicts:                  # "Merge anyway" can't work: Claude rebases it, then Merge again
+            return self._ask_update(p, pr, behind, base, conflicts)
         if behind and overlap:
             shown = ", ".join(overlap[:3]) + (f" and {len(overlap) - 3} more" if len(overlap) > 3 else "")
             pick = self.choose(f"PR #{pr['number']} in {name}: {pr['title']}\n\nThis PR is {behind} commit{'s' if behind != 1 else ''} behind {base}, and {base} also changed {shown}; "
                                "its tests ran without those changes.\n\nAsk Claude to update it and re-test (Enter), or merge it as it is.", [
                 ("ask", "Ask Claude to update and re-test (a)", "a"), ("merge", "Merge anyway (m)", "m"), ("cancel", "Cancel (c)", "c")], enter="ask")
             if pick == "ask":
-                sess = sanitize(name)
-                pane = find_claude_pane(sess) if session_exists(sess) else None
-                if not pane:
-                    return f"{name} is not running: Open it, then ask again (nothing more was merged)"
-                inject_prompt(pane, update_prompt(name, pr, behind, base), [])
-                return f"asked Claude to update it on {base} and re-test"
+                return self._ask_update(p, pr, behind, base)
             if pick != "merge":
                 return "cancelled"
         self.say_from_thread(f"{name}: merging PR #{pr['number']}...")
         ok, msgs = merge_pr(name, p["path"], pr, self.say_from_thread)
+        if not ok and any(w in " ".join(msgs).lower() for w in ("conflict", "not mergeable", "cannot be cleanly")):      # GitHub's own view of a conflict
+            return self._ask_update(p, pr, behind or 0, base, ["(see the PR on GitHub)"])
         if not ok:
             return "; ".join(msgs)
         pr["_local_ok"] = any(m.startswith("local: on") and "failed" not in m for m in msgs)
