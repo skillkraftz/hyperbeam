@@ -1,7 +1,7 @@
 ---
 id: 2026-11-12-manager-row
 status: implemented
-prs: []
+prs: [56]
 topic: ui
 supersedes: [2026-11-12-manager-session-is-home]
 ---
