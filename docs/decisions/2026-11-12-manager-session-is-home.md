@@ -1,8 +1,10 @@
 ---
 id: 2026-11-12-manager-session-is-home
-status: implemented
+status: superseded
 prs: [45]
 topic: ui
+collapsed_into: [2026-11-12-manager-row]
+code: hyperbeam:ensure_menu
 ---
 # The hyperbeam session is home: first in the list, where Stop returns to, width kept on resize
 

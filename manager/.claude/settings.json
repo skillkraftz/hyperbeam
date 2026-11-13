@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "deny": ["Edit(~/projects/**)", "Write(~/projects/**)", "Edit(~/.local/lib/hyperbeam/**)", "Write(~/.local/lib/hyperbeam/**)"]
+  }
+}
