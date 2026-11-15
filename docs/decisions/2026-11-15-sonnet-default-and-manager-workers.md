@@ -1,7 +1,7 @@
 ---
 id: 2026-11-15-sonnet-default-and-manager-workers
 status: implemented
-prs: []
+prs: [57]
 topic: claude
 supersedes: [2026-11-12-injected-prompts-start-in-plan-mode]
 ---
