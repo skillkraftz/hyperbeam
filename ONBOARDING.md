@@ -1,12 +1,12 @@
 # Investigate a project for hyperbeam
 
-You are Claude Code, running in the project's directory, in the `claude` window of the project's tmux session.
-hyperbeam started you because the project has no manifest, because starting it failed, or because the user pressed Onboard.
-The facts (project name, manifest, session, what failed with the last lines of the failing window) are at the bottom.
+This is a worker task: the manager sends it with `hyperbeam work NAME ~/.local/lib/hyperbeam/ONBOARDING.md`, after the user said yes. hyperbeam never sends it by itself.
+You run in the project's directory. The project's name is the folder name; its manifest is `~/projects/hyperbeam/projects/<name>.toml` (it may not exist yet).
+The tmux session of this worker is `claude-<name>`: start what you need in new windows of it.
 Read docs/REFERENCE.md in ~/projects/hyperbeam first (the sections "Manifest format" and "Reachable over Tailscale"): it defines the manifest format, the Docker rule and the Tailscale notes.
 
 Rules: never print the contents of .env files, keys or tokens (say only that such a file exists and which variable names it needs).
-Do not commit anything in the project. The one exception is the manifest in hyperbeam, after the user approves it (step 3).
+Do not commit anything in the project. The one exception is the manifest in hyperbeam (step 3).
 **Steno files:** `steno-YYYY-MM-DD.txt` files whose first line starts with `stenographr` are the user's personal dictation notes, not project files.
 Never read them for the project, never `git add` them, never commit them. If one is not covered by .gitignore, list "add `steno-*.txt` to .gitignore"
 among the project changes you recommend.
@@ -27,16 +27,15 @@ so you know which ports are taken.
 - If it does serve something: use a free port from 3100 upward that no manifest holds and nothing listens on; set PORT and HB_PORT
   to it for the commands you start. If the dev command ignores $PORT, put the override in the command (for example `--port $HB_PORT`)
   and bind all interfaces as docs/REFERENCE.md says (Reachable over Tailscale).
-- Check it: curl the port, run the test command, read the window output. If the status below lists a failure, find its cause first.
+- Check it: curl the port, run the test command, read the window output. If a service fails, find its cause first.
 - Leave what you started running if it works; stop what does not.
 
-## 3. Propose the manifest, then wait
-Show the user the full `projects/<name>.toml` you propose (format in docs/REFERENCE.md: `port` only if something serves, ordered services, `ready_port`, `stop` for every backing
-service, `[env]` if needed; no URLs: `kk` discovers links itself, `[links]` is only for extras it cannot find) with one line per service saying what you checked. **Then stop and wait for the user to approve.**
-Only after approval write it to the manifest path given below in ~/projects/hyperbeam (this directory is added to your session), and
+## 3. Write the manifest
+Write `projects/<name>.toml` (format in docs/REFERENCE.md: `port` only if something serves, ordered services, `ready_port`, `stop` for every backing
+service, `[env]` if needed; no URLs: `kk` discovers links itself, `[links]` is only for extras it cannot find), with one line per service in your report saying what you checked, and
 **commit it straight to hyperbeam's main and push**, no branch and no PR: `git add projects/<name>.toml` (only that file), commit with a message such as
 "Add <name> manifest", `git push origin main`. If ~/projects/hyperbeam is not on main or has other uncommitted work, do not switch branches: write the file,
-tell the user, and ask how to proceed.
+stop and say so in your report.
 If a manifest already exists, change only what is wrong and commit it the same way.
 
 ## 4. Reply with
@@ -47,7 +46,5 @@ If a manifest already exists, change only what is wrong and commit it the same w
 
 If the project needs a non-default way to install, update, test or restart (the defaults come from its lockfile), add a `[commands]` table to the manifest (`install = "..."`, `update = "..."`, `test = "..."`); `hyperbeam NAME help` shows what each verb will run.
 
-## 4. Then align the project to hyperbeam
-Before the alignment proposal, switch back to plan mode (EnterPlanMode): approving the first proposal took you out of it, and the proposal should come from the planning model.
-After the manifest step (a configured project: after you checked the manifest is still right), follow ALIGN.md, which hyperbeam appends below this
-file. Do not start it before the manifest is settled, and do not change the project before the user approves the alignment proposal.
+## 5. Aligning is a separate task
+Do not align the project here. If it needs it, say so in your report: the manager sends ALIGN.md as its own task (`hyperbeam work NAME ~/.local/lib/hyperbeam/ALIGN.md`).

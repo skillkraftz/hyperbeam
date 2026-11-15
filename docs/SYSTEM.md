@@ -12,12 +12,10 @@ Marked **[gap]** = known difference between what was intended and what is built.
             │     menu: the menu again (phone / SSH)
             └─ project row ── Open ──┐
                                      ▼
-          no manifest? ──yes──> Onboard: ONBOARDING.md + ALIGN.md (plan, wait for approval, PR)
-                │no
           saved layout? ──> restored without asking: windows, panes, their programs
                 │
           services start in order ─> start check (git, crash) ─> shell runs kk
-                │                    red problem? → offer RECOVER.md
+                │                    failed service? → red dot + a note, nothing sent to Claude
                 ▼
           Claude starts: continues its last conversation (fresh if none), no question
                 ▼
@@ -38,9 +36,10 @@ Marked **[gap]** = known difference between what was intended and what is built.
 
 | Prompt | When | What Claude does |
 |---|---|---|
-| ONBOARDING.md | Open without a manifest, a service failed, or Onboard | reads the project, starts it, proposes the manifest, waits for approval |
-| ALIGN.md | right after ONBOARDING | compares the project with RULES.md, proposes changes, waits, then a PR |
-| RECOVER.md | Open finds a red problem and you say yes | diagnoses read-only, proposes, waits |
+| ONBOARDING.md | the manager sends it (`hyperbeam work NAME ~/.local/lib/hyperbeam/ONBOARDING.md`) after your yes | reads the project, starts it, writes and commits the manifest |
+| ALIGN.md | the manager sends it the same way | compares the project with RULES.md, makes the changes in a PR |
+
+hyperbeam never sends a prompt by itself.
 
 Every injected prompt starts in plan mode (Opus plans, Sonnet builds).
 

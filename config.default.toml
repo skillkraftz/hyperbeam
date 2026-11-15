@@ -5,7 +5,5 @@ projects_dir = "~/projects"
 # "sidebar" (desktop default): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal.
 # "window": a new kitty window per project. Over SSH it is always switch. The menu's Settings screen changes it.
 open_mode = "sidebar"
-# "ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.
-on_problem = "ask"
 # GitHub owners hyperbeam leaves alone (no PR badge, no Merge, not checked by `hyperbeam verify`). Put it in your own config, e.g. ["algoviewz"].
 ignore_owners = []

@@ -2,13 +2,14 @@
 
 hyperbeam is the system; projects are brought in line with it, they do not override it. A project may differ from RULES.md **only** where its
 CLAUDE.md has a section `## Exceptions to hyperbeam rules` that lists each exception and why, approved by the user.
-You are Claude Code in the project's directory. Read `.hyperbeam/RULES.md` (or ~/projects/hyperbeam/RULES.md) first. The project's real state is
-in the "Alignment facts" at the bottom of this prompt; check anything else yourself (read-only: `gh`, `git`, the files). Never print secret values.
+This is a worker task: the manager sends it with `hyperbeam work NAME ~/.local/lib/hyperbeam/ALIGN.md`, after the user said yes. hyperbeam never sends it by itself.
+You are in the project's directory. Read `.hyperbeam/RULES.md` (or ~/projects/hyperbeam/RULES.md) first. The project's real state is
+what `hyperbeam align-facts` prints (run it in the project's directory); check anything else yourself (read-only: `gh`, `git`, the files). Never print secret values.
 
 ## 1. Compare
 Compare the project's CLAUDE.md, README and docs/ against RULES.md **and against the real repo state**:
 - **Stale or wrong claims**: anything a doc says that the repo contradicts. Example: CLAUDE.md says the repo is not public but `gh` says it is
-  public (check the facts; the lines that claim public/private are listed).
+  public (check the facts; the lines that claim public/private are in the facts).
 - **Rules**: does CLAUDE.md import `@.hyperbeam/RULES.md`? Does it say anything that conflicts with a rule (branch/PR workflow, testing, secrets,
   steno files, README upkeep, final report)? Is there a PRIVATE.md for the real secrets, and does .gitignore cover exactly those?
 - **Docs layout**: CLAUDE.md = how the project works now (setup, run, test, layout); docs/decisions/ = one file per design decision (front matter: status,
@@ -23,16 +24,14 @@ Compare the project's CLAUDE.md, README and docs/ against RULES.md **and against
 - **Standard verbs**: the facts list which of install, update, test, version, help the project provides itself and which only have hyperbeam's default. Propose the smallest real addition where the default doesn't fit (a `version` script that prints the version, a real `update`, `--help`), as a change to the project. Compare the project's own entry point with the standard: a CLI should answer `NAME --version`, `NAME help`, `NAME update`, `NAME install` itself; a web app `/version`. Where the default `update` is wrong for how the project is installed (an editable tool install is `uv tool install --editable ...`, not `uv sync`), propose a `[commands]` entry for the manifest or a real subcommand.
 - **Hygiene**: steno files ignored, `.hyperbeam` not committed, README matches how the project behaves now.
 
-## 2. Propose, then wait
-Be in plan mode when you write the proposal (EnterPlanMode if you are not): the proposal should come from the planning model.
-Write the proposal as a list. Each difference gets: what you found (with file:line), and either
+## 2. Decide
+Nobody answers questions while you work: for each difference, pick the simplest option and say why in the PR description. Each difference gets: what you found (with file:line), and either
 - **change the project** (what you would edit), or
 - **record an exception** (draft the line for `## Exceptions to hyperbeam rules`: the rule, what the project does instead, and the reason).
-Mark the ones where the user must decide (for example how an existing decisions doc relates to docs/decisions/). Show the list and **stop and wait for approval.**
-Nothing is changed before that.
+Mark the ones where the user should look again (for example how an existing decisions doc relates to docs/decisions/): put them first in the PR description with your recommendation and the alternative.
 
-## 3. After approval
+## 3. Make the changes
 Work on a branch in the project's own folder (`git fetch` first, `git switch -c align origin/main`, never stack). Only if the checkout has other work in it, use a git worktree
-(`git worktree add -b align ~/.cache/hyperbeam-work/<project>-align main`); the project's own rules win if they say otherwise and the user approved that. Make exactly the approved changes, including the `@.hyperbeam/RULES.md`
+(`git worktree add -b align ~/.cache/hyperbeam-work/<project>-align main`); the project's own rules win if they say otherwise. Make the changes you decided on, including the `@.hyperbeam/RULES.md`
 import and the Exceptions section if any. Test in the lab (`hyperbeam lab run --why ...`), commit, push, open a PR with a manual test checklist, remove the
 worktree if you made one, and report: branch, PR URL, what changed, what you could not do. Do not merge.
