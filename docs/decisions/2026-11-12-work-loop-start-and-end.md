@@ -1,8 +1,10 @@
 ---
 id: 2026-11-12-work-loop-start-and-end
-status: implemented
+status: superseded
 prs: [52]
 topic: work-loop
+collapsed_into: [2026-11-15-cut-merge-and-done-extras]
+code: hyperbeam:start_choice
 ---
 # A conversation has a start and an end: a choice when Claude starts and after a finished Merge run
 

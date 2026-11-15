@@ -540,13 +540,6 @@ def recover_prompt(name, path, sess, findings):
     return write_prompt(sess, (HERE / "RECOVER.md").read_text() + "\n\n---\n" + "\n".join(ctx) + "\n")
 
 
-def wrapup_prompt(results, sess):
-    ctx = ["Projects checked (findings per project; values of secrets are never shown):", ""]
-    for r in results:
-        ctx += [format_wrapup(r, cap=40), f"  path: {r['path']}", ""]
-    return write_prompt(sess, (HERE / "WRAPUP.md").read_text() + "\n\n---\n" + "\n".join(ctx))
-
-
 def find_claude_pane(sess):
     """The pane for Claude: the one running claude; else the left pane of window `work` in a project session, or the first non-menu pane of
     the hyperbeam session's home window. Never the menu pane: text sent to it would be keystrokes for the menu."""
@@ -558,18 +551,6 @@ def find_claude_pane(sess):
         return next((r[0] for r in rows if r[1] == "claude"), None) or (rows[0][0] if rows else None)
     return (next((r[0] for r in rows if r[1] == "claude"), None)
             or next((r[0] for r in rows if r[2] == "work"), None) or (rows[0][0] if rows else None))
-
-
-def start_wrapup(sess, results):
-    """Wrap-up findings to Claude in the session's Claude pane (inject_prompt). Returns the pane id."""
-    pane = find_claude_pane(sess)
-    if not pane:
-        raise RuntimeError(f"no pane to start Claude in {sess}")
-    here = tmux("display-message", "-p", "-t", pane, "#{pane_current_path}").stdout.strip()
-    inject_prompt(pane, wrapup_prompt(results, sess), [r["path"] for r in results if Path(r["path"]) != Path(here)])
-    tmux("select-window", "-t", pane, check=False)
-    tmux("select-pane", "-t", pane, check=False)
-    return pane
 
 
 def claude_base(plan=False):
@@ -679,12 +660,6 @@ def start_text(name, path):
         prs = []
     L.append("Open PRs (yours): " + (", ".join(f"#{x['number']} {x['title']}" for x in prs) if prs else "none"))
     return (HERE / "START.md").read_text() + "\n\n---\n" + "\n".join(L) + "\n---\n" + review_snapshot(name, path)
-
-
-def start_fresh(name, path):
-    """A fresh plan-mode Claude (START.md) replaces the project's running Claude (swap_claude). -> (started, message)."""
-    f = write_prompt(sanitize(name), start_text(name, path))          # built first: the snapshot includes what the Claude being replaced last said
-    return swap_claude(name, path, f, "fresh start", [HERE] if name == "hyperbeam" else [])
 
 
 def begin_claude(name, path, pane, begin, cont=False):
@@ -950,29 +925,6 @@ def review_text(name, path, since):
 def review_prompt(name, path, since):
     """review_text written to the prompts folder (with the plan-first line). -> the file."""
     return write_prompt(sanitize(name), review_text(name, path, since))
-
-
-def daily_done(name):
-    """True when `name` was already marked today: Done's offers happen once a day, not at every press."""
-    try:
-        return json.loads((DATA_DIR / "daily.json").read_text()).get(name) == time.strftime("%Y-%m-%d")
-    except (OSError, ValueError):
-        return False
-
-
-def daily_mark(name):
-    f = DATA_DIR / "daily.json"
-    today = time.strftime("%Y-%m-%d")
-    try:
-        d = {k: v for k, v in json.loads(f.read_text()).items() if v == today}
-    except (OSError, ValueError):
-        d = {}
-    d[name] = today
-    try:
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps(d))
-    except OSError:
-        pass
 
 
 def previous_claude(name):
@@ -2864,19 +2816,6 @@ def format_digest(d, tool_notes=(), title="Lab digest"):
     return "\n".join(L)
 
 
-def digest_summary(d, tool_notes=()):
-    """A few lines for Done."""
-    if not d["runs"]:
-        return "Lab: no runs logged."
-    top = d["candidates"][0] if d["candidates"] else None
-    L = [f"Lab: {d['runs']} runs, {mins(d['seconds'])}, {sum(v['failed'] for v in d['projects'].values())} failed, {len(d['flaky'])} flaky",
-         f"Tool candidates: {len(d['candidates'])}" + (f" (top: {top['count']}x {top['what'][:50]}, {mins(top['total'])})" if top else "")]
-    L += [f"Tool note: {n}" for n in tool_notes]
-    L += [f"Tool {n}: failed {v['failed']} of {v['used']} runs" for n, v in d.get("tools", {}).items() if v["failed"]]
-    L += [f"Tool {n}: its work was done by hand {v['by_hand']}x" for n, v in d.get("tools", {}).items() if v["by_hand"]]
-    return "\n".join(L)
-
-
 def tool_names():
     """Tools: tools/NAME/ with an executable NAME, or a Go tool (go.mod) that is built on first use."""
     t = TOOLS_SRC
@@ -2959,20 +2898,6 @@ def cmd_lab_digest(a):
     d = lab_digest(read_lab_runs(since))
     print(format_digest(d, tool_test_notes() if not a.no_tests else (), "Lab digest" + (f" since {since}" if since else "")))
     return 0
-
-
-def offered_digest(d):
-    """True once per day per set of candidates: Done offers the tool proposal once, not at every press."""
-    key = "digest:" + hashlib.sha1(json.dumps([(c["project"], c["what"]) for c in d["candidates"]]).encode()).hexdigest()[:10]
-    if daily_done(key):
-        return True
-    daily_mark(key)
-    return False
-
-
-def tools_prompt(d, notes):
-    """TOOLS_PROPOSE.md plus the digest, for the hyperbeam session's Claude."""
-    return write_prompt(DEV, (HERE / "TOOLS_PROPOSE.md").read_text() + "\n\n---\n\n" + format_digest(d, notes, "Lab digest (today)") + "\n")
 
 
 def cmd_tool(a):
@@ -5260,14 +5185,7 @@ def cmd_stop(args):
         r = check_project(args.name)
         if r and not wrapup_clean(r):
             print(format_wrapup(r))
-            if not sys.stdin.isatty():
-                sys.exit("hyperbeam: not clean; run it in a terminal to choose, or use --force")
-            pick = input("[w] wrap up with Claude  [s] stop anyway  [c] cancel: ").strip().lower()[:1]
-            if pick == "w" and session_exists(sess):
-                start_wrapup(sess, [r])
-                sys.exit(f"Claude started in {sess}'s Claude pane; attach with `hyperbeam open {args.name}`, and stop again when it is done.")
-            if pick != "s":
-                sys.exit("hyperbeam: not stopped")
+            sys.exit("hyperbeam: not stopped: not clean (commit or stash, or use --force)")
     try:
         sys.exit(0 if stop_project(args.name, man) else 1)
     except RuntimeError as e:
@@ -6024,17 +5942,13 @@ class Menu(App):
         self.run_worker(lambda: self._stop(p, man), thread=True)
 
     def _stop(self, p, man):
-        """Stop: the wrap-up check first. Clean: confirm and stop. Not clean: wrap up with Claude, stop anyway, or cancel."""
+        """Stop: the wrap-up check first. Clean: confirm and stop. Not clean: stop anyway or cancel."""
         name = p["name"]
         try:
             r = check_project(name)
             if r and not wrapup_clean(r):
                 pick = self.choose(f"{format_wrapup(r)}\n\nStop {name} anyway?", [
-                    ("wrap", "Start Claude to wrap up (w)", "w"), ("stop", "Stop anyway (s)", "s"), ("cancel", "Cancel (c)", "c")])
-                if pick == "wrap":
-                    start_wrapup(sanitize(name), [r])
-                    show_session(sanitize(name))
-                    return self.say_from_thread(f"{name}: Claude is wrapping up in its Claude pane. Stop again when it says it's done.")
+                    ("stop", "Stop anyway (s)", "s"), ("cancel", "Cancel (c)", "c")])
                 if pick != "stop":
                     return self.say_from_thread(f"{name}: not stopped.")
             else:
@@ -6049,62 +5963,6 @@ class Menu(App):
             self.busy.discard(name)
             self.call_from_thread(self.reload, True)
 
-    def digest_step(self):
-        """Done, first: today's lab digest in a few lines (plain script, no tokens). If it found tool candidates (once per set per day) the user may ask
-        Claude, in the hyperbeam session, to propose tools. Returns True if Done should stop here (Claude was started: press Done again later)."""
-        try:
-            d = lab_digest(read_lab_runs(time.strftime("%Y-%m-%d")))
-            notes = tool_test_notes()
-        except Exception as e:
-            self.say_from_thread(f"Done for now: the lab digest failed ({e}); going on.")
-            return False
-        if not d["runs"] and not notes:
-            return False
-        text = digest_summary(d, notes)
-        if d["candidates"] and not offered_digest(d):
-            if self.choose(text + "\n\nTurn the repeated work into small tools?", [("ask", "Ask Claude to propose tools (a)", "a"), ("skip", "Skip (s)", "s")]) == "ask":
-                pane = find_claude_pane(DEV) if session_exists(DEV) else None
-                if not pane:
-                    self.say_from_thread("Done for now: open the hyperbeam project first; its Claude pane proposes the tools.")
-                    return False
-                inject_prompt(pane, tools_prompt(d, notes), [])
-                tmux("select-window", "-t", pane, check=False)
-                tmux("select-pane", "-t", pane, check=False)
-                self.say_from_thread("Done for now: Claude is proposing tools in the hyperbeam project's Claude pane. Press Done again when it is finished.")
-                return True
-        else:
-            self.say_from_thread(text.replace("\n", "  |  "))
-        return False
-
-    def review_step(self):
-        """Done, second: a project worked on today with `review_after` or more PRs merged since its last review: offer the review pass (once a day per project).
-        Returns True if Claude was started (press Done again when it says "Review done.")."""
-        try:
-            names = sorted(load_journal()["projects"])
-        except Exception:
-            return False
-        for n in names:
-            try:
-                path = known_path(n)
-                due = reviews_due(path, n)
-                if not due or due[0] < cfg_get("review_after") or daily_done(f"review:{n}"):
-                    continue
-            except Exception:
-                continue
-            if self.choose(f"{n}: {due[0]} PRs merged since {since_text(due[1])}.\n\nReview them now? A fresh Claude in plan mode (Opus) replaces the one "
-                           "in that session, checks the whole batch and proposes ONE cleanup PR first. The old conversation comes back with Previous Claude.",
-                           [("ask", "Ask Claude to review (r)", "r"), ("later", "Later (l)", "l")]) != "ask":
-                daily_mark(f"review:{n}")
-                continue
-            ok, msg = start_review(n, path, due[1]["through"])
-            if not ok:
-                self.say_from_thread(f"Done for now: no review started: {msg}")
-                continue
-            daily_mark(f"review:{n}")
-            self.say_from_thread(f"Done for now: {n}: {msg}. Press Done again when it says \"Review done.\"")
-            return True
-        return False
-
     def action_done(self):
         if "@done" in self.busy:
             return self.say("Done for now is already running.")
@@ -6114,23 +5972,14 @@ class Menu(App):
 
     def _done(self):
         """Done for now: the wrap-up check on every project worked on since the menu started. All clean: offer to stop their sessions.
-        Otherwise offer Claude (in the hyperbeam session's Claude pane); the user presses Done again when finished."""
+        Otherwise say which are not clean and stop nothing."""
         try:
-            if self.digest_step() or self.review_step():
-                return
             names = sorted(n for n in load_journal()["projects"] if n != MENU)       # the manager is not a project: its notes are committed by its own wrap-up
             if not names:
                 return self.say_from_thread("Done for now: no project has been opened since the menu started.")
             results = [r for r in (check_project(n) for n in names) if r]
-            dirty = [r for r in results if not wrapup_clean(r)]
-            if dirty:
-                text = "\n\n".join(format_wrapup(r) for r in results)
-                if self.choose(f"{text}\n\nStart Claude to wrap up?", [("wrap", "Start Claude to wrap up (w)", "w"), ("close", "Close (c)", "c")]) == "wrap":
-                    if not session_exists(DEV):
-                        return self.say_from_thread("Done for now: open the hyperbeam project first; its Claude pane does the wrap-up.")
-                    start_wrapup(DEV, dirty)
-                    return self.say_from_thread("Done for now: Claude is wrapping up in the hyperbeam project's Claude pane. Press Done again when it says it's done.")
-                return self.say_from_thread("Done for now: not clean, nothing stopped.")
+            if any(not wrapup_clean(r) for r in results):
+                return self.say_from_thread("Done for now: not clean, nothing stopped: " + ", ".join(r["name"] for r in results if not wrapup_clean(r)) + ". Stop one to see why.")
             all_running = [n for n in names if sanitize(n) != MENU and session_exists(sanitize(n))]
             busy = {n: claude_state(n)[0] for n in all_running if claude_state(n)[0] in ("working", "waiting")}       # git-clean is not the same as finished
             running = [n for n in all_running if n not in busy]
@@ -6234,8 +6083,6 @@ class Menu(App):
             summary = (("merged " + ", ".join(f"#{x['number']}" for x in merged)) if merged else "nothing merged") + (f"; {stopped}" if stopped else "")
             if merged and name == "hyperbeam":
                 self.say_from_thread(f"{name}: {summary}")
-                if not stopped:
-                    self.next_step(p, merged)                      # before the update: it restarts this menu
                 self.call_from_thread(self.update_hyperbeam)       # the menu restarts itself: this runs in a popup
             elif merged and local_ok:
                 lines = []                                         # merged and pulled: now the project's own update (install, restart services), one click in all
@@ -6244,32 +6091,10 @@ class Menu(App):
                 self.say_from_thread(f"{name}: {summary}; update {'ok' if rc == 0 else 'FAILED'}: {last}")
             else:
                 self.say_from_thread(f"{name}: {summary}")
-            if merged and not stopped and name != "hyperbeam":
-                self.next_step(p, merged)
         except Exception as e:
             self.say_from_thread(f"{name}: merge ERROR {e}" + (f" (merged {', '.join('#' + str(x['number']) for x in merged)} before)" if merged else ""))
         finally:
             self.busy.discard(name)
-
-    def next_step(self, p, merged):
-        """A Merge run finished: that piece of work is done, so a conversation has an end. If the project's session runs, offer a fresh plan session (a new Claude in
-        plan mode proposes what to do next; Previous Claude keeps the old conversation), a review when one is due, or keeping the conversation."""
-        name = p["name"]
-        if not session_exists(sanitize(name)):
-            return
-        due = reviews_due(p["path"], name)
-        review = bool(due and due[0] >= cfg_get("review_after"))
-        opts = [("fresh", "Fresh plan session (f)", "f"), *([("review", "Review (r)", "r")] if review else []), ("keep", "Keep this conversation (k)", "k")]
-        pick = self.choose(f"{name}: merged {', '.join('#' + str(x['number']) for x in merged)}. That piece of work is done: start the next one fresh?\n\n"
-                           "Fresh plan session: a new Claude in plan mode reads the state and proposes what to do next, then waits; the old conversation comes back with "
-                           "Previous Claude." + (f"\n\nA review is due: {due[0]} PRs merged since {since_text(due[1])}." if review else ""), opts, "fresh")
-        if pick == "fresh":
-            ok, msg = start_fresh(name, Path(p["path"]))
-        elif pick == "review":
-            ok, msg = start_review(name, Path(p["path"]), due[1]["through"])
-        else:
-            return
-        self.say_from_thread(f"{name}: {msg}")
 
     def _ask_update(self, p, pr, behind, base, conflicts=()):
         """Ask the project's Claude to rebase the PR onto its base and re-test (update_prompt). -> the sentence that stops the merge run."""

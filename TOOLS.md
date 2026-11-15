@@ -6,8 +6,7 @@ Small, single-purpose scripts that replace repeated multi-step lab work, built f
 (`hyperbeam tool --test NAME`). The sidebar runs every tool's test once a day (the first start) and a failing one turns the hyperbeam row red;
 the digest shows how often each tool was used, how often it failed, and work it replaces that was done by hand.
 
-A tool lives in `tools/<name>/<name>` with `tools/<name>/test`. New ones come from the digest, proposed by Claude and approved by the user
-(TOOLS_PROPOSE.md). One line each: **name** - usage - the work it replaces.
+A tool lives in `tools/<name>/<name>` with `tools/<name>/test`. New ones come from the digest, proposed by Claude and approved by the user. One line each: **name** - usage - the work it replaces.
 
 ## Tools
 - **decisions** - `hyperbeam tool decisions list|check|index` - reads docs/decisions/ (one file per decision): the implemented ones, a consistency check (status, supersedes, collapsed_into), the generated docs/DECISIONS.md index (Go)

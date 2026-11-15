@@ -14,9 +14,9 @@ What happens, in order, and what does it. Names in `code` are what to search for
 5. **You work.** You and Claude talk; Claude plans (Opus), builds (Sonnet), works on a branch, runs all tests in the lab, opens a PR. The row's dot shows what Claude is doing: cyan working, blue waiting for you, green running, red only for something real. Claude's every shell command first passes the guard.
 6. **PRs appear.** After any `gh pr create|merge|close` a hook refreshes the PR list; the row turns magenta and a **Merge** button appears.
 7. **You press Merge.** All of your open PRs of that project, oldest first, one confirmation. Before each: is it behind main, did main change the same files, would it conflict? No overlap merges at once; overlap asks (Claude updates and re-tests, or merge anyway); a conflict is handed to Claude to rebase and the run stops. After the last merge the project's own `update` runs (install, restart services). For hyperbeam itself the installed copy is updated. (`_merge_all`, `_merge_one`, `pr_state`, `merge_pr`)
-8. **The piece of work ends.** When a Merge run merged everything, the same choice as at the start appears: **Fresh plan session**, **Review** when due, **Keep this conversation**. This is the only place a conversation is asked to end. (`next_step`)
+8. **The piece of work ends.** A Merge run ends at its summary and the project's update. Nothing is asked: the manager plans the next piece of work.
 9. **A review comes due.** After 5 merged PRs since the last review (or since onboarding, for a project with no review yet), a quiet note on the row and in the start message; the Project screen has a **Review** button; Done offers it. A review is a fresh plan-mode Claude that reads the whole batch and proposes one cleanup PR, then does it and writes `docs/reviews/<date>.md`. (`reviews_due`, `start_review`, `swap_claude`)
-10. **You stop for now.** Stop (one project) and Done (the day) run the wrap-up check: uncommitted or unpushed work, stashes, secrets in changes, steno files. Clean: sessions stop. Not clean: Claude is offered to wrap up (WRAPUP.md). Done first offers the lab digest (tools worth building) and the reviews. Layouts are saved on Stop and every 5 minutes. (`wrapup_check`, `_done`, `digest_step`, `review_step`)
+10. **You stop for now.** Stop (one project) and Done (the day) run the wrap-up check: uncommitted or unpushed work, stashes, secrets in changes, steno files. Clean: sessions stop. Not clean: it says what is unclean and stops nothing (Stop in the menu may stop anyway; `hyperbeam stop` refuses without `--force`). Layouts are saved on Stop and every 5 minutes. (`wrapup_check`, `_done`)
 
 ## 2. Words used here
 - **Project**: a folder in `~/projects`. **Manifest**: `projects/<name>.toml` in hyperbeam's own repo, saying how the project starts (services, port, env). Never inside the project.
@@ -57,7 +57,7 @@ Open ─ running? ──yes──> just show it
 ```
 - *Why:* a conversation that is never ended grows, costs more on every request, and nothing pushes work to a resolved state. Open and Merge are the two natural moments to decide.
 - *Can go wrong:* the question is only asked when a conversation exists for that folder; a service that fails still wins over your choice (the investigate prompt is more useful). **[check: is Fresh the right default, and should Continue ever be the default?]**
-- *Code:* `open_project`, `start_session`, `start_choice`, `begin_claude`, `start_text`, `start_fresh`, `inject_prompt`, `latest_conversation`, `set_aside`, START.md.
+- *Code:* `open_project`, `start_session`, `start_choice`, `begin_claude`, `start_text`, `inject_prompt`, `latest_conversation`, `set_aside`, START.md.
 
 ### 3.3 Claude's state: dots and hooks
 - *What:* hooks in `~/.claude/settings.json` write `working` / `waiting` into the project's data folder on Claude's own events; the menu turns that into cyan / blue. Green means the services are up. Red is rare on purpose: a service down, secrets in unpushed commits, a stuck merge with conflicts. Everything else (uncommitted work, behind, drift, stale docs, review due) is a quiet note, never a red dot.
@@ -76,13 +76,13 @@ Merge ─ confirm ─> for each open PR, oldest first:
 ```
 - *Why:* one click ships work and keeps the installed copy current; the check against main exists because the PR's tests ran without what main gained.
 - *Can go wrong:* GitHub lags a few seconds listing a just-merged PR (handled by dropping it from the list). A fork or offline state merges without the check and says so.
-- *Code:* `_merge_all`, `_merge_one`, `pr_state`, `merge_pr`, `next_step`, `refresh-prs` and the `pr-refresh` hook.
+- *Code:* `_merge_all`, `_merge_one`, `pr_state`, `merge_pr`, `refresh-prs` and the `pr-refresh` hook.
 
 ### 3.5 The review loop
 - *What:* count merged PRs since the last review record (`docs/reviews/`) or, with none, since onboarding. At 5 (a setting) it is **due**: shown as a note on the row and at Open, offered at Done once a day, and always available from the Project screen's **Review** button. The review replaces the project's Claude with a fresh plan-mode one that reads the batch (REVIEW.md plus facts and snapshot), proposes **one** cleanup PR, waits for approval, does it, and writes the record. The first review of a project writes its first record; from then on counting starts there.
 - *Why:* fast AI work layers up: duplicated code, hacks, stale docs, decisions that replaced each other. One pass per batch fixes it as a whole.
 - *Can go wrong:* the first review of stenographr only covered the onboarding's own alignment PR, because onboarding's date is taken before that PR merges. **[check: planned fix, re-baseline when a PR titled "Align with hyperbeam" merges]**
-- *Code:* `reviews_due`, `review_baseline`, `review_notes`, `review_facts`, `review_snapshot`, `start_review`, `swap_claude`, `back_claude`, `review_step`, REVIEW.md.
+- *Code:* `reviews_due`, `review_baseline`, `review_notes`, `review_facts`, `review_snapshot`, `start_review`, `swap_claude`, `back_claude`, REVIEW.md.
 
 ### 3.6 Onboarding and aligning
 - *What:* a project with no manifest, or on Onboard, gets a Claude that reads it, starts it, proposes the manifest and waits for your approval; then ALIGN.md compares the project's CLAUDE.md, README and docs with RULES.md and proposes a branch and PR to bring it in line. Projects follow the system; differences are allowed only where the project's CLAUDE.md lists them as approved exceptions. Manifests are committed straight to hyperbeam's main; everything else goes through a branch and PR.
@@ -119,11 +119,11 @@ Merge ─ confirm ─> for each open PR, oldest first:
 - *Code:* `context_bundle`, `hyperbeam context`, `tools/decisions`, `stale_doc_items`.
 
 ### 3.11 Done, Stop and the digest
-- *What:* **Stop** checks one project and stops it. **Done** works through everything touched today: the lab digest (repeated lab work worth a tool, offered once a day), reviews due, then the wrap-up check on every project; clean ones are stopped, others get a Claude. Done never stops a Claude that is working or waiting for you.
-- *Code:* `_done`, `digest_step`, `review_step`, `wrapup_check`, `stop_project`, `lab_digest`, TOOLS_PROPOSE.md.
+- *What:* **Stop** checks one project and stops it. **Done** works through everything touched today: the wrap-up check on every project; clean ones are stopped, others are listed and nothing is stopped. Done never stops a Claude that is working or waiting for you.
+- *Code:* `_done`, `wrapup_check`, `stop_project`, `lab_digest`.
 
 ## 4. Where this may not be what you meant
-1. A conversation ends only at Merge. Nothing ends one that never reaches a merge (exploration, a question). **[check]**
+1. Nothing ends a conversation any more: the manager decides when work is done and starts workers fresh. **[check]**
 2. The hyperbeam session continues silently after a reboot; every project asks. **[check: planned]**
 3. A review needs 5 merged PRs; small projects may never reach it. **[check: is 5 right, and should Done offer one when a project has gone N days?]**
 4. Fresh plan session is the default at Open. The previous conversation is one click away (Previous Claude), but only one level deep. **[check]**
