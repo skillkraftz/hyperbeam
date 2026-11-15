@@ -35,10 +35,6 @@ class Ranking(unittest.TestCase):
         self.assertEqual(d["candidates"][-1]["what"], "unit")
         self.assertTrue(any(c["kind"] == "sequence" for c in d["candidates"][:-1]))   # the sequences are bigger than the command and listed before it
 
-    def test_summary_names_the_biggest_candidate(self):
-        d = hb.lab_digest(self.runs())
-        self.assertIn("npm run often", hb.digest_summary(d))
-
     def test_the_text_shows_total_average_and_longest(self):
         text = hb.format_digest(hb.lab_digest(self.runs()))
         self.assertIn("where the time went", text)

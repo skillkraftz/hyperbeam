@@ -26,13 +26,9 @@ Marked **[gap]** = known difference between what was intended and what is built.
                 │   dots: blue = waits for you, cyan = working; PR badge in the row
                 ▼
           Merge (button): every open PR, oldest first, stops at a conflict → the project's `update` runs
-                │   all merged: same choice again (Fresh plan session / Review / Keep) = the conversation's end
                 ▼
-          Stop (one project): wrap-up check → clean: stop / not: WRAPUP.md
-          Done (whole day):  1. lab digest → maybe "propose tools" (TOOLS_PROPOSE.md)
-                             2. review due (5 merges since the last record, or since onboarding when there is none)
-                                → fresh plan-mode Claude, REVIEW.md, one cleanup PR
-                             3. wrap-up check on every project touched → stop their sessions
+          Stop (one project): wrap-up check → clean: stop / not: stop anyway or cancel
+          Done (whole day):  wrap-up check on every project touched → all clean: stop their sessions / else list what is unclean
 
  Background: minute recheck (dots, notes: drift, stale docs, review count, context size), PR poll,
  usage line (5h / week), daily tool check, layout save every 5 min (every session, the hyperbeam one too).
@@ -45,9 +41,7 @@ Marked **[gap]** = known difference between what was intended and what is built.
 | ONBOARDING.md | Open without a manifest, a service failed, or Onboard | reads the project, starts it, proposes the manifest, waits for approval |
 | ALIGN.md | right after ONBOARDING | compares the project with RULES.md, proposes changes, waits, then a PR |
 | RECOVER.md | Open finds a red problem and you say yes | diagnoses read-only, proposes, waits |
-| WRAPUP.md | Stop/Done finds uncommitted work, secrets, steno files | sorts them out before stopping |
-| TOOLS_PROPOSE.md | Done, when the lab digest has candidates | proposes up to 3 small tools, waits |
-| START.md | Open (choice) and after a finished Merge run (choice) | fresh plan-mode Claude checks for half-done work, proposes the next 1-3 items, waits |
+| START.md | Open (choice) | fresh plan-mode Claude checks for half-done work, proposes the next 1-3 items, waits |
 | REVIEW.md | Done offers it, the Project screen's Review button, or `hyperbeam review` | fresh plan-mode Claude proposes ONE cleanup PR, then does it |
 
 Every injected prompt starts in plan mode (Opus plans, Sonnet builds).

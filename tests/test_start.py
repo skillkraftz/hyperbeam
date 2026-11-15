@@ -14,7 +14,7 @@ NOT_DUE = (2, {"date": "2026-11-12", "through": "abc1234"})
 
 class Base(unittest.TestCase):
     NAMES = ("DATA_DIR", "CLAUDE_DIR", "known_path", "ensure_link", "load_layout", "start_check", "start_session", "session_exists", "reviews_due", "open_prs",
-             "review_snapshot", "review_prompt", "send_line", "swap_claude", "start_review", "start_fresh")
+             "review_snapshot", "review_prompt", "send_line", "swap_claude", "start_review")
 
     def setUp(self):
         self.addCleanup(setattr, hb, 'plans_first', hb.plans_first)
@@ -134,55 +134,6 @@ class BeginClaude(Base):
         hb.reviews_due = lambda path, name=None: None                                  # nothing due after all: a fresh session, not an error
         hb.begin_claude("proj", self.proj, "%1", "review")
         self.assertNotIn(str(rp), self.typed[1])
-
-
-class NextStep(Base):
-    """Menu.next_step: after a Merge run the same choice, so a conversation has an end."""
-
-    def setUp(self):
-        super().setUp()
-        hb.session_exists = lambda s: True
-        self.calls = []
-        hb.start_fresh = lambda n, p: (self.calls.append(("fresh", n)), (True, "a fresh Claude in plan mode"))[1]
-        hb.start_review = lambda n, p, since: (self.calls.append(("review", since)), (True, "review started"))[1]
-
-    def menu(self, answer):
-        outer = self
-
-        class Fake:
-            say = []
-            choose = lambda s, text, opts, enter=None: (outer.offers.append(([o[0] for o in opts], enter, text)), answer)[1]
-            say_from_thread = lambda s, m: s.say.append(m)
-            next_step = hb.Menu.next_step
-        return Fake()
-
-    def run_step(self, answer):
-        self.offers = []
-        m = self.menu(answer)
-        m.next_step({"name": "proj", "path": str(self.proj)}, [{"number": 7}, {"number": 8}])
-        return m
-
-    def test_fresh(self):
-        m = self.run_step("fresh")
-        self.assertEqual(self.offers[0][:2], (["fresh", "keep"], "fresh"))
-        self.assertIn("merged #7, #8", self.offers[0][2])
-        self.assertEqual(self.calls, [("fresh", "proj")])
-        self.assertIn("a fresh Claude in plan mode", m.say[0])
-
-    def test_keep_does_nothing(self):
-        m = self.run_step("keep")
-        self.assertEqual((self.calls, m.say), ([], []))
-
-    def test_review_when_due(self):
-        hb.reviews_due = lambda path, name=None: DUE
-        self.run_step("review")
-        self.assertEqual(self.offers[0][0], ["fresh", "review", "keep"])
-        self.assertEqual(self.calls, [("review", "abc1234")])
-
-    def test_not_running_asks_nothing(self):
-        hb.session_exists = lambda s: False
-        self.run_step("fresh")
-        self.assertEqual((self.offers, self.calls), ([], []))
 
 
 if __name__ == "__main__":
