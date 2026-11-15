@@ -9,8 +9,8 @@ What happens, in order, and what does it. Names in `code` are what to search for
 
 1. **You press the hotkey.** `hyperbeam` opens one kitty window split in two: the menu on the left (`Menu`, a Textual app, always running), a tmux client on the right. Pressing it again says it is already open. (`launch_sidebar`)
 2. **The `hyperbeam` session is there.** It is the first row and the "home" of the right side: window `home` (Claude in `~/projects/hyperbeam`, shells) and window `menu`. After a reboot it is rebuilt from its saved layout, panes and the programs that ran in them included; Claude continues the last conversation **[check: it does not ask yet; planned]**. (`ensure_menu`, `restore_layout`)
-3. **You double-click a project.** Open (`open_project`) does, in order: link the project's data folder as `.hyperbeam`; if the session is not running, the start check (git state, drift, a crash) and, only for something red, an offer to have Claude sort it out (RECOVER.md); then the session: tmux session `name` with window `work` (Claude left, shell right), one window per service from the manifest, started in order, each waiting for the previous one to be ready. A saved layout comes back without asking.
-4. **Claude starts.** No manifest, a failing service or Onboard: Claude starts with the onboarding prompt (ONBOARDING.md, then ALIGN.md). Otherwise Claude continues its last conversation in the folder (`--continue`, a fresh one if there is none). Nothing is asked. (`start_session`, `claude_cmd`)
+3. **You double-click a project.** Open (`open_project`) does, in order: link the project's data folder as `.hyperbeam`; if the session is not running, the start check (git state, drift, a crash: findings and notes only); then the session: tmux session `name` with window `work` (Claude left, shell right), one window per service from the manifest, started in order, each waiting for the previous one to be ready. A saved layout comes back without asking.
+4. **Claude starts.** Always plain: Claude continues its last conversation in the folder (`--continue`, a fresh one if there is none). Nothing is asked. (`start_session`, `claude_cmd`)
 5. **You work.** You and Claude talk; Claude plans (Opus), builds (Sonnet), works on a branch, runs all tests in the lab, opens a PR. The row's dot shows what Claude is doing: cyan working, blue waiting for you, green running, red only for something real. Claude's every shell command first passes the guard.
 6. **PRs appear.** After any `gh pr create|merge|close` a hook refreshes the PR list; the row turns magenta and a **Merge** button appears.
 7. **You press Merge.** All of your open PRs of that project, oldest first, one confirmation. Before each: is it behind main, did main change the same files, would it conflict? No overlap merges at once; overlap asks (Claude updates and re-tests, or merge anyway); a conflict is handed to Claude to rebase and the run stops. After the last merge the project's own `update` runs (install, restart services). For hyperbeam itself the installed copy is updated. (`_merge_all`, `_merge_one`, `pr_state`, `merge_pr`)
@@ -42,16 +42,14 @@ What happens, in order, and what does it. Names in `code` are what to search for
 ```
 Open ─ running? ──yes──> just show it
           │no
-   start check (git, drift, crash) ──red?──> offer RECOVER.md
+   start check (git, drift, crash) ──> findings and notes only
           │
    session: saved layout restored (panes, programs), services in order
           │
-   Claude: no manifest / failed service / Onboard ──> investigate prompt (ONBOARDING + ALIGN)
-           recover chosen ─────────────────────────> RECOVER prompt
-           otherwise ──> claude --continue (fresh if none)
+   Claude: always claude --continue (fresh if none); a failed service = red dot + a note
 ```
 - *Why:* the manager decides when work is done and starts workers fresh; Open only has to get back to where the user was.
-- *Can go wrong:* a service that fails still wins over continuing (the investigate prompt is more useful); a very long conversation keeps growing (the context size note warns).
+- *Can go wrong:* a service that fails does not change what Claude does, only the dot and a note; a very long conversation keeps growing (the context size note warns).
 - *Code:* `open_project`, `start_session`, `claude_cmd`, `inject_prompt`.
 
 ### 3.3 Claude's state: dots and hooks
@@ -73,9 +71,9 @@ Merge ─ confirm ─> for each open PR, oldest first:
 - *Code:* `_merge_all`, `_merge_one`, `pr_state`, `merge_pr`, `refresh-prs` and the `pr-refresh` hook.
 
 ### 3.5 Onboarding and aligning
-- *What:* a project with no manifest, or on Onboard, gets a Claude that reads it, starts it, proposes the manifest and waits for your approval; then ALIGN.md compares the project's CLAUDE.md, README and docs with RULES.md and proposes a branch and PR to bring it in line. Projects follow the system; differences are allowed only where the project's CLAUDE.md lists them as approved exceptions. Manifests are committed straight to hyperbeam's main; everything else goes through a branch and PR.
+- *What:* the manager sends ONBOARDING.md as a worker task (after your yes): it reads the project, starts it and commits the manifest; ALIGN.md, another task, compares the project's CLAUDE.md, README and docs with RULES.md and opens a PR to bring it in line. Projects follow the system; differences are allowed only where the project's CLAUDE.md lists them as approved exceptions. Manifests are committed straight to hyperbeam's main; everything else goes through a branch and PR.
 - *Why:* every project then has the same verbs (`install`, `update`, `test`, `version`, `help`, `restart`), the same rules and the same memory layout.
-- *Code:* `investigate_prompt`, `align_facts`, `fingerprint`, `take_fingerprint`, ONBOARDING.md, ALIGN.md, RULES.md, `VERBS`, `verb_command`.
+- *Code:* `align_facts`, `fingerprint`, `take_fingerprint`, ONBOARDING.md, ALIGN.md, RULES.md, `VERBS`, `verb_command`.
 
 ### 3.6 The lab
 - *What:* `hyperbeam lab run` copies the project (no secrets, no `.git`) to `/srv/hblab` and runs the command there as the user `hblab`, which cannot signal your processes. Own tmux server and display per run, ports in a reserved range, logs in `lab-runs.jsonl`. `NAME test`, `tool` and `shot` use it by themselves. Inside the lab (`HB_LAB=1`) any lab command refuses at once and says why; nothing needs changing.
