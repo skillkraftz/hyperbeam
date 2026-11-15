@@ -24,6 +24,7 @@ class InstallSh(unittest.TestCase):
         self.git(self.dev, "config", "user.name", "t")
         for f in ("install.sh", "hyperbeam", "hyperbeam.conf", "guard.py", "config.default.toml"):
             shutil.copy(HERE / f, self.dev / f)
+        shutil.copytree(HERE / "hb", self.dev / "hb", ignore=shutil.ignore_patterns("__pycache__"))
         self.git(self.dev, "add", "-A")
         self.git(self.dev, "commit", "-qm", "one")
         self.git(self.t, "clone", "-q", "--bare", str(self.dev), str(self.t / "origin.git"))
