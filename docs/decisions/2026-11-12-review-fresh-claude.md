@@ -1,8 +1,9 @@
 ---
 id: 2026-11-12-review-fresh-claude
-status: implemented
+status: superseded
 prs: [43]
 topic: workflow
+collapsed_into: [2026-11-15-cut-review-start-choice]
 ---
 # The review runs in a fresh plan-mode Claude swapped into the pane
 
