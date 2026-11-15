@@ -2,12 +2,16 @@
 """hyperbeam guard: a Claude Code PreToolUse hook for the Bash tool (installed by `hyperbeam _hooks`).
 
 Claude Code runs it before every Bash call of a Claude started inside a hyperbeam session (the hook command exits at once without $HB_PROJECT).
-It reads the tool call as JSON on stdin ({"tool_name": "Bash", "tool_input": {"command": "..."}, ...}).
-To block: print the message on stderr and exit 2 (Claude Code shows stderr to Claude and does not run the command).
-To allow: exit 0 with no output. Plain stdlib, no hyperbeam import, ~20 ms.
+It reads the tool call as JSON on stdin ({"tool_name": "Bash", "tool_input": {"command": "..."}, "cwd": "..."}).
+To block: print the message on stderr and exit 2. To allow: exit 0 with no output. Plain stdlib, no hyperbeam import.
 
-Why: agents in a hyperbeam session have $TMUX, so a bare `tmux ...` reaches the user's REAL server. Only `-L <name>` or `-S <path>` (a different
-socket) reaches another one; TMUX_TMPDIR and `env -u TMUX` do not help while $TMUX is set. One kill-server took down every session.
+How: the command line is split into simple commands (heredoc bodies dropped, quoted strings stay single words, so text that merely mentions
+`kitty` or `kill` is data and never matches; `bash -c '...'` and `$(...)` are looked into). Each command is reduced to its command word and
+arguments (leading VAR=x and wrappers like sudo/env/timeout removed) and tested against RULES. `hyperbeam lab run ...` commands are skipped:
+they run as hblab in the lab, which refuses what it must.
+
+Why tmux: agents in a hyperbeam session have $TMUX, so a bare `tmux ...` reaches the user's REAL server. Only `-L <name>` or `-S <path>`
+reaches another one. One kill-server took down every session.
 """
 import json
 import os
@@ -16,179 +20,107 @@ import shlex
 import subprocess
 import sys
 
-KILL = r"(?:kill-server|kill-session|kill-window|kill-pane|killw|killp)"
-GUI = ("kitty|xterm|gnome-terminal|alacritty|foot|wezterm|konsole|terminator|tilix|firefox|google-chrome|chromium|chrome|code|gedit|"
-       "nautilus|eog|evince|xdg-open|gio open|gnome-[a-z-]+|xdotool|wmctrl")
+CWD = ""                                                      # the tool call's working directory (set by main)
+INSTALLED = os.path.expanduser("~/.local/lib/hyperbeam")      # the app the user runs: a clone of main that install.sh keeps current
+KILLERS = {"kill", "pkill", "killall"}
+TMUX_KILL = {"kill-server", "kill-session", "kill-window", "kill-pane", "killw", "killp"}
+WRAPPERS = {"sudo", "env", "nohup", "exec", "time", "command", "xargs", "timeout", "setsid", "stdbuf", "nice", "ionice", "builtin",
+            "then", "do", "else", "!"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+GUI = {"kitty", "xterm", "gnome-terminal", "alacritty", "foot", "wezterm", "konsole", "terminator", "tilix", "firefox", "google-chrome",
+       "chrome", "chromium", "code", "gedit", "nautilus", "eog", "evince", "xdg-open", "xdotool", "wmctrl"}
+SETUP_SCRIPT = re.compile(r"(^|/)lab/(setup|remove|podman-setup)\.sh$")
+SEP = ";&|\n()`"
+base = os.path.basename
+
+
+def parse(cmd):
+    """Token lists of every simple command in a command line, including those inside `bash -c '...'` and `$(...)`/backticks."""
+    lines, drop = [], None
+    for line in cmd.split("\n"):                               # heredoc bodies are data
+        if drop:
+            drop = None if line.strip() == drop else drop
+            continue
+        lines.append(line)
+        m = re.search(r"<<-?\s*(['\"]?)(\w+)\1", line)
+        drop = m.group(2) if m else None
+    text = "\n".join(lines)
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=SEP)
+        lex.whitespace, lex.whitespace_split = " \t\r", True
+        toks = list(lex)
+    except ValueError:                                         # odd quoting: split on words
+        toks = [w for part in re.split(f"([{re.escape(SEP)}])", text) for w in ([part] if part and part in SEP else part.split())]
+    out, cur = [], []
+    for t in toks + [";"]:
+        if set(t) <= set(SEP):
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    for toks in list(out):
+        for t in toks:
+            if "$(" in t or "`" in t:                          # inside double quotes a substitution still runs
+                out += parse(re.sub(r"\$\(|\)|`", ";", t))
+        if "-c" in toks[:-1] and not any(base(t) == "hyperbeam" for t in toks) and any(base(t) in SHELLS for t in toks[:toks.index("-c")]):
+            out += parse(toks[toks.index("-c") + 1])
+    return out
+
+
+def head(toks):
+    """(wrappers skipped, command word and arguments): leading VAR=x, wrappers, their options and numbers are dropped."""
+    wrappers, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if re.fullmatch(r"\w+=.*", t):
+            pass
+        elif t in WRAPPERS or t.startswith("-") or t.isdigit():
+            wrappers.append(t)
+            i += t == "-u"                                     # env -u NAME
+        else:
+            break
+        i += 1
+    return wrappers, toks[i:]
+
+
+def unset_vars(cmds):
+    """Display variables unset somewhere in the line: `-u X`, `unset X`, `X=`."""
+    return {v for t in cmds for v in ("WAYLAND_DISPLAY", "DISPLAY")
+            if f"{v}=" in t or (v in t[1:] and (t[0] == "unset" or t[t.index(v) - 1] == "-u"))}
 
 
 def real_socket():
-    """Socket path of the server we are in ($TMUX = path,pid,session): the user's real server."""
-    t = os.environ.get("TMUX", "")
+    t = os.environ.get("TMUX", "")                              # $TMUX = path,pid,session: the user's real server
     return t.split(",")[0] if t else f"/tmp/tmux-{os.getuid()}/default"
 
 
-def tmux_calls(cmd):
-    """Each `tmux ...` invocation in the command line (up to the next ; & | or newline), as token lists (quotes stripped)."""
-    for m in re.finditer(r"(?:^|[\s;&|(`'\"])tmux((?:\s+[^;&|\n)`]*)?)", cmd):
-        yield [t.strip("'\"") for t in m.group(1).split()]
-
-
-def reaches_real_server(args):
-    """True unless the call names another socket with -L <name> / -S <path>."""
+def tmux_kills_real_server(w, argv, ctx):
+    if base(argv[0]) != "tmux" or not TMUX_KILL & set(argv):
+        return False
     real = real_socket()
-    for i, a in enumerate(args[:-1]):
-        if a == "-L" and args[i + 1] != os.path.basename(real):
+    for i, a in enumerate(argv[:-1]):                           # -L <name> / -S <path> name another server
+        if a == "-L" and argv[i + 1] != base(real):
             return False
-        if a == "-S" and os.path.realpath(args[i + 1]) != os.path.realpath(real):
+        if a == "-S" and os.path.realpath(argv[i + 1]) != os.path.realpath(real):
             return False
     return True
 
 
-def tmux_kill(cmd):
-    return any(any(re.fullmatch(KILL, a) for a in args) and reaches_real_server(args) for args in tmux_calls(cmd))
-
-
-def kill_tmux_or_kitty(cmd):
-    if re.search(r"\bpgrep\b\s+(?:-\S+\s+)*-\w*f[^\n;&]*\|\s*xargs\b[^\n;&]*\bkill", cmd):
-        return True
-    for seg in re.split(r"[;&|\n]+", cmd):
-        if re.search(r"tmux\s+-[LS]\s", seg):                       # a pattern aimed at a test server's own command line
-            continue
-        if re.search(r"\b(?:pkill|killall)\b.*\b(?:tmux|kitty)\b", seg):
-            return True
-        # a full-command-line match: a tmux server's command line is the command that created it (`hyperbeam _menu; ...`), so any pattern can hit it
-        if re.search(r"\bpkill\b\s+(?:-\S+\s+)*-\w*f", seg) or re.search(r"\bkill\b.*\$\(\s*pgrep\s+(?:-\S+\s+)*-\w*f", seg) \
-                or re.search(r"\bpgrep\b\s+(?:-\S+\s+)*-\w*f.*\|\s*xargs\s+(?:\S+\s+)*kill", seg):
-            return True
-        if re.search(r"\bkill\b.*(?:pgrep|pidof)\b.*\b(?:tmux|kitty)\b", seg):
-            return True
-        if re.match(r"\s*(?:sudo\s+)?kill\b", seg):                 # kill <pid>: look at what the pid is
-            for pid in re.findall(r"(?<![\w-])(\d+)(?!\w)", seg):
-                try:
-                    comm = open(f"/proc/{pid}/comm").read().strip()
-                except OSError:
-                    continue
-                if comm.startswith(("tmux", "kitty")):
-                    return True
-    return False
-
-
-def gui_with_display(cmd):
-    """A GUI app started while this environment points at the user's screens, unless the command unsets both variables."""
-    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+def gui_on_screens(w, argv, ctx):
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")) or {"WAYLAND_DISPLAY", "DISPLAY"} <= ctx["unset"]:
         return False
-    unset = all(re.search(rf"(?:-u\s+{v}\b|unset\b[^;&|\n]*\b{v}\b|\b{v}=(?:\s|$|;))", cmd) for v in ("WAYLAND_DISPLAY", "DISPLAY"))
-    if unset:
-        return False
-    prefix = r"(?:\w+=\S*\s+|env\s+(?:-\S+\s+)*|sudo\s+|nohup\s+|setsid\s+|exec\s+|command\s+)*"
-    return any(re.match(rf"\s*{prefix}(?:\S*/)?(?:{GUI})(?:\s|$)", seg) for seg in re.split(r"[;&|\n(]+", cmd))
-
-
-# The rules: (name, test, message shown to Claude). Anything that matches none is allowed.
-RULES = [
-    ("tmux-kill-real-server", tmux_kill,
-     "BLOCKED by hyperbeam: this tmux kill command would hit the user's REAL tmux server (you are inside it, via $TMUX): it would take down "
-     "hyperbeam and every project session. Instead: for tests use your own server, `tmux -L hb-test ...` (or `-S /tmp/<short>/sock`); "
-     "TMUX_TMPDIR does not help while $TMUX is set. Ask the user before touching real sessions."),
-    ("kill-tmux-or-kitty", kill_tmux_or_kitty,
-     "BLOCKED by hyperbeam: killing tmux or kitty processes would take down the user's real sessions and terminals (also `pkill -f PATTERN`: a "
-     "tmux server's command line is the command that created it, so any pattern can match the user's live server). Instead: stop only a test "
-     "server you started yourself (`tmux -L hb-test kill-server`), kill your own test processes by pid, or ask the user."),
-    ("gui-on-user-screens", gui_with_display,
-     "BLOCKED by hyperbeam: starting a kitty or other GUI app here would open a window on the user's screens (WAYLAND_DISPLAY or DISPLAY is set). "
-     "Instead: run headless (`env -u WAYLAND_DISPLAY -u DISPLAY ...`) or use the lab (coming soon)."),
-]
-
-
-KILLERS = {"kill", "pkill", "killall"}
-WRAPPERS = {"sudo", "env", "nohup", "exec", "time", "command", "xargs", "timeout", "setsid", "stdbuf", "nice", "ionice", "builtin"}
-SHELLS = {"bash", "sh", "zsh", "dash"}
-
-
-def split_commands(cmd):
-    """Tokens of each simple command of a command line (split at ; & | newline); None if it can't be parsed (heredoc, odd quoting)."""
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n")
-        lex.whitespace, lex.whitespace_split = " \t\r", True
-        toks = list(lex)
-    except ValueError:
-        return None
-    out, cur = [], []
-    for t in toks:
-        if set(t) <= set(";&|\n"):
-            out.append(cur)
-            cur = []
-        else:
-            cur.append(t)
-    return out + [cur]
-
-
-def is_lab_run(toks):
-    toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-    return len(toks) >= 2 and os.path.basename(toks[0]) == "hyperbeam" and (toks[1:3] == ["lab", "run"] or toks[1] in ("tool", "shot"))       # `tool` runs in the lab too
-
-
-def outside_lab(cmd):
-    """The command line without its `hyperbeam lab run ...` parts: those run as the user hblab, in the lab, and may do anything (with no
-    command substitution anywhere in the line, which would run as the user first)."""
-    cmds = split_commands(cmd)
-    if cmds is None or "$(" in cmd or "`" in cmd or "<(" in cmd:
-        return cmd
-    return "\n".join(" ".join(c) for c in cmds if c and not is_lab_run(c))
-
-
-def runs_killer(toks):
-    for i, t in enumerate(toks):
-        if t in WRAPPERS or t.startswith("-") or t.isdigit() or re.fullmatch(r"\w+=.*", t):
-            continue
-        b = os.path.basename(t)
-        if b in KILLERS:
-            return True
-        if b in SHELLS and "-c" in toks[i + 1:]:                       # bash -c 'kill 1'
-            inner = toks[toks.index("-c", i) + 1:][:1]
-            return bool(inner) and kill_anywhere(inner[0])
-        return False
-    return False
-
-
-def kill_anywhere(cmd):
-    cmds = split_commands(cmd)
-    if cmds is None:
-        return bool(re.search(r"(?<![\w-])(?:kill|pkill|killall)(?![\w-])", cmd))
-    return any(runs_killer(c) for c in cmds)
-
-
-def kill_outside_lab(cmd):
-    """Any kill, pkill or killall that does not run through `hyperbeam lab run` (hblab cannot signal the user's processes, you can)."""
-    if ("$(" in cmd or "`" in cmd or "<(" in cmd) and re.search(r"(?<![\w-])(?:kill|pkill|killall)(?![\w-])", cmd):
-        return True                     # a substitution runs as the user, even inside quotes or a lab command's arguments
-    return kill_anywhere(cmd)
-
-
-# The rules: (name, test, message shown to Claude). Anything that matches none is allowed.
-RULES = RULES + [
-    ("kill-outside-lab", kill_outside_lab,
-     "BLOCKED by hyperbeam: kill, pkill and killall are not allowed here: they run as the user and can take down live sessions (a `pkill -f` once "
-     "killed the whole tmux server). Run tests and anything that needs a kill in the lab: `hyperbeam lab run <command>` runs it as the user "
-     "hblab, which cannot signal the user's processes (`hyperbeam lab status` shows whether the lab is set up). To stop your own test, give the "
-     "lab command a `--timeout`. If the word only appears in text (a PR body, a commit message), write that text to a file with the Write tool and pass it with "
-     "`--body-file` or `-F`."),
-]
-
-
-CWD = ""         # the tool call's working directory (set by main)
-
-
-INSTALLED = os.path.expanduser("~/.local/lib/hyperbeam")      # the app the user runs: a clone of main that install.sh keeps current
+    b = base(argv[0])
+    return b in GUI or b.startswith("gnome-") or (b == "gio" and argv[1:2] == ["open"])
 
 
 def is_worktree_dir(d):
-    """A folder of a git worktree: under ~/.cache/hyperbeam-work/, or with a .git *file* (a linked worktree), anywhere up its path; or, once hyperbeam is
-    installed, any other checkout of hyperbeam itself (the dev folder ~/projects/hyperbeam): only the installed copy may run as the user."""
+    """A folder of a git worktree (under ~/.cache/hyperbeam-work/, or with a .git *file*, anywhere up its path), or, once hyperbeam is installed,
+    any other checkout of hyperbeam itself (the dev folder): only the installed copy may run as the user."""
     d = os.path.realpath(d)
     if "/hyperbeam-work/" in d + "/":
         return True
-    if os.path.isdir(INSTALLED) and d != os.path.realpath(INSTALLED) and os.path.isfile(os.path.join(d, "guard.py")) and os.path.isfile(os.path.join(d, "hyperbeam")):
+    if os.path.isdir(INSTALLED) and d != os.path.realpath(INSTALLED) and all(os.path.isfile(os.path.join(d, f)) for f in ("guard.py", "hyperbeam")):
         return True
     while d != "/":
         if os.path.isfile(os.path.join(d, ".git")):
@@ -197,157 +129,121 @@ def is_worktree_dir(d):
     return False
 
 
-def runs_worktree_script(cmd):
-    """Any token that names a `hyperbeam` script (relative to the working directory, tracking `cd`) inside a worktree."""
-    cwd = CWD or os.getcwd()
-    for line in cmd.split("\n"):
-        try:
-            toks = shlex.split(line)
-        except ValueError:
-            toks = line.split()
-        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-        if not toks:
+def worktree_script(w, argv, ctx):
+    """The command runs a `hyperbeam` script that lives in a worktree (directly, or by an interpreter like `uv run --script ./hyperbeam`).
+    A bare mention (`git add hyperbeam`) is not a run; read-only lab commands, `tool` and `shot` never touch state."""
+    if re.search(r"\blab (status|stop|log|digest)\b|\bhyperbeam (tool|shot)\b", " ".join(argv)):
+        return False
+    cand = [argv[0]]
+    if re.fullmatch(r"python[\d.]*|bash|sh", base(argv[0])):
+        cand += [t for t in argv[1:] if not t.startswith("-")][:1] if not {"-m", "-c"} & set(argv[1:3]) else []
+    elif base(argv[0]) == "uv":
+        cand += argv[1:8]
+    for t in cand:
+        if base(t) != "hyperbeam" or (t == argv[0] and "/" not in t):          # a bare `hyperbeam` is the installed one, from PATH
             continue
-        if toks[0] == "cd" and len(toks) > 1:
-            cwd = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(toks[1]))))
-            continue
-        # the script run directly, or by an interpreter / wrapper (`uv run --script ./hyperbeam`, `python3 hyperbeam`, `timeout 5 ./hyperbeam`);
-        # a bare mention (`git add hyperbeam`, `py_compile hyperbeam`) is not a run
-        if re.search(r"\blab\s+(?:status|stop|log|digest)\b", " ".join(toks)) or re.search(r"\bhyperbeam\s+(?:tool|shot)\b", " ".join(toks)):         # read-only / per-project lab commands never touch state
-            continue
-        cand = [toks[0]]
-        if re.fullmatch(r"(?:.*/)?(?:python[\d.]*|bash|sh)", toks[0]):          # the script is the first argument that isn't an option (not after -m / -c)
-            rest = [t for t in toks[1:] if not t.startswith("-")]
-            cand += rest[:1] if not {"-m", "-c"} & set(toks[1:3]) else []
-        elif re.fullmatch(r"(?:.*/)?(?:uv|env|timeout|sudo|exec|nohup|setsid)", toks[0]):
-            cand += [t for t in toks[1:8] if os.path.basename(t) == "hyperbeam"]
-        for t in cand:
-            if os.path.basename(t) != "hyperbeam":
-                continue
-            if t == toks[0] and "/" not in t:          # a bare `hyperbeam` is looked up on PATH (the installed one), not in the working directory
-                continue
-            p = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(t))))
-            if os.path.isfile(p) and is_worktree_dir(os.path.dirname(p)):
-                return True
+        p = os.path.normpath(os.path.join(ctx["cwd"], os.path.expandvars(os.path.expanduser(t))))
+        if os.path.isfile(p) and is_worktree_dir(os.path.dirname(p)):
+            return True
     return False
 
 
-RULES = RULES + [
-    ("worktree-script-outside-lab", runs_worktree_script,
+def lab_reset(w, argv, ctx):
+    return any(base(t) == "hyperbeam" and argv[i + 1:i + 3] == ["lab", "reset"] for i, t in enumerate(argv))
+
+
+def lab_setup(w, argv, ctx):
+    """Running lab/setup.sh, remove.sh or podman-setup.sh (directly or with a shell). Reading them is fine."""
+    script = [t for t in argv[1:] if not t.startswith("-")][:1] if base(argv[0]) in SHELLS else argv[:1]
+    return bool(script) and bool(SETUP_SCRIPT.search(script[0]))
+
+
+def sudo(w, argv, ctx):
+    """Any sudo except `sudo -n -l` (listing the rules)."""
+    return "sudo" in w and not (not argv and w[w.index("sudo") + 1:] in (["-n", "-l"], ["-nl"], ["-ln"]))
+
+
+def worktree_force_remove(w, argv, ctx):
+    return any(argv[i:i + 2] == ["worktree", "remove"] and any(re.fullmatch(r"--force|-[a-z]*f[a-z]*", t) for t in argv[i + 2:])
+               for i in range(len(argv)))
+
+
+def rm_dirty_worktree(w, argv, ctx):
+    """`rm -r` of a git worktree folder (or of the folder that holds worktrees) with uncommitted changes or untracked files."""
+    if base(argv[0]) != "rm" or not any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--recursive", t) for t in argv[1:]):
+        return False
+    for t in argv[1:]:
+        if t.startswith("-"):
+            continue
+        path = os.path.normpath(os.path.join(ctx["cwd"], os.path.expandvars(os.path.expanduser(t))))
+        cands = [os.path.join(path, d) for d in os.listdir(path)] if base(path) == "hyperbeam-work" and os.path.isdir(path) else [path]
+        for c in cands:
+            if os.path.isfile(os.path.join(c, ".git")):
+                r = subprocess.run(["git", "-C", c, "status", "--porcelain"], capture_output=True, text=True, timeout=10)
+                if r.stdout.strip():
+                    return True
+    return False
+
+
+# The rules: (name, test(wrappers, argv, ctx), message shown to Claude). Anything that matches none is allowed.
+RULES = [
+    ("tmux-kill-real-server", tmux_kills_real_server,
+     "BLOCKED by hyperbeam: this tmux kill command would hit the user's REAL tmux server (you are inside it, via $TMUX): it would take down "
+     "hyperbeam and every project session. Instead: for tests use your own server, `tmux -L hb-test ...` (or `-S /tmp/<short>/sock`); "
+     "TMUX_TMPDIR does not help while $TMUX is set. Ask the user before touching real sessions."),
+    ("kill-outside-lab", lambda w, argv, ctx: base(argv[0]) in KILLERS,
+     "BLOCKED by hyperbeam: kill, pkill and killall are not allowed here: they run as the user and can take down live sessions (a `pkill -f` once "
+     "killed the whole tmux server: a server's command line is the command that created it, so any pattern can match it). Run tests and anything "
+     "that needs a kill in the lab: `hyperbeam lab run <command>` runs it as the user hblab, which cannot signal the user's processes "
+     "(`hyperbeam lab status` shows whether the lab is set up). To stop your own test, give the lab command a `--timeout`. If the word only appears "
+     "in text (a PR body, a commit message), write that text to a file with the Write tool and pass it with `--body-file` or `-F`."),
+    ("gui-on-user-screens", gui_on_screens,
+     "BLOCKED by hyperbeam: starting a kitty or other GUI app here would open a window on the user's screens (WAYLAND_DISPLAY or DISPLAY is set). "
+     "Instead: run headless (`env -u WAYLAND_DISPLAY -u DISPLAY ...`) or use the lab."),
+    ("worktree-script-outside-lab", worktree_script,
      "BLOCKED by hyperbeam: a worktree's or the dev folder's `hyperbeam` script must not run as the user: it uses the user's real state, tmux and config (running one "
      "once migrated the user's live state folder). Run it in the lab: `hyperbeam lab run --dir <worktree> -- uv run --quiet --script hyperbeam ...` "
      "(the lab copies the folder and runs it as hblab with its own home, tmux and display). Only `hyperbeam lab run ...` itself is allowed from a "
      "worktree. The installed `hyperbeam` (~/.local/lib/hyperbeam, on PATH) is the one that runs as the user; or ask the user."),
-]
-
-
-def runs_lab_reset(cmd):
-    """`hyperbeam lab reset` (forced or not): it kills processes, and the lab is shared with other projects' runs. Agents use `hyperbeam lab stop`."""
-    return bool(re.search(r"hyperbeam\S*\s+lab\s+reset\b", cmd))
-
-
-def force_removes_worktree(cmd):
-    for line in cmd.split("\n"):
-        try:
-            toks = shlex.split(line)
-        except ValueError:
-            toks = line.split()
-        for i in range(len(toks) - 1):
-            if toks[i] == "worktree" and toks[i + 1] == "remove" and any(t in ("-f", "-ff", "--force") or re.fullmatch(r"-[a-z]*f[a-z]*", t) for t in toks[i + 2:]):
-                return True
-    return False
-
-
-def deletes_dirty_worktree(cmd):
-    """`rm -r` of a git worktree folder (or of the folder that holds worktrees) that has uncommitted changes or untracked files."""
-    cwd = CWD or os.getcwd()
-    for line in cmd.split("\n"):
-        try:
-            toks = shlex.split(line)
-        except ValueError:
-            toks = line.split()
-        toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-        while toks and toks[0] in ("sudo", "env", "command", "nohup", "time"):
-            toks = toks[1:]
-        if not toks or os.path.basename(toks[0]) != "rm":
-            continue
-        if not any(t.startswith("-") and not t.startswith("--") and set(t[1:]) & set("rR") or t == "--recursive" for t in toks[1:]):
-            continue
-        for t in toks[1:]:
-            if t.startswith("-"):
-                continue
-            path = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(t))))
-            cands = [path]
-            if os.path.basename(path) == "hyperbeam-work" and os.path.isdir(path):
-                cands = [os.path.join(path, d) for d in os.listdir(path)]
-            for c in cands:
-                if os.path.isfile(os.path.join(c, ".git")):
-                    r = subprocess.run(["git", "-C", c, "status", "--porcelain"], capture_output=True, text=True, timeout=10)
-                    if r.stdout.strip():
-                        return True
-    return False
-
-
-SETUP_SCRIPT = re.compile(r"(^|/)(setup|remove|podman-setup)\.sh$")
-
-
-def command_head(toks, keep_sudo=False):
-    """toks without leading VAR=x words, wrappers (sudo, env, ...) and options; keep_sudo stops at a `sudo`."""
-    toks = [t for t in toks if not re.fullmatch(r"\w+=.*", t)]
-    while toks and not (keep_sudo and toks[0] == "sudo") and (toks[0] in WRAPPERS or toks[0].startswith("-")):
-        toks = toks[1:]
-    return toks
-
-
-def runs_lab_setup(cmd):
-    """Running lab/setup.sh, remove.sh or podman-setup.sh (directly, with bash/sh, under sudo). Reading them (cat, grep) is fine."""
-    for toks in split_commands(cmd) or [cmd.split()]:
-        toks = command_head(toks)
-        if toks and os.path.basename(toks[0]) in SHELLS:
-            toks = [t for t in toks[1:] if not t.startswith("-")]
-        if toks and SETUP_SCRIPT.search(toks[0]) and "lab" in toks[0].split("/")[-2:-1]:
-            return True
-    return False
-
-
-def runs_sudo(cmd):
-    """Any sudo except `sudo -n -l` (listing the rules). Agents have no sudo: the lab already runs things as hblab."""
-    for toks in split_commands(cmd) or [cmd.split()]:
-        toks = command_head(toks, keep_sudo=True)
-        if toks and os.path.basename(toks[0]) == "sudo" and not (toks[1:3] == ["-n", "-l"] or toks[1:2] in (["-nl"], ["-ln"])):
-            return True
-    return False
-
-
-RULES = RULES + [
-    ("lab-reset", runs_lab_reset,
+    ("lab-reset", lab_reset,
      "BLOCKED by hyperbeam: `hyperbeam lab reset` (forced or not) is for the user only. The lab is shared: reset kills what other projects have running "
      "(it once killed another project's e2e suite). To stop your own runs use `hyperbeam lab stop` (it touches only this project's runs). To see what is "
      "running: `hyperbeam lab status`. If a reset is really needed, ask the user."),
-    ("lab-setup", runs_lab_setup,
+    ("lab-setup", lab_setup,
      "BLOCKED by hyperbeam: lab/setup.sh, remove.sh and podman-setup.sh are for the user only (they change /etc, the disk image, the hblab user). If the lab fails, "
      "check read-only (`hyperbeam lab status`, `id hblab`, `df /srv/hblab`, the last lines of ~/.local/share/hyperbeam/lab-runs.jsonl), report what you find and "
      "ask the user. An error message is not a reason to change the lab."),
-    ("sudo", runs_sudo,
+    ("sudo", sudo,
      "BLOCKED by hyperbeam: agents don't use sudo (only `sudo -n -l`, to list rules). Tests and tools run as hblab through `hyperbeam lab run`, `hyperbeam tool` and "
      "`hyperbeam NAME test`. If something really needs root, say what and why, and ask the user to run it."),
-    ("worktree-force-remove", force_removes_worktree,
+    ("worktree-force-remove", worktree_force_remove,
      "BLOCKED by hyperbeam: `git worktree remove --force` throws away uncommitted work (it was lost once). Commit or stash first, push the branch, then "
      "`git worktree remove <path>` without --force: git itself refuses if something is uncommitted."),
-    ("rm-dirty-worktree", deletes_dirty_worktree,
+    ("rm-dirty-worktree", rm_dirty_worktree,
      "BLOCKED by hyperbeam: that worktree has uncommitted changes or untracked files, and deleting it would lose them. Commit or stash first (and push), "
      "then remove it with `git worktree remove <path>`."),
 ]
 
 
+def violations(cmd):
+    """(name, message) of every rule the command line breaks. `hyperbeam lab run|tool|shot ...` commands are skipped (they run in the lab, which
+    refuses a lab inside the lab itself)."""
+    raw = parse(cmd)
+    ctx, found = {"cwd": CWD or os.getcwd(), "unset": unset_vars(raw)}, []
+    for w, argv in map(head, raw):
+        if not argv:
+            continue
+        if argv[0] == "cd" and len(argv) > 1:
+            ctx["cwd"] = os.path.normpath(os.path.join(ctx["cwd"], os.path.expandvars(os.path.expanduser(argv[1]))))
+        elif not (base(argv[0]) == "hyperbeam" and (argv[1:3] == ["lab", "run"] or argv[1:2] in (["tool"], ["shot"]))):
+            found += [(n, m) for n, test, m in RULES if test(w, argv, ctx)]
+    return found
+
+
 def check(cmd):
-    """The message of the first rule the command breaks, else None. `hyperbeam lab run ...` parts are not looked at. A lab command inside a lab run is not
-    the guard's business: the lab refuses it itself (`lab_ready` in hyperbeam, decision lab-refuses-nesting)."""
-    cmd = outside_lab(cmd)
-    for name, test, message in RULES:
-        if test(cmd):
-            return message
-    return None
+    """The message of the first rule the command breaks, else None."""
+    found = violations(cmd)
+    return found[0][1] if found else None
 
 
 def main():

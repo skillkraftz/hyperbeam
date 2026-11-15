@@ -86,7 +86,7 @@ Merge ─ confirm ─> for each open PR, oldest first:
 - *How:* it **searches the command text**, so a command that only mentions a blocked word is blocked too (write such text with the Write tool and pass `--body-file`). Lab nesting is no longer judged here: the lab refuses it (#53).
 - *Why:* CLAUDE.md text did not stop a `tmux kill-server`; a hook does.
 - *Can go wrong:* false blocks on text. **[check: the rules are stacked in four layers and parse commands in five ways; an audit would look at it]**
-- *Code:* `guard.py` (`RULES`, `check`, `split_commands`, `outside_lab`), installed by `hyperbeam _hooks` into `~/.claude/settings.json`.
+- *Code:* `guard.py` (`RULES`, `check`, `parse`, `head`), installed by `hyperbeam _hooks` into `~/.claude/settings.json`.
 
 ### 3.8 Where state lives
 | What | Where |
