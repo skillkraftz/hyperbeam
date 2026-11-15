@@ -26,7 +26,7 @@ What happens, in order, and what does it. Names in `code` are what to search for
 - **Fingerprint**: a snapshot of the parts of a project that define how it runs (scripts, dependency names, compose files...), taken when it was onboarded. A change later is the "setup changed" note (**drift**).
 - **Baseline**: where review counting starts for a project with no review record: its onboarding, i.e. the fingerprint's date.
 - **Snapshot**: what a fresh Claude is given instead of chat history: CLAUDE.md, the decisions index, IDEAS.md, the last review line, recent git history, what the previous session last said.
-- **Plan mode / opusplan**: Claude plans with Opus, builds with Sonnet; every prompt hyperbeam injects starts in plan mode.
+- **Sonnet by default, planning in the manager**: project Claudes run on Sonnet; the plan is made in the manager conversation (Opus). With the `opusplan` setting every prompt hyperbeam injects starts in plan mode. Workers: the manager starts, waits for and closes a Claude per project (`work`, `wait`, `close`).
 - **Previous Claude**: the conversation set aside when a fresh Claude took its place; one button (or `hyperbeam back`) resumes it.
 - **Lab**: a separate Linux user `hblab` with its own disk image, where every test and risky command runs, so nothing can touch your live sessions. **Run**: one `hyperbeam lab run`.
 - **Guard**: a hook that looks at every shell command Claude is about to run in a hyperbeam session and refuses the dangerous ones.

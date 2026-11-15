@@ -53,7 +53,8 @@
 - He is on a Claude Pro plan with 5-hour limits. Be economical: read what you need, prefer
   existing scripts and tools over long exploration, don't re-run expensive suites without a
   reason.
-- Planning happens in plan mode (opusplan: Opus plans, Sonnet implements).
+- Planning happens in the manager conversation (the first row of the sidebar, Opus); project Claudes run on Sonnet and do the work. A worker the manager starts
+  (`HB_WORKER=1`) never asks questions: it picks the simplest option, notes it in the PR, and stops with a clear message if blocked.
 - Every project provides the same verbs: `install`, `update`, `test`, `version`, `help` (and `restart` for its services), run as `hyperbeam NAME VERB`.
   hyperbeam supplies defaults from what is in the folder (pnpm/npm/uv/pip/cargo); when the default doesn't fit, add the real thing (a package.json script,
   a Makefile target, or `[commands]` in the manifest) in the same PR. A prototype that is becoming a project gets these first.

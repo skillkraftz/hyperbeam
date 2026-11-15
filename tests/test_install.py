@@ -96,13 +96,14 @@ class StartingClaude(unittest.TestCase):
 
     def test_default_is_no_permission_prompts(self):
         self.assertEqual(hb.cfg_get("claude_permissions"), "skip")
-        self.assertEqual(hb.claude_base(), "claude --model opusplan --effort medium --dangerously-skip-permissions")
+        self.assertEqual(hb.claude_base(), "claude --model sonnet --effort medium --dangerously-skip-permissions")
 
     def test_plan_mode_allows_bypass_but_does_not_turn_it_on(self):
+        self.cfg = {"claude_model": "opusplan"}
         self.assertEqual(hb.claude_base(plan=True), "claude --model opusplan --effort medium --permission-mode plan --allow-dangerously-skip-permissions")
 
     def test_ask_turns_the_flags_off(self):
-        self.cfg = {"claude_permissions": "ask"}
+        self.cfg = {"claude_permissions": "ask", "claude_model": "opusplan"}
         self.assertEqual(hb.claude_base(), "claude --model opusplan --effort medium")
         self.assertEqual(hb.claude_base(plan=True), "claude --model opusplan --effort medium --permission-mode plan")
 
@@ -110,12 +111,23 @@ class StartingClaude(unittest.TestCase):
         self.cfg = {"claude_permissions": "bogus"}
         self.assertEqual(hb.cfg_get("claude_permissions"), "skip")
 
+    def test_sonnet_is_the_default_and_never_starts_in_plan_mode(self):
+        self.assertEqual(hb.cfg_get("claude_model"), "sonnet")
+        self.assertEqual(hb.claude_base(plan=True), "claude --model sonnet --effort medium --dangerously-skip-permissions")
+        self.assertEqual(hb.inject_prompt("%1", "/x/P.md"), "started")
+        self.assertNotIn("plan", self.typed[0])
+        hb.pane_command = lambda pane: "claude"
+        self.assertEqual(hb.inject_prompt("%1", "/x/P.md"), "injected")
+        self.assertEqual(self.typed[-1], "Read /x/P.md and follow it.")
+
     def test_injecting_into_a_shell_pane_starts_claude_in_plan_mode(self):
+        self.cfg = {"claude_model": "opusplan"}
         self.assertEqual(hb.inject_prompt("%1", "/x/P.md"), "started")
         self.assertIn("--permission-mode plan --allow-dangerously-skip-permissions --continue", self.typed[0])
         self.assertIn('"$(cat /x/P.md)"', self.typed[0])
 
     def test_injecting_into_a_running_claude_uses_plan_command(self):
+        self.cfg = {"claude_model": "opusplan"}
         hb.pane_command = lambda pane: "claude"
         self.assertEqual(hb.inject_prompt("%1", "/x/P.md"), "injected")
         self.assertEqual(self.typed, ["/plan Read /x/P.md and follow it."])

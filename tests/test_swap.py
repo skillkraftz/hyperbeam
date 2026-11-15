@@ -17,6 +17,8 @@ class Fakes(unittest.TestCase):
     """A project with a running Claude pane, tmux replaced by a recorder."""
 
     def setUp(self):
+        self.addCleanup(setattr, hb, 'plans_first', hb.plans_first)
+        hb.plans_first = lambda: True            # these tests are about the opusplan model
         self.tmp = Path(tempfile.mkdtemp())
         self.saved = {k: getattr(hb, k) for k in ("DATA_DIR", "known_path", "find_claude_pane", "session_exists", "claude_state", "claude_session_file", "tmux", "send_line",
                                                   "report_text", "context_bundle", "session_project", "review_facts")}
@@ -147,6 +149,14 @@ class PlanFirst(Fakes):
 
 
 class GuardRule(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, guard, "configured_model", guard.configured_model)
+        guard.configured_model = lambda: "opusplan"
+
+    def test_only_opusplan_needs_plan_mode(self):
+        guard.configured_model = lambda: "sonnet"
+        self.assertFalse(self.blocked("default", "hyperbeam review --print"))
+
     def blocked(self, mode, cmd):
         guard.PERMISSION_MODE = mode
         return guard.reviews_outside_plan(cmd)

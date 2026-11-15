@@ -21,7 +21,7 @@ Marked **[gap]** = known difference between what was intended and what is built.
                 ▼
           Claude starts: earlier conversation? ask: Fresh plan session (START.md) / Review (if due) / Continue
                 ▼
-          WORK: you + Claude (opusplan) on a branch → PR
+          WORK: you + Claude (sonnet) on a branch → PR
                 │   lab runs every test, guard blocks dangerous commands
                 │   dots: blue = waits for you, cyan = working; PR badge in the row
                 ▼

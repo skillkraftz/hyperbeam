@@ -17,6 +17,8 @@ class Base(unittest.TestCase):
              "review_snapshot", "review_prompt", "send_line", "swap_claude", "start_review", "start_fresh")
 
     def setUp(self):
+        self.addCleanup(setattr, hb, 'plans_first', hb.plans_first)
+        hb.plans_first = lambda: True            # these tests are about the opusplan model
         self.saved = {k: getattr(hb, k) for k in self.NAMES}
         self.tmp = Path(tempfile.mkdtemp())
         hb.DATA_DIR = self.tmp / "data"
