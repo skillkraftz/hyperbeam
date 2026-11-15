@@ -82,18 +82,18 @@ MANAGER_DIR = Path(os.environ.get("HB_MANAGER", Path.home() / "manager"))       
 KEYS = [("M-Left/Right/Up/Down", "select pane"), ("M-z", "zoom / unzoom the pane"),
         ("M-h", "back to the hyperbeam session (menu), from anywhere"), ("M-]", "next session in the stack"), ("M-[", "previous session in the stack"),
         ("M-y", "copy the Claude conversation / the pane's whole scrollback (clipboard; outbox over SSH)"),
-        ("M-s", "hide / show the sidebar (desktop sidebar window)"), ("Shift+Tab", "Claude plan mode (cycles Claude Code's permission modes; with opusplan Opus plans, Sonnet implements)")]
+        ("M-s", "hide / show the sidebar (desktop sidebar window)"), ("Shift+Tab", "Claude plan mode (cycles Claude Code's permission modes)")]
 USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select pane"), ("C-a H J K L", "resize pane"),
              ("M-n / M-p", "next / previous window"), ("C-a w", "window tree"), ("C-a [", "copy mode (v select, y copy)"),
              ("M-`", "mouse on/off"), ("C-a r", "reload tmux.conf")]
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "opusplan", "manager_model": "opus", "claude_effort": "medium", "claude_permissions": "skip", "review_after": 5, "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
-CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["opusplan", "sonnet", "opus", "haiku", "fable"], "manager_model": ["opus", "fable", "sonnet", "opusplan", "haiku"],
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "manager_model": "opus", "claude_effort": "medium", "claude_permissions": "skip", "review_after": 5, "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
+CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["sonnet", "opusplan", "opus", "haiku", "fable"], "manager_model": ["opus", "fable", "sonnet", "opusplan", "haiku"],
            "claude_effort": ["low", "medium", "high", "xhigh", "max"], "claude_permissions": ["skip", "ask"], "review_after": [3, 5, 8, 10], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
-                "claude_model": "model for every Claude hyperbeam starts (claude --model): opusplan (Opus plans in plan mode, Sonnet does the work), sonnet, opus, haiku, fable",
+                "claude_model": "model for every Claude hyperbeam starts (claude --model): sonnet (the default: planning happens in the manager conversation), opusplan (Opus plans in plan mode, Sonnet does the work; injected prompts then start in plan mode), opus, haiku, fable",
                 "manager_model": "model for the manager (the first row: a conversation with Claude about all your projects, never in plan mode, never writes code in a project)",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
                 "claude_permissions": '"skip": every Claude hyperbeam starts runs without permission prompts (claude --dangerously-skip-permissions; the guard hook still blocks the dangerous commands). "ask": Claude asks as usual.',
@@ -372,6 +372,7 @@ def build_projects():
         r["manifest"] = m is not None
         r["port"] = m.get("port") if m else None
         r["running"] = sanitize(r["name"]) in run_set
+        r["worker"] = worker_sess(r["name"]) in run_set
         r["opened"] = opened.get(r["name"], 0)
     rows.append(dict(name=MENU, path=MANAGER_DIR, git=True, remote="", owner="manager", dirty=False, manifest=False, port=None,
                      running=MENU in run_set, opened=opened.get(MENU, 0)))      # the manager: the first row, not a project in ~/projects
@@ -497,15 +498,20 @@ def pane_tail(target, n=50):
     return "\n".join(out[-n:])
 
 
+def plans_first():
+    """Injected prompts start in plan mode only when the configured model is opusplan (Opus runs only in plan mode there)."""
+    return cfg_get("claude_model") == "opusplan"
+
+
 PLAN_FIRST = ("**Plan mode first.** If plan mode is not active, call EnterPlanMode before anything else: this step is planned by Opus, and nothing is changed "
               "until the user approves your plan.\n\n")
 
 
-def write_prompt(sess, text):
+def write_prompt(sess, text, plan=True):
     d = project_dir(session_project(sess)) / "prompts"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{sess}-{time.strftime('%Y%m%d-%H%M%S')}.md"
-    f.write_text(PLAN_FIRST + text)
+    f.write_text((PLAN_FIRST if plan and plans_first() else "") + text)
     f.chmod(0o600)
     return f
 
@@ -567,8 +573,10 @@ def start_wrapup(sess, results):
 
 
 def claude_base(plan=False):
-    """Every Claude hyperbeam starts uses the configured model, effort and permissions. plan: it starts in plan mode (injected prompts); with
-    permissions "skip" bypass is then only allowed, so approving the plan can switch to it (both flags together would leave the mode unclear)."""
+    """Every Claude hyperbeam starts uses the configured model, effort and permissions. plan: it starts in plan mode (injected prompts), but only with the
+    opusplan model (plans_first); with permissions "skip" bypass is then only allowed, so approving the plan can switch to it (both flags together would
+    leave the mode unclear)."""
+    plan = plan and plans_first()
     skip = cfg_get("claude_permissions") == "skip"
     mode = (" --permission-mode plan" + (" --allow-dangerously-skip-permissions" if skip else "")) if plan else (" --dangerously-skip-permissions" if skip else "")
     return f"claude --model {cfg_get('claude_model')} --effort {cfg_get('claude_effort')}{mode}"
@@ -614,11 +622,11 @@ def pane_command(pane):
 
 
 def inject_prompt(pane, f, add_dirs=()):
-    """The one way a prompt file reaches Claude (recover, wrap-up, onboarding). Always in plan mode, so with opusplan Opus makes the proposal and
-    Sonnet only builds after the user approves. Claude already running in the pane: `/plan` plus one line pointing at the file, then Enter.
+    """The one way a prompt file reaches Claude (recover, wrap-up, onboarding). In plan mode when the model is opusplan (plans_first), so Opus makes
+    the proposal and Sonnet only builds after the user approves; with any other model it starts normally. Claude already running in the pane: `/plan` plus one line pointing at the file, then Enter.
     Otherwise start `claude --permission-mode plan --continue` with the prompt, falling back to a fresh `claude` if there is no conversation."""
     if pane_command(pane) == "claude":
-        send_line(pane, f"/plan Read {f} and follow it.")
+        send_line(pane, f"{'/plan ' if plans_first() else ''}Read {f} and follow it.")
         return "injected"
     start_claude_with_prompt(pane, f, add_dirs)
     return "started"
@@ -967,7 +975,7 @@ def previous_claude(name):
 
 
 def swap_claude(name, path, prompt_file, why, add_dirs=()):
-    """Replace the project's Claude with a fresh one in plan mode (opusplan: Opus proposes, Sonnet builds after approval) that starts from `prompt_file`.
+    """Replace the project's Claude with a fresh one (in plan mode with opusplan: Opus proposes, Sonnet builds after approval) that starts from `prompt_file`.
     The conversation it replaces is remembered (`previous-claude`) so `back_claude` can resume it. Refuses while Claude is working (it would be killed).
     -> (started, message)."""
     sess = sanitize(name)
@@ -986,7 +994,7 @@ def swap_claude(name, path, prompt_file, why, add_dirs=()):
     start_claude_with_prompt(pane, prompt_file, add_dirs, cont=False)
     tmux("select-window", "-t", pane, check=False)
     tmux("select-pane", "-t", pane, check=False)
-    return True, "a fresh Claude in plan mode" + (" (the previous conversation is kept: Previous Claude brings it back)" if sf else "")
+    return True, ("a fresh Claude in plan mode" if plans_first() else "a fresh Claude") + (" (the previous conversation is kept: Previous Claude brings it back)" if sf else "")
 
 
 def back_claude(name):
@@ -1045,7 +1053,7 @@ def cmd_audit(a):
         sys.exit("hyperbeam audit: no project (run it in a project session, or give a name)")
     path = known_path(name)
     if a.print:
-        print(PLAN_FIRST + audit_text(name, path))
+        print((PLAN_FIRST if plans_first() else "") + audit_text(name, path))
         return 0
     ok, msg = start_audit(name, path)
     print(f"{name}: {msg}")
@@ -1065,11 +1073,182 @@ def cmd_review(a):
     if not since:
         sys.exit(f"hyperbeam review: {name} has no review record (docs/reviews/) and was never onboarded: say where to start, e.g. --since <the merge commit before the first PR to review>")
     if a.print:
-        print(PLAN_FIRST + review_text(name, path, since))
+        print((PLAN_FIRST if plans_first() else "") + review_text(name, path, since))
         return 0
     ok, msg = start_review(name, path, since)
     print(f"{name}: {msg}")
     return 0 if ok else 1
+
+
+# ---------- workers: Claude sessions the manager starts for a project (`hyperbeam work|wait|close`) ----------
+def worker_sess(name):
+    """The tmux session of a project's worker: claude-NAME. Not a project, never listed as one."""
+    return f"claude-{sanitize(name)}"
+
+
+def worker_dir(name):
+    """The worker's own state folder (the hooks' `claude` state file, started.json): apart from the project's, so a worker never changes the user's dot."""
+    d = project_dir(name) / "worker"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def reports_dir(name):
+    return project_dir(name) / "reports"
+
+
+def worker_prompt_text(prompt_file, findings):
+    """What the worker's Claude starts from: the start-check problems (if any), WORKER.md, then the manager's prompt."""
+    top = ("The start check found problems in this project. Look at them first, and say in your final message what you did about them:\n"
+           + "\n".join(f"- {f}" for f in findings) + "\n\n---\n\n") if findings else ""
+    return top + (HERE / "WORKER.md").read_text().rstrip() + "\n\n---\n\n" + Path(prompt_file).read_text()
+
+
+def worker_state(name):
+    """('working'|'finished'|'blocked'|'ended'|'none', detail, started.json) from the worker's hook state file and its session."""
+    try:
+        rec = json.loads((project_dir(name) / "worker" / "started.json").read_text())
+    except (OSError, ValueError):
+        return "none", "", {}
+    try:
+        txt = (project_dir(name) / "worker" / "claude").read_text().strip()
+    except OSError:
+        txt = ""
+    if txt.startswith("waiting finished responding"):
+        return "finished", "", rec
+    if txt.startswith("waiting"):
+        return "blocked", txt[len("waiting"):].strip(), rec
+    if not session_exists(worker_sess(name)):
+        return "ended", "its session is gone", rec
+    return "working", "", rec
+
+
+def newest_report(name, since=0):
+    try:
+        fs = [f for f in reports_dir(name).glob("*.md") if f.stat().st_mtime >= since]
+        return max(fs, key=lambda f: f.stat().st_mtime, default=None)
+    except OSError:
+        return None
+
+
+def cmd_work(a):
+    """hyperbeam work NAME PROMPT_FILE: make sure the user's session NAME runs, then start the worker `claude-NAME`: a fresh Claude (no plan mode) in the project's
+    folder, with WORKER.md and the prompt. Asks nothing: start-check problems go to the top of the worker's prompt. One worker per project."""
+    name = a.name
+    if not project_exists(name) or sanitize(name) == MENU:
+        sys.exit(f"hyperbeam work: no project called {name} (try `hyperbeam scan`)")
+    pf = Path(a.prompt_file).expanduser()
+    if not pf.is_file():
+        sys.exit(f"hyperbeam work: {pf} is not a file")
+    sess, wsess = sanitize(name), worker_sess(name)
+    if session_exists(wsess):
+        sys.exit(f"hyperbeam work: {name} already has a worker ({wsess}): one worker per project, because it edits the folder the services run from. "
+                 f"`hyperbeam wait {name}` waits for it, `hyperbeam close {name}` ends it.")
+    man = load_manifests().get(name)
+    path = manifest_path(man) if man else known_path(name)
+    if not path.is_dir():
+        sys.exit(f"hyperbeam work: {path} does not exist")
+    findings, notes = start_check(name, path)
+    if not session_exists(sess):
+        start_session(name, man, print, path=path, restore=load_layout(name), findings=findings, recover=False, notes=notes)
+        touch_opened(name)
+    wd = worker_dir(name)
+    (wd / "claude").write_text("working\n")             # a stale state of an earlier worker must not look like "finished"
+    task = next((l.lstrip("# ").strip() for l in pf.read_text().splitlines() if l.strip()), "worker task")
+    (wd / "started.json").write_text(json.dumps({"time": time.time(), "head": git_out(path, "rev-parse", "HEAD"), "task": task, "prompt": str(pf), "path": str(path)}))
+    prompt = write_prompt(sess, worker_prompt_text(pf, findings), plan=False)
+    envargs = project_envargs(name, man, path, {"HB_WORKER": "1", "HB_STATE": str(wd), "HB_REPORTS": str(reports_dir(name))})
+    pane = new_pane(["new-session", "-d", "-s", wsess, "-n", "claude", "-x", "200", "-y", "50", "-c", str(path), *envargs])
+    tmux("set-option", "-t", f"={wsess}", "detach-on-destroy", "off", check=False)
+    send_line(pane, f'{claude_base()} "$(cat {shlex.quote(str(prompt))})"')
+    print(f"{name}: worker started in the tmux session {wsess} ({len(findings)} start-check problems added to its prompt)."
+          f" `hyperbeam wait {name}` waits for it; the report goes to {reports_dir(name)}/")
+    return 0
+
+
+def cmd_wait(a):
+    """hyperbeam wait NAME [NAME...] [--timeout S]: block until each worker's Claude has finished (the Stop hook's state), then print each report's path.
+    Exit 0 all finished, 1 timeout, 2 a worker is blocked (waiting for input) or its session ended."""
+    deadline = time.time() + a.timeout if a.timeout else None
+    pending, code, seen = list(dict.fromkeys(a.names)), 0, {}
+    for n in pending:
+        if worker_state(n)[0] == "none":
+            sys.exit(f"hyperbeam wait: {n} has no worker")
+    while pending:
+        for n in list(pending):
+            st, detail, rec = worker_state(n)
+            rep = newest_report(n, rec.get("time", 0)) if st in ("finished", "ended", "blocked") else None
+            if st == "working" or (st == "finished" and not rep and time.time() - seen.setdefault(n, time.time()) < 30):
+                continue                                    # the report is written just after the state: give it a moment
+            pending.remove(n)
+            if st in ("blocked", "ended"):
+                code = max(code, 2)
+            print(f"{n}: {rep or '(no report: worker ' + st + (': ' + detail if detail else '') + ')'}", flush=True)
+        if pending:
+            if deadline and time.time() > deadline:
+                print(f"hyperbeam wait: timeout; still working: {', '.join(pending)}", file=sys.stderr)
+                return 1
+            time.sleep(2)
+    return code
+
+
+def cmd_close(a):
+    """hyperbeam close NAME: end the worker session claude-NAME. Never the user's session NAME."""
+    wsess = worker_sess(a.name)
+    if not session_exists(wsess):
+        sys.exit(f"hyperbeam close: {a.name} has no worker")
+    if tmux("show-environment", "-t", f"={wsess}", "HB_WORKER", check=False).stdout.strip() != "HB_WORKER=1":
+        sys.exit(f"hyperbeam close: the session {wsess} is not a worker (no HB_WORKER); not touching it")
+    tmux("kill-session", "-t", f"={wsess}", check=False)
+    shutil.rmtree(project_dir(a.name) / "worker", ignore_errors=True)
+    print(f"{a.name}: worker closed (reports stay in {reports_dir(a.name)}/)")
+    return 0
+
+
+def cmd_status(_):
+    """hyperbeam status: which project sessions run, and each worker's state."""
+    run_set = running_sessions()
+    for r in scan():
+        n = r["name"]
+        w = worker_state(n)[0] if worker_sess(n) in run_set else ""
+        if sanitize(n) in run_set or w:
+            print(f"{n}: session running" + (f"; worker {w}" if w else ""))
+    return 0
+
+
+def cmd_worker_report(_):
+    """The Stop hook of a worker (HB_WORKER=1): <HB_REPORTS>/<date-time>-<slug>.md with the task, Claude's final message, branch, commits since the worker
+    started, the PR URL and the transcript path. Reads the hook input (JSON) on stdin."""
+    try:
+        hook = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        hook = {}
+    d = os.environ.get("HB_REPORTS")
+    if not d:
+        return 0
+    try:
+        rec = json.loads((Path(os.environ.get("HB_STATE", "")) / "started.json").read_text())
+    except (OSError, ValueError):
+        rec = {}
+    path = rec.get("path") or hook.get("cwd") or os.getcwd()
+    tp = hook.get("transcript_path") or ""
+    msg = ""
+    try:
+        msg = last_assistant_message(tp) if tp else ""
+    except OSError:
+        pass
+    msg = msg or hook.get("last_assistant_message") or "(no final message found)"
+    branch = git_out(path, "rev-parse", "--abbrev-ref", "HEAD") or "-"
+    commits = git_out(path, "log", "--oneline", "-n", "30", f"{rec['head']}..HEAD") if rec.get("head") else ""
+    pr = next(iter(re.findall(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", msg)), "none")
+    task = rec.get("task") or "worker task"
+    slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:40] or "report"
+    Path(d).mkdir(parents=True, exist_ok=True)
+    f = Path(d) / f"{time.strftime('%Y-%m-%d-%H%M')}-{slug}.md"
+    f.write_text(f"# {task}\n\n- project: {os.environ.get('HB_PROJECT', '-')}\n- finished: {time.strftime('%Y-%m-%d %H:%M')}\n- branch: {branch}\n- PR: {pr}\n"
+                 f"- transcript (the long form): {tp or '-'}\n\n## Claude's final message\n\n{msg.strip()}\n\n## Commits since the worker started\n\n"
+                 + (commits or "none") + "\n")
+    return 0
 
 
 def cmd_back(a):
@@ -1394,8 +1573,10 @@ HOOK_CMDS = [
 GUARD_MATCHER = "Bash"
 
 
-def hook_command(state):
-    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ] && echo "{state}" > "$HB_STATE/claude"; exit 0'
+def hook_command(state, stop=False):
+    """Writes the state the menu and `wait` read. At Stop in a worker session (HB_WORKER=1) the report is written too (`_worker-report`, reads the hook input)."""
+    report = f' && {{ [ -z "$HB_WORKER" ] || {SELF} _worker-report; }}' if stop else ""
+    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ] && echo "{state}" > "$HB_STATE/claude"{report}; exit 0'
 
 
 def guard_command():
@@ -1419,12 +1600,12 @@ def install_hooks(settings=None):
     if f.exists() and not bak.exists():
         bak.write_text(f.read_text())
     hooks = data.setdefault("hooks", {})
-    want = [(e, m, hook_command(st)) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
+    want = [(e, m, hook_command(st, stop=e == "Stop")) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
     kind = lambda c: "guard" if "hyperbeam-guard" in c else "prs" if "hyperbeam-prs" in c else "state"
     claimed = set()
     for event, matcher, cmd in want:
         groups = hooks.setdefault(event, [])
-        entry = {"type": "command", "command": cmd, "timeout": 5}
+        entry = {"type": "command", "command": cmd, "timeout": 20 if event == "Stop" else 5}
         for gi, g in enumerate(groups):
             hit = [i for i, h in enumerate(g.get("hooks", [])) if (event, gi, i) not in claimed and any(m in h.get("command", "") for m in HOOK_MARKS)
                    and kind(h["command"]) == kind(cmd)]
@@ -1442,10 +1623,11 @@ def install_hooks(settings=None):
         for gi, g in enumerate(groups):
             g["hooks"] = [h for i, h in enumerate(g.get("hooks", [])) if (event, gi, i) in claimed or not any(m in h.get("command", "") for m in HOOK_MARKS)]
         hooks[event] = [g for g in groups if g.get("hooks")]
-    # Claude's default model: opusplan (Opus plans, Sonnet builds), set once; the marker keeps a later manual choice (/model, settings) from being reset by every update
-    marker = DATA_DIR / "claude-model-set"
+    # Claude's default model moved from opusplan to sonnet, once: only an opusplan is changed; the marker keeps a later manual choice (/model, settings) from being reset by every update
+    marker = DATA_DIR / "claude-model-sonnet"
     if not marker.exists():
-        data["model"] = "opusplan"
+        if data.get("model") == "opusplan":
+            data["model"] = "sonnet"
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(time.strftime("%Y-%m-%d") + "\n")
@@ -2002,6 +2184,21 @@ def restart_programs(lay, plan):
             send_line(pid, pane["prog"])
 
 
+def project_envargs(name, man, path, extra=None):
+    """`-e K=V` tmux arguments for a project's session: session_env, HB_STATE (the project's state folder) and PATH (the shims: `NAME VERB`, `hb VERB`), then `extra`."""
+    env = session_env(man, name)
+    ensure_link(name, path)
+    env["HB_STATE"] = str(project_dir(name, path))
+    try:
+        install_shims()
+        env["PATH"] = session_path()
+    except OSError:
+        pass
+    env.update(extra or {})
+    clean_server_env()
+    return [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
+
+
 def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=(), begin=None):
     """Create the project's session: the default layout, or `restore` (a saved layout).
     Default: window `work` (Claude left, a shell right), then one window per service. Services start in manifest order, each after the
@@ -2014,16 +2211,7 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
     path = manifest_path(man) if man else Path(path)
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
-    env = session_env(man, name)
-    ensure_link(name, path)
-    env["HB_STATE"] = str(project_dir(name, path))
-    try:
-        install_shims()
-        env["PATH"] = session_path()          # `NAME VERB` and `hb VERB` inside the session
-    except OSError:
-        pass
-    clean_server_env()
-    envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
+    envargs = project_envargs(name, man, path)
     plan = None
     if restore:
         try:
@@ -2856,8 +3044,9 @@ def verify_checks(which="all"):
             add("FAIL", f"{home_rel(sf)} is missing or unreadable", "hyperbeam _hooks")
         else:
             add("PASS" if "hyperbeam-guard" in json.dumps(d) else "FAIL", "Claude hooks (guard and the dot states) are installed", "" if "hyperbeam-guard" in json.dumps(d) else "hyperbeam _hooks")
-            add("PASS" if d.get("model") == "opusplan" else "YOU", f"Claude's default model is {d.get('model') or 'unset'}" + ("" if d.get("model") == "opusplan" else " (opusplan = Opus plans, Sonnet builds)"),
-                "" if d.get("model") == "opusplan" else "claude --model opusplan   (or /model opusplan inside Claude)")
+            want = cfg_get("claude_model")
+            add("PASS" if d.get("model") == want else "YOU", f"Claude's default model is {d.get('model') or 'unset'}" + ("" if d.get("model") == want else f" (hyperbeam's setting is {want})"),
+                "" if d.get("model") == want else f"claude --model {want}   (or /model {want} inside Claude)")
     if which in ("all", "lab"):
         msg = lab_ready()
         if msg:
@@ -3008,6 +3197,8 @@ def cmd_shot_render(a):
             pdata = data / "hyperbeam" / "projects" / f"{name}-{hashlib.sha1(str((root / name).resolve()).encode()).hexdigest()[:6]}"
             pdata.mkdir(parents=True, exist_ok=True)
             (pdata / "prs.json").write_text(json.dumps({"time": time.time(), "prs": [{"number": int(pr[0]), "title": pr[1], "url": "https://github.com/x/y/pull/" + pr[0], "branch": "feature"}], "error": ""}))
+    (base / "task.md").write_text("# Add the week view\n")
+    subprocess.run([*uvrun, "work", "dotwork", str(base / "task.md")], env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=120)       # a running worker: the » mark
     (data / "hyperbeam").mkdir(parents=True, exist_ok=True)
     (data / "hyperbeam" / "rate-limits.json").write_text(json.dumps({"at": time.time(), "five_hour": {"used_percentage": 83, "resets_at": time.time() + 3 * 3600 + 120},
                                                                       "seven_day": {"used_percentage": 41, "resets_at": time.time() + 3 * 86400}}))
@@ -5292,7 +5483,8 @@ def row_text(p, st, width, note=""):
     avail = max(4, width - 2 - len(right) - (1 if show_branch else 0))           # the dot, the port, the space before the branch
     name, branch = fit_row(p["name"], branch if show_branch else "", avail)
     t = Text(no_wrap=True, overflow="crop")
-    t.append("● " if st else "  ", style=DOT.get(st[0], "") if st else "")
+    t.append("●" if st else " ", style=DOT.get(st[0], "") if st else "")
+    t.append("»" if p.get("worker") else " ", style="bold yellow")           # a worker the manager started runs for this project
     t.append(name.ljust(avail - len(branch)), style="bold white" if p["recent"] else "grey54")
     if branch:
         t.append(" " + branch, style="#ff79c6" if p.get("prs") else "yellow")           # a light pink stays readable on the blue selected row
@@ -5605,8 +5797,9 @@ class Menu(App):
         changed = False
         for p in self.projects:
             now = sanitize(p["name"]) in run_set
-            changed |= now != p["running"]
-            p["running"] = now
+            w = worker_sess(p["name"]) in run_set
+            changed |= now != p["running"] or w != p.get("worker", False)
+            p["running"], p["worker"] = now, w
         if changed:
             self.poll_status()
 
@@ -6529,6 +6722,19 @@ def main():
     au.add_argument("project", nargs="?")
     au.add_argument("--print", action="store_true")
     au.set_defaults(f=cmd_audit)
+    wk = sub.add_parser("work", help="the manager's: start a worker (a fresh Claude, session claude-NAME) in a project with WORKER.md + the prompt file; one per project")
+    wk.add_argument("name")
+    wk.add_argument("prompt_file")
+    wk.set_defaults(f=cmd_work)
+    wt = sub.add_parser("wait", help="the manager's: block until the named workers have finished, then print each one's report path (exit 1 on timeout, 2 if one is blocked)")
+    wt.add_argument("names", nargs="+")
+    wt.add_argument("--timeout", type=int, default=0, help="seconds (default: no limit)")
+    wt.set_defaults(f=cmd_wait)
+    cl = sub.add_parser("close", help="the manager's: end a project's worker session (claude-NAME); never the user's session")
+    cl.add_argument("name")
+    cl.set_defaults(f=cmd_close)
+    sub.add_parser("status", help="running sessions and the state of their workers").set_defaults(f=cmd_status)
+    sub.add_parser("_worker-report").set_defaults(f=cmd_worker_report)
     bk = sub.add_parser("back", help="resume the conversation a review set aside (the review's Claude ends); default project $HB_PROJECT")
     bk.add_argument("project", nargs="?")
     bk.set_defaults(f=cmd_back)

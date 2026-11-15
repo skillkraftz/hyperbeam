@@ -20,6 +20,7 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - Swap a fresh plan-mode Claude (with a snapshot and Previous Claude) for the other propose-then-wait steps too (Onboard, Fix, wrap-up, tools): today they inject `/plan` into the running Claude, which keeps its history but depends on the session being idle.
 
 ## Done
+- ~~Sonnet as the default model; manager workers (`work`, `wait`, `close`, reports)~~ Done (PR #57, decision sonnet-default-and-manager-workers).
 - ~~Lab refuses nesting itself, the guard stops guessing; `hyperbeam shot --dir`~~ Done (PR #53, decision lab-refuses-nesting, which collapses lab-setup-is-the-users).
 - ~~Work loop step 1: a fresh plan session (START.md) / review / continue when Claude starts, and after a finished Merge run~~ Done (PR #52, decision work-loop-start-and-end).
 - ~~Every project in the review loop (count from onboarding), a Review button in the Project screen~~ Done (PR #51, decision review-every-project).

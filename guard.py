@@ -242,10 +242,21 @@ RULES = RULES + [
 ]
 
 
+def configured_model():
+    """hyperbeam's claude_model setting (sonnet unless config.toml says otherwise): plan mode matters only with opusplan."""
+    try:
+        import tomllib
+        f = os.environ.get("HB_CONFIG") or os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "hyperbeam", "config.toml")
+        with open(f, "rb") as fh:
+            return str(tomllib.load(fh).get("claude_model", "sonnet"))
+    except Exception:
+        return "sonnet"
+
+
 def reviews_outside_plan(cmd):
     """`hyperbeam review ... --print` in a session that is not in plan mode: the review is planned by Opus, which with opusplan only runs in plan mode.
     Not applied when Claude doesn't report its permission mode."""
-    if not PERMISSION_MODE or PERMISSION_MODE == "plan":
+    if not PERMISSION_MODE or PERMISSION_MODE == "plan" or configured_model() != "opusplan":
         return False
     return bool(re.search(r"\bhyperbeam\s+review\b", cmd) and re.search(r"(?:^|\s)--print\b", cmd))
 

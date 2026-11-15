@@ -1,7 +1,8 @@
 ---
 id: 2026-11-12-injected-prompts-start-in-plan-mode
-status: implemented
+status: superseded
 prs: [31]
+collapsed_into: 2026-11-15-sonnet-default-and-manager-workers
 topic: claude
 ---
 # Injected prompts start in plan mode

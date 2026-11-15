@@ -7,7 +7,8 @@ Hotkey -> a sidebar (a Textual menu) of every project in ~/projects -> one tmux 
 Works locally; the phone (SSH from Termux over Tailscale) attaches to the same sessions and gets its own round later.
 
 ## Decisions (the short list; docs/decisions/ has the why, one file per decision; docs/DECISIONS.md is the generated index)
-- Claude Code is the default agent, on `opusplan` (Opus plans, Sonnet builds, one session per project).
+- Claude Code is the default agent, on `sonnet`, one session per project. Planning happens in the manager conversation (the first row); `opusplan` stays a choice in Settings (injected prompts then start in plan mode).
+- **Workers:** the manager, after the user said yes in the conversation, starts a worker in a project (`hyperbeam work NAME PROMPT_FILE`: tmux session `claude-NAME`, a fresh Claude, no services), waits (`hyperbeam wait NAME`), reads the report, and ends it (`hyperbeam close NAME`). hyperbeam never starts Claude work by itself.
 - One tmux session per project.
 - Manifests (`projects/<name>.toml`, in this repo, not in the projects) say how a project starts: ordered services, ports, env.
 - Each project gets a fixed port, set through tmux session env vars. No direnv.
@@ -29,13 +30,13 @@ Works locally; the phone (SSH from Termux over Tailscale) attaches to the same s
 
 ## Where things are
 - `install.sh`: installs hyperbeam (see Rules). `hyperbeam`: the whole app, one uv script (Textual menu, CLI commands, lab, verify, shot, digest, tools). `guard.py`: the Claude Bash hook. `hyperbeam.conf`: tmux keys and hooks.
-- Prompts injected into Claude: `ONBOARDING.md`, `ALIGN.md`, `RECOVER.md`, `WRAPUP.md`, `TOOLS_PROPOSE.md`, `REVIEW.md`, `START.md`, `AUDIT.md`. `projects/<name>.toml`: a project's manifest (format in the reference).
+- Prompts injected into Claude: `ONBOARDING.md`, `ALIGN.md`, `RECOVER.md`, `WRAPUP.md`, `TOOLS_PROPOSE.md`, `REVIEW.md`, `START.md`, `AUDIT.md`, `WORKER.md` (the preamble of a manager worker). `projects/<name>.toml`: a project's manifest (format in the reference).
 - `lab/` (setup, remove, podman, rsync shell), `tools/` (tested scripts, listed in `TOOLS.md`), `docs/` (`SYSTEM.md` the one-page map of how it all fits, `DESIGN.md` the same walked through part by part (read this to check the design), `decisions/` the why, one file per decision, `DECISIONS.md` their generated index, `REFERENCE.md` the details, `UI.md`, `PODMAN.md`), `IDEAS.md` the roadmap, `README.md` the why and the goals.
 - `manager/`: the template of `~/manager`, the manager's notes folder (its CLAUDE.md is the manager's role); `ensure_manager_dir` copies it once and never overwrites. **Two hats:** hyperbeam the tool is the installed copy; hyperbeam the project is this folder; the manager is the first row of the sidebar (the tmux session `manager`, `MENU` in the script) and is not a project: no injected prompts, no start choice, no review.
 - State is in `~/.local/share/hyperbeam/` (per project: `projects/<name>-<hash>/`, linked into each project as `.hyperbeam`); settings in `~/.config/hyperbeam/config.toml`.
 
 ## Commands (details in the reference)
-`hyperbeam` (sidebar), `update`, `scan`, `open NAME`, `stop NAME`, `info`/`kk`, `list`, `phone`, `context [--size|--full]`, `report`, `refresh-prs [NAME] [N...]`, `review [NAME] [--since C]`, `audit [NAME]`, `back [NAME]`, `align-facts`, `verify [merge]`, `shot [--cols 35] [--dir D]`, `usage`, `new NAME --cli|--web`, `lab run|status|stop|log|digest|reset`, `tool NAME|--list|--test`.
+`hyperbeam` (sidebar), `update`, `scan`, `open NAME`, `stop NAME`, `info`/`kk`, `list`, `phone`, `context [--size|--full]`, `report`, `refresh-prs [NAME] [N...]`, `review [NAME] [--since C]`, `audit [NAME]`, `back [NAME]`, `work NAME FILE`, `wait NAME...`, `close NAME`, `status` (workers: see Rules and the reference), `align-facts`, `verify [merge]`, `shot [--cols 35] [--dir D]`, `usage`, `new NAME --cli|--web`, `lab run|status|stop|log|digest|reset`, `tool NAME|--list|--test`.
 **`hyperbeam NAME VERB`**: the same verbs in every project: `install`, `update`, `test` (always in the lab), `version`, `help`, `restart`. A project's own script/Makefile target/manifest `[commands]` wins; otherwise hyperbeam derives a default from the lockfile (pnpm/npm/uv/pip/cargo). The sidebar's Update button runs `update` for the selected project, and **Merge runs the project's update by itself afterwards**: click Merge, nothing else. Inside a project's session `NAME VERB` and `hb VERB` do the same (`dotwork help`); `hyperbeam new` starts a project that already conforms.
 `lab run [--dir D] [--why TEXT] [--fresh] [--collect PATH] [--timeout S] [--] COMMAND` runs as the user `hblab` in a synced copy of the project (secrets and `.git` are not copied); options go before the command. The lab shares the machine's network: bind port 0 or `$LAB_PORT_MIN`-`$LAB_PORT_MAX`. `lab reset` is the user's, agents use `lab stop`.
 
