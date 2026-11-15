@@ -17,6 +17,7 @@ else
 fi
 mkdir -p "$bin" "$(dirname "$conf")"
 ln -sfn "$lib/hyperbeam" "$bin/hyperbeam"
+ln -sfn "$lib/hyperbeam" "$bin/kk"
 ln -sfn "$lib/hyperbeam.conf" "$conf"
 uv run --quiet --script "$lib/hyperbeam" _hooks
 echo "hyperbeam installed: $lib ($(git -C "$lib" log --oneline -1))"

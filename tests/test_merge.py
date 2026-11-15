@@ -133,10 +133,10 @@ class Fake:
 class MergeAll(unittest.TestCase):
     def setUp(self):
         self.saved = {k: getattr(hb, k) for k in ("pr_state", "merge_pr", "open_prs", "run_verb", "DATA_DIR", "pr_stale")}
-        self.log, self.updates = [], []
+        self.log, self.updates, self.sinces = [], [], []
         hb.DATA_DIR = Path(tempfile.mkdtemp())
         hb.pr_stale = lambda pr: False
-        hb.run_verb = lambda name, verb, path, say: (self.updates.append(name), 0)[1]
+        hb.run_verb = lambda name, verb, path, say, since=None: (self.updates.append(name), self.sinces.append(since), 0)[2]
         self.prs = [{"number": n, "title": f"t{n}", "base": "main", "branch": f"b{n}"} for n in (35, 33, 34)]
         hb.open_prs = lambda *a, **k: [q for q in self.prs if q["number"] not in k.get("gone", ())]
         self.state = lambda n: {"behind": 0, "overlap": [], "conflicts": []}

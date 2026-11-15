@@ -2863,9 +2863,10 @@ def restart_services(name, say):
     return n
 
 
-def verb_update(name, path, say):
+def verb_update(name, path, say, since=None):
     """Pull the project's default branch and bring it up to date: refuse on uncommitted tracked changes; fetch; check out the default branch;
-    `pull --ff-only`; install only if a lockfile or manifest changed; restart the services of a running session. -> exit code."""
+    `pull --ff-only`; install only if a lockfile or manifest changed; restart the services of a running session. `since`: the commit the checkout was at
+    before something else (Merge) already pulled; the changes are measured from it. Says what it did. -> exit code."""
     path = Path(path)
     if name == "hyperbeam":
         return run_cmd_stream(f"{SELF} update --yes", path, say)
@@ -2878,7 +2879,7 @@ def verb_update(name, path, say):
         return 1
     git_fetch(path)
     base = default_branch(path)
-    before_branch, old = branch_of(path), git_out(path, "rev-parse", "HEAD")
+    before_branch, old = branch_of(path), since or git_out(path, "rev-parse", "HEAD")
     if before_branch != base:
         co = subprocess.run(["git", "-C", str(path), "checkout", "-q", base], capture_output=True, text=True)
         if co.returncode:
@@ -2895,6 +2896,8 @@ def verb_update(name, path, say):
         say(f"{base} is already up to date")
     else:
         say(f"{base}: {old[:7]} -> {new[:7]} ({len(changed)} file{'s' * (len(changed) != 1)} changed)")
+    if changed and not any(Path(f).name in LOCKFILES for f in changed):
+        say("no lockfile changed: nothing to install")
     if any(Path(f).name in LOCKFILES for f in changed):
         cmd, src = verb_command(name, path, "install")
         if cmd:
@@ -2903,7 +2906,10 @@ def verb_update(name, path, say):
                 say("install failed")
                 return 1
     if changed:
-        restart_services(name, say)
+        if not restart_services(name, say):
+            say("no running service windows to restart")
+    else:
+        say("nothing changed: nothing installed, no services restarted")
     return 0
 
 
@@ -2943,7 +2949,7 @@ def verb_help(name, path, say):
     return 0
 
 
-def run_verb(name, verb, path=None, say=print):
+def run_verb(name, verb, path=None, say=print, since=None):
     """One of the standard verbs for a project, with its output through `say`. `test` always runs in the lab. -> exit code."""
     path = Path(path) if path else known_path(name)
     if verb not in VERBS:
@@ -2953,7 +2959,7 @@ def run_verb(name, verb, path=None, say=print):
         say(f"{path} does not exist")
         return 1
     if verb == "update":
-        return verb_update(name, path, say)
+        return verb_update(name, path, say, since=since)
     if verb == "version":
         return verb_version(name, path, say)
     if verb == "help":
@@ -2965,8 +2971,16 @@ def run_verb(name, verb, path=None, say=print):
         say(f"{verb}: {src}")
         return 1
     if verb == "test":
-        ns = types.SimpleNamespace(action="run", dir=str(path), name=None, why=f"{name} test", fresh=False, timeout=900, cmd=["--", cmd], quiet=False, collect=None)
-        return cmd_lab(ns)
+        msg = lab_ready()                      # cmd_lab prints this; inside the menu stdout is Textual's, so say it here
+        if msg:
+            say(msg)
+            return 2
+        say(f"test: {cmd}   [{src}]   (in the lab)")
+        ns = types.SimpleNamespace(action="run", dir=str(path), name=None, why=f"{name} test", fresh=False, timeout=900, cmd=["--", cmd], quiet=False, collect=None, say=say)
+        rc = cmd_lab(ns)
+        log = home_rel(project_dir(name, path) / "verb-test.txt")
+        say(f"test ok (full output: {log})" if rc == 0 else f"test FAILED (exit {rc}); full output: {log}; hyperbeam lab log has the run")
+        return rc
     say(f"{verb}: {cmd}   [{src}]")
     return run_cmd_stream(cmd, path, say)
 
@@ -3587,7 +3601,9 @@ def cmd_lab(a):
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         for line in p.stdout:
-            if not getattr(a, "quiet", False):
+            if getattr(a, "say", None):                      # the menu: its stdout is Textual's, so the lines go to a callback
+                a.say(line.decode(errors="replace").rstrip("\n"))
+            elif not getattr(a, "quiet", False):
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
             tail = (tail + [line.decode(errors="replace").rstrip("\n")])[-20:]
@@ -5553,6 +5569,7 @@ class Menu(App):
         name = p["name"]
         merged, stopped, local_ok = [], None, False
         try:
+            since = git_out(p["path"], "rev-parse", default_branch(p["path"]))      # before the first merge pulls: the update compares against it
             lines = "\n".join(f"#{x['number']} {x['title']}" + (f" (stale: {pr_age_days(x)} days old)" if pr_stale(x) else "") for x in prs)
             if not self.ask(f"Merge {len(prs)} PR{'s' if len(prs) != 1 else ''} in {name}, oldest first?\n\n{lines}\n\n"
                             "A merge commit each; the branches are deleted on GitHub. It stops at the first one that needs a look. Nothing is merged without Yes."):
@@ -5577,7 +5594,7 @@ class Menu(App):
                 self.call_from_thread(self.update_hyperbeam)       # the menu restarts itself: this runs in a popup
             elif merged and local_ok:
                 lines = []                                         # merged and pulled: now the project's own update (install, restart services), one click in all
-                rc = run_verb(name, "update", p["path"], lines.append)
+                rc = run_verb(name, "update", p["path"], lines.append, since=since or None)
                 last = next((l for l in reversed(lines) if l.strip()), "")
                 self.say_from_thread(f"{name}: {summary}; update {'ok' if rc == 0 else 'FAILED'}: {last}")
             else:
@@ -5904,8 +5921,29 @@ def do_update(branch=None, yes=False):
     return subprocess.run([str(repo / "hyperbeam"), "_update-finish"] + (["--yes"] if yes else [])).returncode
 
 
+def link_kk():
+    """~/.local/bin/kk (HB_BIN) must point at this (installed) script: relink an old link (it used to point at the dev folder); make it when missing;
+    leave a real file alone. -> a message or ''."""
+    kk, target = Path(os.environ.get("HB_BIN") or Path.home() / ".local/bin") / "kk", HERE / "hyperbeam"
+    if kk.is_symlink():
+        if os.readlink(kk) == str(target):
+            return ""
+        was = os.readlink(kk)
+    elif kk.exists():
+        return f"{kk} is not a link: left alone"
+    else:
+        was = None
+    kk.parent.mkdir(parents=True, exist_ok=True)
+    tmp = kk.with_name(".kk.new")
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(target)
+    tmp.replace(kk)
+    return f"kk: linked to {target}" + (f" (was {was})" if was else "")
+
+
 def cmd_update_finish(a):
     """The steps after the checkout, run by the new code: hooks, tmux config, menus, Claude panes."""
+    print(link_kk() or "kk: link is current")
     print("hooks: " + (", ".join(install_hooks()) and "updated" or "already current"))
     for m in hook_summary_for_update():
         print(m)
