@@ -1,7 +1,7 @@
 ---
 id: 2026-11-15-verbs-merge-update-kk
 status: implemented
-prs: []
+prs: [62]
 topic: verbs
 ---
 # The Test button, Merge's update and kk, fixed
