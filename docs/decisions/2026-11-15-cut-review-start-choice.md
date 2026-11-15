@@ -1,7 +1,7 @@
 ---
 id: 2026-11-15-cut-review-start-choice
 status: implemented
-prs: []
+prs: [60]
 topic: work-loop
 supersedes: [2026-11-12-review-pass, 2026-11-12-review-fresh-claude, 2026-11-12-review-every-project, 2026-11-12-audit-process]
 ---
