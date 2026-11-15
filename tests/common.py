@@ -57,7 +57,3 @@ class Repo:
         self.git("push", "-q", "origin", "main")
         return self.git("rev-parse", "--short", "HEAD")
 
-    def review_record(self, date, through, prs="[1, 2]"):
-        self.write(f"docs/reviews/{date}.md", f"---\nthrough: {through}\nprs: {prs}\n---\nreviewed\n")
-        self.commit(f"review {date}")
-        self.git("push", "-q", "origin", "main")

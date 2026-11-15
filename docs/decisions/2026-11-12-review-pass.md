@@ -1,8 +1,9 @@
 ---
 id: 2026-11-12-review-pass
-status: implemented
+status: superseded
 prs: [42]
 topic: workflow
+collapsed_into: [2026-11-15-cut-review-start-choice]
 ---
 # A review pass after every few merged PRs, recorded in docs/reviews/
 

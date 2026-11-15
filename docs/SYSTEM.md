@@ -19,7 +19,7 @@ Marked **[gap]** = known difference between what was intended and what is built.
           services start in order ─> start check (git, crash) ─> shell runs kk
                 │                    red problem? → offer RECOVER.md
                 ▼
-          Claude starts: earlier conversation? ask: Fresh plan session (START.md) / Review (if due) / Continue
+          Claude starts: continues its last conversation (fresh if none), no question
                 ▼
           WORK: you + Claude (sonnet) on a branch → PR
                 │   lab runs every test, guard blocks dangerous commands
@@ -30,7 +30,7 @@ Marked **[gap]** = known difference between what was intended and what is built.
           Stop (one project): wrap-up check → clean: stop / not: stop anyway or cancel
           Done (whole day):  wrap-up check on every project touched → all clean: stop their sessions / else list what is unclean
 
- Background: minute recheck (dots, notes: drift, stale docs, review count, context size), PR poll,
+ Background: minute recheck (dots, notes: drift, stale docs, context size), PR poll,
  usage line (5h / week), daily tool check, layout save every 5 min (every session, the hyperbeam one too).
 ```
 
@@ -41,17 +41,10 @@ Marked **[gap]** = known difference between what was intended and what is built.
 | ONBOARDING.md | Open without a manifest, a service failed, or Onboard | reads the project, starts it, proposes the manifest, waits for approval |
 | ALIGN.md | right after ONBOARDING | compares the project with RULES.md, proposes changes, waits, then a PR |
 | RECOVER.md | Open finds a red problem and you say yes | diagnoses read-only, proposes, waits |
-| START.md | Open (choice) | fresh plan-mode Claude checks for half-done work, proposes the next 1-3 items, waits |
-| REVIEW.md | Done offers it, the Project screen's Review button, or `hyperbeam review` | fresh plan-mode Claude proposes ONE cleanup PR, then does it |
 
 Every injected prompt starts in plan mode (Opus plans, Sonnet builds).
 
-## The review loop today
-- Every onboarded project is in the loop: the count starts at the last review record (`docs/reviews/<date>.md`), or at onboarding when the project has none yet. The first review writes the record.
-- After `review_after` (5) merged PRs: a quiet note on the row and in the shell pane on Open, a line in `hyperbeam context`, the offer at Done (once a day), and a **Review** button in the Project screen that starts it any time.
-
 ## Planned (not built; each PR updates this page)
 1. ~~Layouts come back whole~~ (built: the hyperbeam session is saved too; panes remember their program and start it again; no "Restore?" question).
-2. ~~Every project is in the review loop~~ (built: counted from onboarding; the note shows on Open; Review button in the Project screen; Done offers it).
-3. ~~Work loop, step 1~~ (built: the Fresh plan session / Review / Continue choice when Claude starts, and the same choice after a finished Merge run). Not asked: the hyperbeam session after a reboot (continues).
-4. Later: a "presentable" check at the end of the day, the phone view, the sidebar redesign.
+2. ~~Work loop, step 1~~ (built, then cut: Open continues the last conversation; the manager plans and starts workers).
+3. Later: a "presentable" check at the end of the day, the phone view, the sidebar redesign.

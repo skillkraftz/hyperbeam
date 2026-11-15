@@ -177,7 +177,6 @@ RULES = RULES + [
 
 
 CWD = ""         # the tool call's working directory (set by main)
-PERMISSION_MODE = ""          # the session's permission mode from the hook input (default | plan | ...), set by main; empty when Claude doesn't send it
 
 
 INSTALLED = os.path.expanduser("~/.local/lib/hyperbeam")      # the app the user runs: a clone of main that install.sh keeps current
@@ -239,33 +238,6 @@ RULES = RULES + [
      "once migrated the user's live state folder). Run it in the lab: `hyperbeam lab run --dir <worktree> -- uv run --quiet --script hyperbeam ...` "
      "(the lab copies the folder and runs it as hblab with its own home, tmux and display). Only `hyperbeam lab run ...` itself is allowed from a "
      "worktree. The installed `hyperbeam` (~/.local/lib/hyperbeam, on PATH) is the one that runs as the user; or ask the user."),
-]
-
-
-def configured_model():
-    """hyperbeam's claude_model setting (sonnet unless config.toml says otherwise): plan mode matters only with opusplan."""
-    try:
-        import tomllib
-        f = os.environ.get("HB_CONFIG") or os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "hyperbeam", "config.toml")
-        with open(f, "rb") as fh:
-            return str(tomllib.load(fh).get("claude_model", "sonnet"))
-    except Exception:
-        return "sonnet"
-
-
-def reviews_outside_plan(cmd):
-    """`hyperbeam review ... --print` in a session that is not in plan mode: the review is planned by Opus, which with opusplan only runs in plan mode.
-    Not applied when Claude doesn't report its permission mode."""
-    if not PERMISSION_MODE or PERMISSION_MODE == "plan" or configured_model() != "opusplan":
-        return False
-    return bool(re.search(r"\bhyperbeam\s+review\b", cmd) and re.search(r"(?:^|\s)--print\b", cmd))
-
-
-RULES = RULES + [
-    ("review-outside-plan", reviews_outside_plan,
-     "BLOCKED by hyperbeam: the review is planned by Opus, which only runs in plan mode (with opusplan), and this session is not in plan mode. Call "
-     "EnterPlanMode first and run it again; or run `hyperbeam review` without --print: it starts the review in a fresh plan-mode Claude that replaces this one "
-     "(`hyperbeam back` brings this conversation back)."),
 ]
 
 
@@ -387,8 +359,6 @@ def main():
         return 0
     global CWD
     CWD = str(call.get("cwd") or "")
-    global PERMISSION_MODE
-    PERMISSION_MODE = str(call.get("permission_mode") or "")
     message = check(str((call.get("tool_input") or {}).get("command", "")))
     if message:
         print(message, file=sys.stderr)

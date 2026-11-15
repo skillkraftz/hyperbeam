@@ -1,8 +1,9 @@
 ---
 id: 2026-11-12-audit-process
-status: implemented
+status: superseded
 prs: [55]
 topic: review
+collapsed_into: [2026-11-15-cut-review-start-choice]
 ---
 # The whole-project audit: list, triage, small PRs, close; `hyperbeam audit` starts it
 

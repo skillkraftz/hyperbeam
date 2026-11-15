@@ -89,15 +89,14 @@ USER_KEYS = [("C-a |  /  C-a -", "split right / below"), ("C-a h j k l", "select
 HINT = "M-arrows pane  M-z zoom  M-h menu  M-s sidebar  M-[ M-] stack  M-y copy"
 
 
-DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "manager_model": "opus", "claude_effort": "medium", "claude_permissions": "skip", "review_after": 5, "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
+DEFAULTS = {"open_mode": "sidebar", "claude_model": "sonnet", "manager_model": "opus", "claude_effort": "medium", "claude_permissions": "skip", "menu_width": 45, "recent_days": 7, "on_problem": "ask", "context_warn": 300000}
 CHOICES = {"open_mode": ["sidebar", "switch", "window"], "on_problem": ["ask", "auto"], "claude_model": ["sonnet", "opusplan", "opus", "haiku", "fable"], "manager_model": ["opus", "fable", "sonnet", "opusplan", "haiku"],
-           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "claude_permissions": ["skip", "ask"], "review_after": [3, 5, 8, 10], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
+           "claude_effort": ["low", "medium", "high", "xhigh", "max"], "claude_permissions": ["skip", "ask"], "menu_width": [35, 40, 45, 50, 55, 60], "recent_days": [1, 3, 7, 14, 30]}
 CONFIG_NOTES = {"open_mode": '"sidebar" (desktop): one kitty window, menu on the left, tmux on the right that switches sessions. "switch": Open switches this terminal. "window": a new kitty window per project. Over SSH it is always switch.',
                 "claude_model": "model for every Claude hyperbeam starts (claude --model): sonnet (the default: planning happens in the manager conversation), opusplan (Opus plans in plan mode, Sonnet does the work; injected prompts then start in plan mode), opus, haiku, fable",
                 "manager_model": "model for the manager (the first row: a conversation with Claude about all your projects, never in plan mode, never writes code in a project)",
                 "claude_effort": "effort for every Claude hyperbeam starts (claude --effort): low, medium, high, xhigh, max",
                 "claude_permissions": '"skip": every Claude hyperbeam starts runs without permission prompts (claude --dangerously-skip-permissions; the guard hook still blocks the dangerous commands). "ask": Claude asks as usual.',
-                "review_after": "merged PRs after which Done offers a review pass (plan mode: Claude checks what was merged and proposes one cleanup PR); the project's last review is docs/reviews/*.md",
                 "menu_width": "columns of the menu sidebar (takes effect when the sidebar window is opened again)",
                 "on_problem": '"ask": a popup when you enter a project with problems. "auto": Claude is sent RECOVER.md on entry, once per set of problems.',
                 "recent_days": "a project opened within this many days is 'recent' (bold white in the menu)"}
@@ -632,54 +631,6 @@ def start_claude_with_prompt(pane, f, add_dirs=(), cont=True):
     send_line(pane, f"{base} --continue{arg} || {base}{arg}" if cont else f"{base}{arg}")
 
 
-def latest_conversation(path):
-    """The newest conversation Claude Code kept for this folder (~/.claude/projects/<folder>/<session id>.jsonl), or None."""
-    d = CLAUDE_DIR / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(path))
-    try:
-        return max(d.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, default=None)
-    except OSError:
-        return None
-
-
-def set_aside(name, path, why):
-    """Remember the folder's newest conversation as the previous one (`Previous Claude` brings it back) before a fresh Claude starts in its place."""
-    f = latest_conversation(path)
-    if f:
-        try:
-            pfile(name, "previous-claude").write_text(json.dumps({"session_id": f.stem, "time": time.time(), "why": why}))
-        except OSError:
-            pass
-
-
-def start_text(name, path):
-    """START.md, the facts, and the snapshot: what a fresh plan-mode Claude starts a piece of work from."""
-    L = [f"Project: {name}", f"Project path: {path}", f"Today: {time.strftime('%Y-%m-%d')}", ""]
-    try:
-        prs = open_prs(name, path)
-    except Exception:
-        prs = []
-    L.append("Open PRs (yours): " + (", ".join(f"#{x['number']} {x['title']}" for x in prs) if prs else "none"))
-    return (HERE / "START.md").read_text() + "\n\n---\n" + "\n".join(L) + "\n---\n" + review_snapshot(name, path)
-
-
-def begin_claude(name, path, pane, begin, cont=False):
-    """Type the command that starts the project's Claude in `pane`. begin: "fresh" (a new plan-mode Claude from START.md), "review" (a new plan-mode Claude
-    from REVIEW.md, when one is due), "continue" (`claude --continue`); anything else: plain claude, continuing only when `cont`. A fresh or review start
-    sets the folder's last conversation aside (Previous Claude)."""
-    dirs = [HERE] if name == "hyperbeam" else []
-    due = reviews_due(path, name) if begin == "review" else None
-    if begin == "review" and not due:
-        begin = "fresh"
-    if begin == "fresh":
-        f = write_prompt(sanitize(name), start_text(name, path))
-    elif begin == "review":
-        f = review_prompt(name, path, due[1]["through"])
-    else:
-        return send_line(pane, claude_cmd(cont=cont or begin == "continue"))
-    set_aside(name, path, begin)
-    start_claude_with_prompt(pane, f, dirs, cont=False)
-
-
 def send_line(target, text):
     tmux("send-keys", "-t", target, "-l", text)
     tmux("send-keys", "-t", target, "Enter")
@@ -800,246 +751,6 @@ def take_fingerprint(name, path):
     man = MANIFESTS / f"{name}.toml"
     fingerprint_file(name, path).write_text(json.dumps({"date": time.strftime("%Y-%m-%d %H:%M"), "manifest_mtime": man.stat().st_mtime if man.is_file() else 0,
                                                         "parts": fingerprint(path)}, indent=1))
-
-
-# ---------- review pass: after N merged PRs a plan-mode review of what was merged (REVIEW.md). The record of the last one is docs/reviews/*.md ----------
-def read_front(text):
-    """The `key: value` lines between the two --- lines at the top of a record (a decision, a review) -> {key: value as a string}."""
-    lines = text.split("\n")
-    if not lines or lines[0].strip() != "---":
-        return {}
-    out = {}
-    for l in lines[1:]:
-        if l.strip() == "---":
-            break
-        k, _, v = l.partition(":")
-        if _:
-            out[k.strip()] = v.strip()
-    return out
-
-
-def last_review(path):
-    """The newest review record of a project (docs/reviews/YYYY-MM-DD.md): its front matter plus `date`, or None."""
-    d = Path(path) / "docs" / "reviews"
-    files = sorted(d.glob("*.md")) if d.is_dir() else []
-    if not files:
-        return None
-    r = read_front(files[-1].read_text(errors="replace"))
-    r.setdefault("date", files[-1].stem[:10])
-    return r
-
-
-def review_baseline(name, path):
-    """A project with no review record yet counts from its onboarding: the last commit of the default branch at the fingerprint's date (the root commit if
-    every commit is newer) as a record-like dict {date, through, baseline: True}; None when the project was never onboarded or has no history."""
-    try:
-        date = json.loads((project_dir(name, path, create=False) / "fingerprint.json").read_text())["date"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    base = f"origin/{default_branch(path)}"
-    c = git_out(path, "rev-list", "-1", "--first-parent", f"--before={date}", base) or (git_out(path, "rev-list", "--max-parents=0", base).split() or [""])[-1]
-    return dict(date=date[:10], through=c[:7], baseline=True) if c else None
-
-
-def since_text(r):
-    return f"onboarding ({r['date']})" if r.get("baseline") else f"the last review ({r['date']})"
-
-
-def reviews_due(path, name=None):
-    """(merged PRs since the last review's `through` commit, that review record), or None when the commit isn't known or the project is in no loop at all
-    (no review record and never onboarded). With no record yet the count starts at onboarding (`review_baseline`); the first review writes the record."""
-    r = last_review(path)
-    if not r or not r.get("through"):
-        r = review_baseline(name or Path(path).name, path)
-    if not r or not r.get("through"):
-        return None
-    n = git_out(path, "rev-list", "--merges", "--first-parent", "--count", f"{r['through']}..origin/{default_branch(path)}")
-    return (int(n), r) if n.isdigit() else None
-
-
-def review_notes(name, path):
-    """One quiet note on the project row: how far it is from the next review. Never red."""
-    due = reviews_due(path, name)
-    if not due or not due[0]:
-        return []
-    n, r = due
-    limit = cfg_get("review_after")
-    return [f"review due: {n} PRs merged since {since_text(r)}; Open and Done offer it (Project, Review)" if n >= limit else f"{n} of {limit} PRs since {'onboarding' if r.get('baseline') else 'the last review'}"]
-
-
-def review_line(path, name=None):
-    """For `hyperbeam context`: where the project is in the review loop (a new session knows how much room is left), or None."""
-    due = reviews_due(path, name)
-    if not due:
-        return None
-    n, r = due
-    if r.get("baseline"):
-        return f"No review yet; counting from onboarding ({r['date']}, commit {r['through']}): {n} PR{'s' * (n != 1)} merged since; a review is offered at {cfg_get('review_after')}."
-    return (f"Last review {r['date']} (through {r['through']}" + (f", PRs {r['prs']}" if r.get("prs") else "") + f"); {n} PR{'s' * (n != 1)} merged since; "
-            f"a review is offered at {cfg_get('review_after')}.")
-
-
-def review_facts(path, since):
-    """What the review prompt shows: the PRs merged since `since` with the files each changed, decision records added, the size of the change, IDEAS.md."""
-    base = f"origin/{default_branch(path)}"
-    rows = [l.split(" ", 1) for l in git_out(path, "log", "--merges", "--first-parent", "--reverse", "--format=%h %s", f"{since}..{base}").splitlines() if l.strip()]
-    L = [f"Project path: {path}", f"Reviewing from: {since} (the last review's `through`, or the commit you were given)", f"Merged PRs since then: {len(rows)}", ""]
-    for h, subj in rows:
-        files = git_out(path, "diff", "--name-only", f"{h}^1", h).split()
-        L.append(f"- {subj}  [{h}]  files: " + (", ".join(files[:12]) + (f" (+{len(files) - 12} more)" if len(files) > 12 else "") or "none"))
-    L += ["", "Size of the change: " + (git_out(path, "diff", "--shortstat", f"{since}..{base}") or "unknown")]
-    rec = git_out(path, "diff", "--name-only", "--diff-filter=A", f"{since}..{base}", "--", "docs/decisions").split()
-    L += ["", "Decision records added: " + (", ".join(rec) or "none")]
-    ideas = Path(path) / "IDEAS.md"
-    L += ["", "IDEAS.md:", ideas.read_text(errors="replace").rstrip() if ideas.is_file() else "(none)"]
-    last = last_review(path)
-    L += ["", "Last review record: " + (json.dumps(last) if last else "none")]
-    return "\n".join(L) + "\n"
-
-
-SNAPSHOT_CAP = 12000          # characters per part of the snapshot
-
-
-def review_snapshot(name, path):
-    """What a fresh Claude needs to not start blind, without the whole repo: CLAUDE.md, the decisions index, IDEAS.md, the last review, the recent history,
-    and what the previous session last said (read before the swap). README.md and docs/REFERENCE.md are left for it to read on demand."""
-    want = ("CLAUDE.md", "docs/DECISIONS.md", "IDEAS.md", "Last review", "Recent history")
-    out = ["## Snapshot of the project (you start from this; read README.md and docs/REFERENCE.md yourself when you need them)"]
-    for title, body in context_bundle(name, path, parts_only=True):
-        if title in want and body:
-            out += ["", f"### {title}", body[:SNAPSHOT_CAP] + ("\n... (cut; read the file)" if len(body) > SNAPSHOT_CAP else "")]
-    try:
-        last = report_text(name).strip()
-        if last:
-            out += ["", "### What the previous session last said", last[:2000] + (" ..." if len(last) > 2000 else "")]
-    except Exception:
-        pass
-    return "\n".join(out) + "\n"
-
-
-def review_text(name, path, since):
-    """REVIEW.md, the facts, and the snapshot: everything the review starts from."""
-    return (HERE / "REVIEW.md").read_text() + "\n\n---\n" + review_facts(path, since) + "\n---\n" + review_snapshot(name, path)
-
-
-def review_prompt(name, path, since):
-    """review_text written to the prompts folder (with the plan-first line). -> the file."""
-    return write_prompt(sanitize(name), review_text(name, path, since))
-
-
-def previous_claude(name):
-    """The conversation `swap_claude` set aside for this project ({session_id, time, why}), or None."""
-    try:
-        d = json.loads(pfile(name, "previous-claude").read_text())
-        return d if re.fullmatch(r"[0-9a-fA-F-]{8,40}", str(d.get("session_id", ""))) else None
-    except (OSError, ValueError):
-        return None
-
-
-def swap_claude(name, path, prompt_file, why, add_dirs=()):
-    """Replace the project's Claude with a fresh one (in plan mode with opusplan: Opus proposes, Sonnet builds after approval) that starts from `prompt_file`.
-    The conversation it replaces is remembered (`previous-claude`) so `back_claude` can resume it. Refuses while Claude is working (it would be killed).
-    -> (started, message)."""
-    sess = sanitize(name)
-    pane = find_claude_pane(sess) if session_exists(sess) else None
-    if not pane:
-        return False, f"{name} is not running: open it, then ask again"
-    if claude_state(name)[0] == "working":
-        return False, f"Claude is working in {name}: wait until it is idle, then ask again"
-    sf = claude_session_file(pane)
-    if sf:
-        try:
-            pfile(name, "previous-claude").write_text(json.dumps({"session_id": sf.stem, "time": time.time(), "why": why}))
-        except OSError:
-            pass
-    tmux("respawn-pane", "-k", "-t", pane, "-c", str(path), check=False)
-    start_claude_with_prompt(pane, prompt_file, add_dirs, cont=False)
-    tmux("select-window", "-t", pane, check=False)
-    tmux("select-pane", "-t", pane, check=False)
-    return True, ("a fresh Claude in plan mode" if plans_first() else "a fresh Claude") + (" (the previous conversation is kept: Previous Claude brings it back)" if sf else "")
-
-
-def back_claude(name):
-    """Resume the conversation `swap_claude` set aside, in the same pane (the swapped-in Claude ends). -> (done, message)."""
-    rec = previous_claude(name)
-    if not rec:
-        return False, "no previous Claude conversation to go back to"
-    sess = sanitize(name)
-    pane = find_claude_pane(sess) if session_exists(sess) else None
-    if not pane:
-        return False, f"{name} is not running: open it first"
-    if claude_state(name)[0] == "working":
-        return False, f"Claude is working in {name}: wait until it is idle"
-    tmux("respawn-pane", "-k", "-t", pane, "-c", str(known_path(name)), check=False)
-    send_line(pane, f"{claude_base()} --resume {rec['session_id']}")
-    pfile(name, "previous-claude").unlink(missing_ok=True)
-    tmux("select-window", "-t", pane, check=False)
-    tmux("select-pane", "-t", pane, check=False)
-    return True, "back in the previous conversation"
-
-
-def start_review(name, path, since):
-    """The review in a fresh plan-mode Claude (swap_claude) that starts from REVIEW.md, the facts and a snapshot. -> (started, message)."""
-    f = review_prompt(name, path, since)               # built first: the snapshot includes what the Claude being replaced last said
-    ok, msg = swap_claude(name, path, f, "review", [HERE] if name == "hyperbeam" else [])
-    if not ok:
-        return False, msg
-    return True, f"{msg}; it starts from about {len(f.read_text()) // 4000}k tokens of context and proposes one cleanup PR first"
-
-
-def audit_text(name, path):
-    """AUDIT.md, a few facts about the size of the project, and the snapshot: what a fresh plan-mode Claude starts the audit from."""
-    files = [f for f in git_out(path, "ls-files").splitlines() if f]
-    sizes = []
-    for f in files:
-        try:
-            sizes.append((len((Path(path) / f).read_text(errors="strict").splitlines()), f))
-        except (OSError, UnicodeDecodeError):
-            pass
-    big = ", ".join(f"{f} ({n})" for n, f in sorted(sizes, reverse=True)[:10])
-    facts = [f"Project: {name}", f"Project path: {path}", f"Today: {time.strftime('%Y-%m-%d')}", f"Tracked files: {len(files)}; largest (lines): {big}"]
-    return (HERE / "AUDIT.md").read_text() + "\n\n---\n" + "\n".join(facts) + "\n---\n" + review_snapshot(name, path)
-
-
-def start_audit(name, path):
-    """The audit in a fresh plan-mode Claude that replaces the project's Claude (swap_claude; Previous Claude brings the old conversation back). -> (started, message)."""
-    f = write_prompt(sanitize(name), audit_text(name, path))           # built first: the snapshot includes what the Claude being replaced last said
-    ok, msg = swap_claude(name, path, f, "audit", [HERE] if name == "hyperbeam" else [])
-    return (True, f"{msg}; it starts from about {len(f.read_text()) // 4000}k tokens of context, reads the whole project and lists findings first") if ok else (False, msg)
-
-
-def cmd_audit(a):
-    """hyperbeam audit [PROJECT] [--print]: the whole-project audit (AUDIT.md) in a fresh plan-mode Claude that replaces the project's Claude, or the prompt printed."""
-    name = a.project or os.environ.get("HB_PROJECT")
-    if not name:
-        sys.exit("hyperbeam audit: no project (run it in a project session, or give a name)")
-    path = known_path(name)
-    if a.print:
-        print((PLAN_FIRST if plans_first() else "") + audit_text(name, path))
-        return 0
-    ok, msg = start_audit(name, path)
-    print(f"{name}: {msg}")
-    return 0 if ok else 1
-
-
-def cmd_review(a):
-    """hyperbeam review [PROJECT] [--since COMMIT] [--print]: the review for a project (default $HB_PROJECT) in a fresh plan-mode Claude that replaces the
-    project's Claude (`hyperbeam back` returns to the old conversation), or the prompt printed."""
-    name = a.project or os.environ.get("HB_PROJECT")
-    if not name:
-        sys.exit("hyperbeam review: no project (run it in a project session, or give a name)")
-    path = known_path(name)
-    r = last_review(path)
-    due = reviews_due(path, name)
-    since = a.since or (due[1]["through"] if due else None)
-    if not since:
-        sys.exit(f"hyperbeam review: {name} has no review record (docs/reviews/) and was never onboarded: say where to start, e.g. --since <the merge commit before the first PR to review>")
-    if a.print:
-        print((PLAN_FIRST if plans_first() else "") + review_text(name, path, since))
-        return 0
-    ok, msg = start_review(name, path, since)
-    print(f"{name}: {msg}")
-    return 0 if ok else 1
 
 
 # ---------- workers: Claude sessions the manager starts for a project (`hyperbeam work|wait|close`) ----------
@@ -1213,16 +924,6 @@ def cmd_worker_report(_):
     return 0
 
 
-def cmd_back(a):
-    """hyperbeam back [PROJECT]: resume the conversation a review (swap_claude) set aside."""
-    name = a.project or os.environ.get("HB_PROJECT")
-    if not name:
-        sys.exit("hyperbeam back: no project (run it in a project session, or give a name)")
-    ok, msg = back_claude(name)
-    print(f"{name}: {msg}")
-    return 0 if ok else 1
-
-
 def drift_notes(name, path):
     """A quiet note when the run-defining files changed since the project was onboarded. Projects with a manifest but no fingerprint get a
     baseline now, without a note; a manifest written since the fingerprint counts as onboarding done (new fingerprint, no note). Never red."""
@@ -1361,7 +1062,7 @@ def recheck(name, path):
     if name == "hyperbeam":
         red = [*red, *tool_check_findings()]
     cn = context_note(name, path) if session_exists(sanitize(name)) else ""
-    write_status(name, red, [*drift_notes(name, path), *review_notes(name, path), *([cn] if cn else []), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
+    write_status(name, red, [*drift_notes(name, path), *([cn] if cn else []), *stale_doc_notes(name, path), *notes])        # the setup note first: it is the one with a fix, and the status segment shows the first
 
 
 def claude_state(name):
@@ -1821,7 +1522,7 @@ def start_check(name, path, fetch=True):
     """(red, notes) on Open. Only red problems make Open offer Claude; a crash (saved layout not clean) is a note, like the git state."""
     red, notes = git_red_notes(path, fetch)
     crash = crash_note(name)
-    return red, drift_notes(name, path) + review_notes(name, path) + stale_doc_notes(name, path) + ([crash] if crash else []) + notes
+    return red, drift_notes(name, path) + stale_doc_notes(name, path) + ([crash] if crash else []) + notes
 
 
 # ---------- wrap-up check: git state, obvious secrets, steno files. Reports file, line and pattern name, never a value. ----------
@@ -1994,32 +1695,9 @@ def ask_tty(text):
     return input("y/n: ").strip().lower().startswith("y")
 
 
-def choose_tty(text, options, enter=None):
-    """Pick one of `options` [(id, label, key)] in the terminal; Enter takes `enter`. No terminal: continue the last conversation (what Open always did)."""
-    if not sys.stdin.isatty():
-        return "continue" if any(o[0] == "continue" for o in options) else enter
-    print(text)
-    for oid, label, key in options:
-        print(f"  {key}) {label}")
-    ans = input(f"[{next((k for o, _, k in options if o == enter), '')}]: ").strip().lower()
-    return next((o for o, _, k in options if k == ans), enter)
-
-
-def start_choice(name, path, conv, choose):
-    """How Claude starts in a project that has an earlier conversation: fresh plan session (the default), review (only when due), or continue. Escape = continue."""
-    due = reviews_due(path, name)
-    review = bool(due and due[0] >= cfg_get("review_after"))
-    text = (f"{name}: how should Claude start?\n\nFresh plan session: a new Claude in plan mode reads the project's state, brings it to a good state and proposes what to do "
-            f"next, then waits. The last conversation ({ago_text(conv.stat().st_mtime)}) is kept: Previous Claude brings it back.\nContinue: pick up that conversation.")
-    if review:
-        text += f"\n\nA review is due: {due[0]} PRs merged since {since_text(due[1])}."
-    opts = [("fresh", "Fresh plan session (f)", "f"), *([("review", "Review (r)", "r")] if review else []), ("continue", "Continue last conversation (c)", "c")]
-    return choose(text, opts, "fresh")
-
-
-def open_project(name, path, man, ask, say, onboard=False, choose=choose_tty):
+def open_project(name, path, man, ask, say, onboard=False):
     """Everything Open does before showing the session: the session if it isn't running (the saved layout comes back; if the start check found something,
-    asking about Claude; with an earlier conversation, asking how Claude starts: fresh plan session, review, continue), or the investigate window on Onboard."""
+    asking about Claude; Claude then continues its last conversation, fresh if none), or the investigate window on Onboard."""
     sess = sanitize(name)
     ensure_link(name, path)
     if sess == MENU:
@@ -2035,12 +1713,8 @@ def open_project(name, path, man, ask, say, onboard=False, choose=choose_tty):
     recover = False
     if findings and man and not onboard:
         recover = ask("Start Claude to sort it out?\n\n" + "\n".join(f"- {f}" for f in findings))
-    begin = None
-    conv = latest_conversation(path)
-    if man and not onboard and not recover and conv:
-        begin = start_choice(name, path, conv, choose)
     start_session(name, man, say, path=path, reason="Onboard requested" if onboard else None,
-                  restore=restore, findings=findings, recover=recover, notes=notes, begin=begin)
+                  restore=restore, findings=findings, recover=recover, notes=notes)
 
 
 def publish_claude_pane(sess, pane, plan=()):
@@ -2161,7 +1835,7 @@ def project_envargs(name, man, path, extra=None):
     return [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
 
 
-def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=(), begin=None):
+def start_session(name, man, say=print, path=None, reason=None, restore=None, findings=(), recover=False, notes=()):
     """Create the project's session: the default layout, or `restore` (a saved layout).
     Default: window `work` (Claude left, a shell right), then one window per service. Services start in manifest order, each after the
     previous one is ready. Then the first shell pane prints the start-check findings and real warnings and runs `kk`, and Claude starts:
@@ -2218,7 +1892,6 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
         reason = reason or "no manifest"
     elif failures:
         reason = reason or "a service failed to start"
-    cont = bool(restore) and plan is not None and any(p[1] == "claude" for p in plan)
     write_status(name, list(findings), list(notes))
     if reason:
         inject_prompt(first_claude, investigate_prompt(name, path, sess, reason, failures, findings), [HERE])
@@ -2227,7 +1900,7 @@ def start_session(name, man, say=print, path=None, reason=None, restore=None, fi
         inject_prompt(first_claude, recover_prompt(name, path, sess, findings))
         say(f"{name}: Claude starts with the recover prompt")
     else:
-        begin_claude(name, path, first_claude, begin, cont)
+        send_line(first_claude, claude_cmd(cont=True))
     seen = {next(c for pid, _, c in plan if pid == first_claude)}
     for pid, role, cwd in claude_panes[1:]:          # more Claude panes: continue only if the directory differs (one conversation per directory)
         send_line(pid, claude_cmd(cont=cwd not in seen))
@@ -4370,8 +4043,7 @@ def context_bundle(name, path=None, full=False, parts_only=False):
              *([("docs/REFERENCE.md", first("docs/REFERENCE.md"))] if full else []),
              ("docs/DECISIONS.md", first("docs/DECISIONS.md")),
              ("IDEAS.md", first("IDEAS.md")),
-             ("Last review", review_line(path, name) if path.is_dir() else None),
-             (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
+              (readme.name if readme else "README", readme.read_text(errors="replace").rstrip() if readme else None),
              (f"hyperbeam manifest (projects/{name}.toml)", man.read_text().rstrip() if man.is_file() else None),
              ("Recent history", recent_history(path) if path.is_dir() else None)]
     if parts_only:
@@ -5273,10 +4945,9 @@ class ProjectScreen(ModalScreen):
     ProjectScreen Button { width: 1fr; height: 1 !important; border: none !important; min-width: 8; }
     """
 
-    def __init__(self, text, back=False):
+    def __init__(self, text):
         super().__init__()
         self.text = text
-        self.back = back             # a conversation was set aside by a review: show Previous Claude
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -5287,7 +4958,7 @@ class ProjectScreen(ModalScreen):
             with Container(id="pbuttons"):
                 for bid, label in [("update", "Update"), ("install", "Install"), ("test", "Test (lab)"), ("version", "Version"), ("help_verbs", "Help"), ("onboard", "Onboard"),
                                    ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"), ("info", "Info window"),
-                                   ("mark_onboarded", "Mark onboarded"), ("review", "Review"), *([("back", "Previous Claude")] if self.back else []), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
+                                   ("mark_onboarded", "Mark onboarded"), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
                                    ("close", "Close")]:
                     b = Button(label, id=f"pb-{bid}")
                     b.can_focus = False
@@ -5479,7 +5150,7 @@ class SettingsScreen(ModalScreen):
     SettingsScreen #close { height: 1 !important; border: none !important; }
     """
     LABELS = [("open_mode", "open mode"), ("claude_model", "model"), ("manager_model", "manager"), ("claude_effort", "effort"),
-              ("claude_permissions", "prompts"), ("review_after", "review at"), ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
+              ("claude_permissions", "prompts"), ("menu_width", "width"), ("recent_days", "recent"), ("on_problem", "on problem")]      # short: label + value must fit beside - and + at 35 columns
 
     def __init__(self):
         super().__init__()
@@ -5908,7 +5579,7 @@ class Menu(App):
         Claude with the investigate prompt), then show it. Onboard forces the investigate prompt."""
         name, sess = p["name"], sanitize(p["name"])
         try:
-            open_project(name, p["path"], load_manifests().get(name), self.ask, self.say_from_thread, onboard, choose=self.choose)
+            open_project(name, p["path"], load_manifests().get(name), self.ask, self.say_from_thread, onboard)
             touch_opened(name)
             how = show_session(sess)
             self.say_from_thread(f"{name}: {how} ({HINT})")
@@ -6159,31 +5830,8 @@ class Menu(App):
                 text = project_summary(name, path, prs=prs)
             except Exception as e:
                 text = f"{name}\n\ncould not read the project: {e}"
-            back = previous_claude(name) is not None
-            self.call_from_thread(lambda: self.push_screen(ProjectScreen(text, back=back), lambda r: self.run_project_action(r)))
+            self.call_from_thread(lambda: self.push_screen(ProjectScreen(text), lambda r: self.run_project_action(r)))
         self.run_worker(work, thread=True)
-
-    def action_back(self):
-        """Previous Claude: the conversation a review set aside, resumed in the same pane."""
-        p = self.current()
-        if not p:
-            return self.say("Nothing selected.")
-        ok, msg = back_claude(p["name"])
-        self.say(f"{p['name']}: {msg}")
-
-    def action_review(self):
-        """Review button (Project screen): the review pass for the selected project now, in a fresh plan-mode Claude that replaces its Claude (Previous Claude
-        brings the old conversation back). Counting starts at the last review, or at onboarding for a project with no record yet."""
-        p = self.current()
-        if not p:
-            return self.say("Nothing selected.")
-        due = reviews_due(p["path"], p["name"])
-        if not due:
-            return self.say(f"{p['name']}: no review record and never onboarded: use Onboard first.")
-        if not due[0]:
-            return self.say(f"{p['name']}: no PRs merged since {since_text(due[1])}: nothing to review.")
-        self.say(f"{p['name']}: starting the review ({due[0]} PRs since {since_text(due[1])})...")
-        self.run_worker(lambda: self.say_from_thread(f"{p['name']}: " + start_review(p["name"], Path(p["path"]), due[1]["through"])[1]), thread=True)
 
     def run_project_action(self, what):
         if what and hasattr(self, "action_" + what):
@@ -6548,15 +6196,6 @@ def main():
     af = sub.add_parser("align-facts", help="the facts ALIGN.md compares a project's docs against (visibility, docs layout, tests, ignores)")
     af.add_argument("path", nargs="?")
     af.set_defaults(f=cmd_align_facts)
-    rv = sub.add_parser("review", help="start the review pass for a project (REVIEW.md + the facts, in plan mode, into its Claude); default project $HB_PROJECT; --print prints the prompt")
-    rv.add_argument("project", nargs="?")
-    rv.add_argument("--since", help="the commit to review from (default: the last review record's `through`)")
-    rv.add_argument("--print", action="store_true")
-    rv.set_defaults(f=cmd_review)
-    au = sub.add_parser("audit", help="start the whole-project audit (AUDIT.md, in plan mode, into the project's Claude); default project $HB_PROJECT")
-    au.add_argument("project", nargs="?")
-    au.add_argument("--print", action="store_true")
-    au.set_defaults(f=cmd_audit)
     wk = sub.add_parser("work", help="the manager's: start a worker (a fresh Claude, session claude-NAME) in a project with WORKER.md + the prompt file; one per project")
     wk.add_argument("name")
     wk.add_argument("prompt_file")
@@ -6570,9 +6209,6 @@ def main():
     cl.set_defaults(f=cmd_close)
     sub.add_parser("status", help="running sessions and the state of their workers").set_defaults(f=cmd_status)
     sub.add_parser("_worker-report").set_defaults(f=cmd_worker_report)
-    bk = sub.add_parser("back", help="resume the conversation a review set aside (the review's Claude ends); default project $HB_PROJECT")
-    bk.add_argument("project", nargs="?")
-    bk.set_defaults(f=cmd_back)
     rf = sub.add_parser("refresh-prs", help="fetch a project's open PRs now so the sidebar's Merge button is right at once; run it after gh pr create (with the number) and after a merge; default project $HB_PROJECT")
     rf.add_argument("project", nargs="?")
     rf.add_argument("numbers", nargs="*", help="PR numbers just opened (looked up directly: GitHub's list lags a few seconds)")

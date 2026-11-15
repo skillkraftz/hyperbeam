@@ -1,5 +1,5 @@
 """guard.py: only the installed copy of hyperbeam may run as the user (the dev folder's and a worktree's script are blocked), with the exceptions that never
-touch state. The review rule is tested in test_swap.py."""
+touch state."""
 import os
 import tempfile
 import unittest

@@ -1,8 +1,9 @@
 ---
 id: 2026-11-12-review-every-project
-status: implemented
+status: superseded
 prs: [51]
 topic: review
+collapsed_into: [2026-11-15-cut-review-start-choice]
 ---
 # Every onboarded project is in the review loop: counted from onboarding, shown on Open, a Review button
 
