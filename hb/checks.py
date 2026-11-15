@@ -596,14 +596,6 @@ def format_wrapup(r, cap=12):
     return "\n".join(lines)
 
 
-def project_path(name):
-    man = load_manifests().get(name)
-    if man:
-        return manifest_path(man)
-    row = next((r for r in scan() if r["name"] == name), None)
-    return row["path"] if row else None
-
-
 def session_since(name):
     """Start of the work to check: the session record's start, else when the project's tmux session was created, else 12 hours ago."""
     d = load_journal()
@@ -614,8 +606,8 @@ def session_since(name):
 
 
 def check_project(name):
-    p = project_path(name)
-    r = wrapup_check(name, p, session_since(name)) if p else None
+    p = known_path(name)
+    r = wrapup_check(name, p, session_since(name)) if p.is_dir() else None
     if r:
         write_wrapup_note(name, r)          # a check that found something is kept in .hyperbeam/notes, whatever the user picks next
     return r

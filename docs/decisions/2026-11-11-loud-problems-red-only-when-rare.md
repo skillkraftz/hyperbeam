@@ -1,6 +1,7 @@
 ---
 id: 2026-11-11-loud-problems-red-only-when-rare
-status: implemented
+status: superseded
+collapsed_into: [2026-11-15-no-automatic-prompts]
 prs: [14]
 topic: ui
 ---

@@ -1,6 +1,7 @@
 ---
 id: 2026-11-09-beam-in-beam-out-saved-layouts
-status: implemented
+status: superseded
+collapsed_into: [2026-11-12-layouts-come-back-whole, 2026-11-15-no-automatic-prompts, 2026-11-15-cut-merge-and-done-extras]
 prs: [8, 9]
 topic: workflow
 ---

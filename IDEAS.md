@@ -19,7 +19,7 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 
 ## Done
 - ~~No automatic prompts: a failed service is a red dot and a note; no popup, no RECOVER.md, no Onboard/Fix buttons~~ Done (decision no-automatic-prompts).
-- ~~Cut the review counter, the start choice, Previous Claude, `hyperbeam review|audit|back`~~ Done (decision cut-review-start-choice): the manager asks for reviews and audits as worker tasks; `docs/reviews/` stays as history.
+- ~~Cut the review counter, the start choice, Previous Claude, `hyperbeam review|audit|back`~~ Done (decision cut-review-start-choice): the manager asks for reviews and audits as worker tasks.
 - ~~Cut what follows a Merge (Fresh/Review/Keep) and Done's digest, review and wrap-up offers~~ Done (decision cut-merge-and-done-extras): the manager does that job.
 - ~~Sonnet as the default model; manager workers (`work`, `wait`, `close`, reports)~~ Done (PR #57, decision sonnet-default-and-manager-workers).
 - ~~Lab refuses nesting itself, the guard stops guessing; `hyperbeam shot --dir`~~ Done (PR #53, decision lab-refuses-nesting, which collapses lab-setup-is-the-users).

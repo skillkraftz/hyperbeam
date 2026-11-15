@@ -112,18 +112,6 @@ def lab_sudo(*args):
     return ["sudo", "-n", "-H", "-u", LAB_USER, *args]
 
 
-def lab_pids():
-    """Pids of processes owned by hblab (chosen by owner, so nothing of the user's can be in the list)."""
-    uid, out = pwd.getpwnam(LAB_USER).pw_uid, []
-    for p in Path("/proc").iterdir():
-        try:
-            if p.name.isdigit() and p.stat().st_uid == uid:
-                out.append(int(p.name))
-        except OSError:
-            pass
-    return out
-
-
 def lab_xvfb():
     """Make sure the lab's virtual display (Xvfb on :99, run as hblab, no network) is up. False if Xvfb isn't installed."""
     sock = Path("/tmp/.X11-unix/X99")
