@@ -45,6 +45,7 @@ class InstallSh(unittest.TestCase):
         lib = self.t / "lib/hyperbeam"
         self.assertEqual(os.readlink(self.t / "bin/hyperbeam"), str(lib / "hyperbeam"))
         self.assertEqual(os.readlink(self.t / "tmux/hyperbeam.conf"), str(lib / "hyperbeam.conf"))
+        self.assertEqual(os.readlink(self.t / "bin/kk"), str(lib / "hyperbeam"))
         self.assertIn(f"exec /usr/bin/python3 {lib}/guard.py", self.settings.read_text())
         self.assertEqual(subprocess.run(["git", "-C", str(lib), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip(), "main")
 
