@@ -1,7 +1,7 @@
 ---
 id: 2026-11-15-cut-merge-and-done-extras
 status: implemented
-prs: []
+prs: [59]
 topic: work-loop
 supersedes: [2026-11-12-work-loop-start-and-end]
 ---
