@@ -28,7 +28,7 @@ class InstalledRule(unittest.TestCase):
     def blocked(self, cwd, cmd, g=None):
         g = g or self.g
         g.CWD = str(cwd)
-        return g.runs_worktree_script(cmd)
+        return "worktree-script-outside-lab" in [n for n, _ in g.violations(cmd)]
 
     def test_the_dev_folders_script_is_blocked(self):
         for cmd in ("./hyperbeam list", "uv run --script hyperbeam update", "python3 hyperbeam list", f"{self.dev}/hyperbeam list"):
@@ -119,6 +119,45 @@ class LabRules(unittest.TestCase):
         for msg in (hb.LAB_NESTED, hb.LAB_SETUP, hb.LAB_USERS_OWN):
             self.assertNotIn("sudo bash", msg)
             self.assertNotIn("run lab/setup.sh", msg)
+
+
+class TextIsData(unittest.TestCase):
+    """Words inside heredocs and quoted strings are text, not commands; the real thing is still blocked, wherever it hides."""
+    @classmethod
+    def setUpClass(cls):
+        cls.g = load("guard_text", "guard.py")
+        cls.g.CWD = "/tmp"
+
+    def setUp(self):
+        self.saved = {k: os.environ.get(k) for k in ("WAYLAND_DISPLAY", "DISPLAY")}
+        os.environ["WAYLAND_DISPLAY"], os.environ["DISPLAY"] = "wayland-0", ":0"
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def blocked(self, cmd):
+        return self.g.check(cmd) is not None
+
+    def test_mentions_pass(self):
+        for cmd in ("python3 - <<EOF\nopen('n.md','w').write('terminal recordings: kitty, pkill -f x, tmux kill-server')\nEOF",
+                    "cat > n.md <<'EOF'\nkitty\nkill 1\ntmux kill-server\nEOF\ngit add n.md",
+                    "echo 'start kitty then kill 1 and tmux kill-server'",
+                    'git commit -m "stop using pkill -f; never run tmux kill-server or kitty"',
+                    "gh pr create --title 'kill kitty' --body 'sudo reboot'",
+                    "grep -n kitty guard.py", "git log --grep=pkill"):
+            self.assertFalse(self.blocked(cmd), cmd)
+
+    def test_the_real_thing_is_blocked(self):
+        for cmd in ("kill 1", "pkill -f foo", "killall tmux", "echo hi && kill -9 5", "ls | xargs kill", "bash -c 'kill 1'", 'echo "$(kill 1)"',
+                    "tmux kill-server", "tmux kill-session -t x", "kitty", "env FOO=1 kitty --class x", "nohup firefox &", "xdg-open http://x",
+                    "gio open x", "sudo apt install x", "bash lab/setup.sh", "hyperbeam lab reset", "git worktree remove --force x", "cd /tmp; kill 1"):
+            self.assertTrue(self.blocked(cmd), cmd)
+
+    def test_other_servers_headless_and_the_lab_pass(self):
+        for cmd in ("tmux -L hb-test kill-server", "tmux -S /tmp/x/sock kill-session -t a", "env -u WAYLAND_DISPLAY -u DISPLAY kitty",
+                    "hyperbeam lab run --why x -- pkill -f foo", "hyperbeam lab run -- bash -c 'tmux kill-server; kill 1'"):
+            self.assertFalse(self.blocked(cmd), cmd)
 
 
 if __name__ == "__main__":
