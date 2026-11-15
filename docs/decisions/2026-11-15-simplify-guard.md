@@ -1,7 +1,7 @@
 ---
 id: 2026-11-15-simplify-guard
 status: implemented
-prs: []
+prs: [64]
 topic: guard
 ---
 # The guard parses commands instead of matching words
