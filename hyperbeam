@@ -593,17 +593,27 @@ def claude_cmd(prompt_file=None, cont=False, add_dir=False):
 
 def manager_cmd(cont=False):
     """The manager's Claude: the manager_model, never plan mode, never skip-permissions (the folder's settings deny edits under ~/projects), all of ~/projects readable.
+    The role (manager/CLAUDE.md of the running hyperbeam, the installed copy) is read at every start with --append-system-prompt-file, so Merge + update changes it.
     cont: continue the last conversation in ~/manager, a fresh one if there is none."""
-    base = f"claude --model {cfg_get('manager_model')} --effort {cfg_get('claude_effort')}"
+    role = shlex.quote(str(HERE / "manager" / "CLAUDE.md"))
+    base = f"claude --model {cfg_get('manager_model')} --effort {cfg_get('claude_effort')} --append-system-prompt-file {role}"
     tail = f" --add-dir {shlex.quote(str(ROOT))}"
     return f"{base} --continue{tail} || {base}{tail}" if cont else f"{base}{tail}"
 
 
 def ensure_manager_dir():
-    """~/manager, the manager's notes: a git repo made from the template in the repo (manager/) the first time; files that exist are never overwritten."""
+    """~/manager, the manager's notes: a git repo made from the template in the repo (manager/) the first time; files that exist are never overwritten.
+    The role (manager/CLAUDE.md) is not copied: it comes from the installed hyperbeam at every start (manager_cmd). Migration: a ~/manager/CLAUDE.md that is a
+    full copy of the role (it starts with the role's first line) is removed; one the user wrote is left alone. The notes are never touched."""
     d = MANAGER_DIR
     tpl = HERE / "manager"
+    role = tpl / "CLAUDE.md"
+    old = d / "CLAUDE.md"
+    if old.is_file() and role.is_file() and old.read_text().splitlines()[:1] == role.read_text().splitlines()[:1]:
+        old.unlink()
     for src in sorted(tpl.rglob("*")):
+        if src == role:
+            continue
         dst = d / src.relative_to(tpl)
         if src.is_dir():
             dst.mkdir(parents=True, exist_ok=True)
