@@ -44,3 +44,4 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - ~~Lab nesting and setup guard: no lab inside the lab, setup scripts and sudo are the user's, error messages state facts~~ Done (PR #46, decision lab-setup-is-the-users).
 - ~~Lab digest ranks by total time (count x duration) so frequent work bubbles up~~ Done (PR #47, decision digest-ranks-by-total-time).
 - ~~Review pass after N merged PRs, review records~~ Done (PRs #42, #43, #44; decisions review-pass, review-fresh-claude).
+- ~~README with recordings of the loop~~ Done (task 9 of the 2026-11-15 audit): README rewritten for the manager/worker flow; `tools/demo` regenerates `docs/img/` (loop.gif and PNGs, fake projects and fake claude, in the lab, drawn with pyte and Pillow instead of asciinema/agg).

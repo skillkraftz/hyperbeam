@@ -1,0 +1,265 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = ["pyte", "pillow"]
+# ///
+"""demo: regenerates the README's pictures (docs/img/) from a fake loop, in the lab. Two throwaway git projects (no remote, never pushed), a fake `claude`
+that prints a short run and exits through the Stop hook's own steps, the real sidebar and the real `hyperbeam work|wait|close`, drawn with pyte and Pillow
+into loop.gif and a few PNGs. Run it from the repo root:  hyperbeam tool demo  is NOT enough (it needs the whole repo), use
+    hyperbeam lab run --dir ~/projects/hyperbeam --collect /srv/hblab/demo-out -- tools/demo/demo --out /srv/hblab/demo-out
+then copy the collected files into docs/img/ (tools/demo/regen does both).   demo --selftest  checks the renderer only (the tool's test)."""
+import argparse, fcntl, hashlib, os, pty, select, shutil, struct, subprocess, sys, tempfile, termios, time
+from pathlib import Path
+import pyte
+from PIL import Image, ImageDraw, ImageFont
+
+ANSI = {"black": (0, 0, 0), "red": (205, 49, 49), "green": (13, 188, 121), "brown": (229, 229, 16), "yellow": (229, 229, 16), "blue": (36, 114, 200),
+        "magenta": (188, 63, 188), "cyan": (17, 168, 205), "white": (204, 204, 204), "brightblack": (102, 102, 102), "brightred": (241, 76, 76),
+        "brightgreen": (35, 209, 139), "brightbrown": (245, 245, 67), "brightyellow": (245, 245, 67), "brightblue": (59, 142, 234),
+        "brightmagenta": (214, 112, 214), "brightcyan": (41, 184, 219), "brightwhite": (255, 255, 255)}
+BG, FG = (30, 30, 30), (204, 204, 204)
+FDIR = "/usr/share/fonts/truetype/dejavu/"
+FONT, BOLD = ImageFont.truetype(FDIR + "DejaVuSansMono.ttf", 15), ImageFont.truetype(FDIR + "DejaVuSansMono-Bold.ttf", 15)
+CW, CH, PAD, TOP = int(FONT.getlength("M")), 19, 8, 26
+
+
+def rgb(name, default):
+    if name in (None, "default"):
+        return default
+    if name in ANSI:
+        return ANSI[name]
+    try:
+        return tuple(int(name[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return default
+
+
+class Scr(pyte.Screen):
+    def report_device_status(self, *a, **k): pass
+    def report_device_attributes(self, *a, **k): pass
+
+
+class Term:
+    """A command in a pty, read into a pyte screen."""
+    def __init__(self, argv, env, cols, rows):
+        self.scr, self.cols, self.rows = Scr(cols, rows), cols, rows
+        self.stream = pyte.ByteStream(self.scr)
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execvpe(argv[0], argv, env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def feed(self):
+        try:
+            d = os.read(self.fd, 65536)
+        except OSError:
+            return
+        self.stream.feed(d)
+
+    def write(self, s):
+        os.write(self.fd, s.encode() if isinstance(s, str) else s)
+
+    def text(self):
+        return "\n".join(self.scr.display)
+
+
+def draw(scrs, caption):
+    """Screens side by side (a divider between), a caption strip on top. -> a PIL image."""
+    w = sum(s.columns for s in scrs) * CW + (len(scrs) - 1) * 8 + 2 * PAD
+    h = max(s.lines for s in scrs) * CH + 2 * PAD + TOP
+    img = Image.new("RGB", (w, h), (12, 12, 12))
+    d = ImageDraw.Draw(img)
+    d.text((PAD, 4), caption, font=FONT, fill=(170, 170, 170))
+    x0 = PAD
+    for i, s in enumerate(scrs):
+        d.rectangle([x0 - 1, TOP + PAD - 1, x0 + s.columns * CW, TOP + PAD + s.lines * CH], fill=BG, outline=(70, 70, 70))
+        for y in range(s.lines):
+            row = s.buffer[y]
+            for x in range(s.columns):
+                c = row[x]
+                fg, bg = rgb(c.fg, FG), rgb(c.bg, BG)
+                if c.reverse:
+                    fg, bg = bg, fg
+                px, py = x0 + x * CW, TOP + PAD + y * CH
+                if bg != BG:
+                    d.rectangle([px, py, px + CW - 1, py + CH - 1], fill=bg)
+                if c.data.strip():
+                    d.text((px, py), c.data, font=BOLD if c.bold else FONT, fill=fg)
+        if i == len(scrs) - 1 and not s.cursor.hidden:
+            px, py = x0 + s.cursor.x * CW, TOP + PAD + s.cursor.y * CH
+            d.rectangle([px, py + CH - 3, px + CW - 1, py + CH - 1], fill=(200, 200, 200))
+        x0 += s.columns * CW + 8
+    return img
+
+
+class Recorder:
+    """Pumps the terminals; every time a screen changed, a frame is kept (with how long it was shown)."""
+    def __init__(self, terms):
+        self.terms, self.frames, self.caption, self.last = terms, [], "", None
+        self.dirty = True
+
+    def pump(self, secs):
+        end = time.time() + secs
+        while time.time() < end:
+            r = select.select([t.fd for t in self.terms], [], [], 0.1)[0]
+            for t in self.terms:
+                if t.fd in r:
+                    t.feed()
+            self.snap()
+
+    def snap(self, force=False):
+        if not force and not any(t.scr.dirty for t in self.terms) and not self.dirty:
+            return
+        for t in self.terms:
+            t.scr.dirty.clear()
+        self.dirty = False
+        now = time.time()
+        if self.frames:
+            self.frames[-1][1] = now - self.last
+        self.last = now
+        self.frames.append([draw([t.scr for t in self.terms], self.caption), 0.0])
+
+    def still(self, path):
+        self.pump(0.3)
+        self.snap(True)
+        self.frames[-1][0].save(path)
+
+    def gif(self, path, cap=1.6):
+        if self.frames:
+            self.frames[-1][1] = 2.5
+        fr = [(f.convert("P", palette=Image.ADAPTIVE, colors=32), max(0.06, min(cap, d))) for f, d in self.frames]
+        fr[0][0].save(path, save_all=True, append_images=[f for f, _ in fr[1:]], duration=[int(d * 1000) for _, d in fr], loop=0, optimize=True)
+
+
+def selftest():
+    scr = Scr(30, 5)
+    pyte.ByteStream(scr).feed(b"\x1b[32mgreen\x1b[0m and \x1b[1mbold\x1b[0m\r\n$ ")
+    out = Path(tempfile.mkdtemp())
+    rec = Recorder([Term(["true"], dict(os.environ), 20, 3)])
+    rec.terms.append(Term(["true"], dict(os.environ), 20, 3))
+    rec.terms[0].scr = scr
+    rec.caption = "selftest"
+    rec.snap(True)
+    rec.terms[0].scr.draw("more")
+    rec.snap(True)
+    rec.gif(out / "t.gif")
+    rec.still(out / "t.png")
+    assert (out / "t.gif").read_bytes()[:6] == b"GIF89a" and (out / "t.png").read_bytes()[1:4] == b"PNG"
+    print("PASS demo renderer")
+    return 0
+
+
+FAKE_CLAUDE = r'''#!/bin/bash
+# A fake claude. As the user's Claude: idle. As a worker (HB_WORKER=1): a short believable run, one commit, then what the Stop hook does.
+[ -n "$HB_WORKER" ] || exec -a claude sleep 900
+nap() { sleep "$1"; }
+case "$HB_PROJECT" in
+  notes-app) file=search.js; msg="Add a search box to the notes list"; branch=search-box
+    steps=("Read src/notes.js and the list view" "Add a search box that filters the list as you type" "Run the tests: 4 passed") ;;
+  *) file=recipes.py; msg="Return 404 for a missing recipe"; branch=missing-recipe
+    steps=("Read the recipe route and its tests" "Return a 404 with a message instead of a 500" "Run the tests: 6 passed") ;;
+esac
+echo "● $HB_PROJECT worker: $msg"
+git checkout -q -b "$branch"
+for s in "${steps[@]}"; do nap 2; echo "  ⎿ $s"; done
+echo "// $msg" > "$file"; git add "$file"; git -c user.name=demo -c user.email=demo@example.com commit -q -m "$msg"
+nap 1; echo "● Done. Branch $branch, PR opened."
+echo "waiting finished responding" > "$HB_STATE/claude"
+printf '{"last_assistant_message": "%s. Tests pass (see the run above). Branch %s, PR https://github.com/example/%s/pull/7", "transcript_path": "~/.claude/projects/%s/transcript.jsonl"}' \
+  "$msg" "$branch" "$HB_PROJECT" "$HB_PROJECT" | @HB@ _worker-report
+exec -a claude sleep 900
+'''
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="demo-out")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    here = Path(__file__).resolve().parents[2] / "hyperbeam"
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    base = Path("/tmp/demo")
+    shutil.rmtree(base, ignore_errors=True)
+    root, man, data, binp, tasks = (base / x for x in ("proj", "man", "share", "bin", "tasks"))
+    for d in (root, man, binp, tasks):
+        d.mkdir(parents=True)
+    (binp / "claude").write_text(FAKE_CLAUDE.replace("@HB@", str(binp / "hyperbeam")))
+    (binp / "hyperbeam").write_text(f'#!/bin/bash\nexec uv run --quiet --script {here} "$@"\n')
+    for f in binp.iterdir():
+        f.chmod(0o755)
+    (base / "cfg.toml").write_text(f'projects_dir = "{root}"\nopen_mode = "sidebar"\nmenu_width = 35\n')
+    for name, port in (("notes-app", 3101), ("recipe-api", 3102)):
+        pd = root / name
+        subprocess.run(["git", "init", "-q", "-b", "main", str(pd)], check=True)
+        subprocess.run(["git", "-c", "user.name=demo", "-c", "user.email=demo@example.com", "-C", str(pd), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        (man / f"{name}.toml").write_text(f'path = "{pd}"\nport = {port}\n')
+    (tasks / "search-box.md").write_text("# Add a search box to the notes list\nFilter the list as you type.\n")
+    (tasks / "missing-recipe.md").write_text("# Return 404 for a missing recipe\nNow it is a 500.\n")
+    env = dict(os.environ, PATH=f"{binp}:" + os.environ["PATH"], HB_CONFIG=str(base / "cfg.toml"), HB_MANIFESTS=str(man), XDG_DATA_HOME=str(data),
+               XDG_CONFIG_HOME=str(base / "cfgdir"), TERM="xterm-256color", HB_SIDEBAR="1", PS1="$ ", HOME=str(base / "home"))
+    (base / "home").mkdir()
+    for k in ("TMUX", "TMUX_PANE", "HB_PROJECT", "WAYLAND_DISPLAY", "DISPLAY"):
+        env.pop(k, None)
+    me = ["uv", "run", "--quiet", "--script", str(here)]
+    subprocess.run(["tmux", "new-session", "-d", "-s", "manager", "-n", "home", str(binp / "claude")], env=env, check=True)
+    menu = Term([*me, "_menu"], env, 35, 24)
+    shell = Term(["bash", "--norc", "--noprofile", "-i"], dict(env, PS1="$ "), 82, 24)
+    rec = Recorder([menu, shell])
+
+    def prompt_ready():
+        lines = [l.rstrip() for l in shell.scr.display]
+        cy = shell.scr.cursor.y
+        return lines[cy].endswith("$") and not shell.scr.cursor.hidden
+
+    def run(cmd, wait=60, settle=0.8):
+        rec.pump(0.5)
+        for i in range(0, len(cmd), 3):
+            shell.write(cmd[i:i + 3])
+            rec.pump(0.07)
+        rec.pump(0.4)
+        shell.write("\r")
+        rec.pump(0.5)
+        end = time.time() + wait
+        while time.time() < end and not prompt_ready():
+            rec.pump(0.3)
+        rec.pump(settle)
+
+    def clear():
+        shell.write("\x0c")
+        rec.pump(0.4)
+
+    rec.caption = "hyperbeam: the sidebar. The manager on top, one row per project"
+    shell.write("cd /tmp/demo && clear\r")
+    t0 = time.time()
+    while time.time() - t0 < 90 and not ("notes-app" in menu.text() and "recipe-api" in menu.text()):
+        rec.pump(0.5)
+    rec.pump(5)
+    rec.still(out / "sidebar.png")
+    rec.pump(1.5)
+    rec.caption = "The manager sends each piece of work to a project's own Claude"
+    run("hyperbeam work notes-app tasks/search-box.md")
+    run("hyperbeam work recipe-api tasks/missing-recipe.md")
+    rec.pump(5)
+    rec.still(out / "workers.png")
+    clear()
+    rec.caption = "hyperbeam wait returns when both workers have finished"
+    run("hyperbeam wait notes-app recipe-api", wait=120, settle=1.5)
+    rec.still(out / "wait.png")
+    clear()
+    rec.caption = "Each worker leaves a short report"
+    run("cat share/hyperbeam/projects/notes-app-*/reports/*.md", settle=3)
+    rec.still(out / "report.png")
+    clear()
+    rec.caption = "close ends the worker; the report stays"
+    run("hyperbeam close notes-app")
+    run("hyperbeam close recipe-api", settle=3)
+    rec.gif(out / "loop.gif")
+    menu.write("q")
+    print(f"demo: {out}/loop.gif ({len(rec.frames)} frames), sidebar.png workers.png wait.png report.png")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

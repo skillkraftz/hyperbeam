@@ -1,0 +1,9 @@
+#!/bin/bash
+# Regenerates docs/img/ (loop.gif and the PNGs the README shows): the fake loop runs in the lab, the files are collected and copied here.
+set -euo pipefail
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+hyperbeam lab run --dir "$repo" --why "README demo" --collect /srv/hblab/demo-out --timeout 400 -- tools/demo/demo --out /srv/hblab/demo-out
+latest=$(ls -dt ~/.cache/hyperbeam-shots/*/ | head -1)
+mkdir -p "$repo/docs/img"
+cp "$latest"/*.gif "$latest"/*.png "$repo/docs/img/"
+ls -l "$repo/docs/img"
