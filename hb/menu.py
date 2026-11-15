@@ -154,7 +154,6 @@ class Choice(ModalScreen):
         self.dismiss(event.button.id[2:])
 
 
-ORANGE = "#ff9f43"
 DOT = {"green": "green", "red": "red", "blue": "dodger_blue1", "cyan": "cyan"}
 
 
@@ -493,7 +492,7 @@ class Menu(App):
         if recheck_all:
             for r in rows:
                 if r["running"]:
-                    recheck(r["name"], manifest_path(mans[r["name"]]) if r["name"] in mans else r["path"])
+                    recheck(r["name"], known_path(r["name"]))
         return {r["name"]: project_status(r["name"], mans.get(r["name"])) for r in rows if r["running"]}
 
     def apply(self, rows, status):
@@ -640,7 +639,7 @@ class Menu(App):
 
     def check_action(self, action, parameters):
         """The Menu's keys do nothing while any other screen (Settings, a question) is up."""
-        if action in ("open", "stop", "done", "settings", "update", "hide", "context", "report", "merge", "info", "project", "more", "keys", "edit_manifest", "mark_onboarded", "back", "install", "test", "version", "help_verbs", "refresh", "quit") and len(self.screen_stack) > 1:
+        if action in ("open", "stop", "done", "settings", "update", "hide", "context", "report", "merge", "info", "project", "more", "keys", "edit_manifest", "mark_onboarded", "install", "test", "version", "help_verbs", "refresh", "quit") and len(self.screen_stack) > 1:
             return False
         return True
 

@@ -1,6 +1,7 @@
 ---
 id: 2026-11-11-lab-digest-and-tools-copy-report
-status: implemented
+status: superseded
+collapsed_into: [2026-11-15-cut-merge-and-done-extras, 2026-11-12-tools-go-for-real-work-a]
 prs: [23]
 topic: tools
 ---

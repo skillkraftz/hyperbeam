@@ -401,7 +401,7 @@ def cmd_open(args):
     man = load_manifests().get(args.name)
     if row is None and man is None and sess != MENU:
         sys.exit(f"hyperbeam: no project called {args.name} (try `hyperbeam scan`)")
-    path = manifest_path(man) if man else (row["path"] if row else HERE)
+    path = known_path(args.name) if (man or row) else HERE
     open_project(args.name, path, man, ask_tty, print)
     touch_opened(args.name)
     if not args.detach:

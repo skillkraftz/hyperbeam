@@ -64,7 +64,7 @@ def cmd_work(a):
         sys.exit(f"hyperbeam work: {name} already has a worker ({wsess}): one worker per project, because it edits the folder the services run from. "
                  f"`hyperbeam wait {name}` waits for it, `hyperbeam close {name}` ends it.")
     man = load_manifests().get(name)
-    path = manifest_path(man) if man else known_path(name)
+    path = known_path(name)
     if not path.is_dir():
         sys.exit(f"hyperbeam work: {path} does not exist")
     findings, notes = start_check(name, path)

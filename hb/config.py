@@ -118,10 +118,6 @@ def open_mode():
     return cfg_get("open_mode")
 
 
-def set_open_mode(mode):
-    set_config("open_mode", mode)
-
-
 def run(*a):
     r = subprocess.run(a, capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""

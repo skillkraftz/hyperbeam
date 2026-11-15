@@ -3,7 +3,7 @@ id: 2026-11-15-no-automatic-prompts
 status: implemented
 prs: []
 topic: work-loop
-supersedes: []
+supersedes: [2026-11-09-beam-in-beam-out-saved-layouts, 2026-11-11-loud-problems-red-only-when-rare]
 ---
 # hyperbeam never sends Claude a prompt by itself
 

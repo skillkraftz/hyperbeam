@@ -18,7 +18,7 @@ The workflow started work by itself and fed on itself: the last 8 PRs were mostl
 - The sidebar's Test button probably crashes (`cmd_lab` writes to `sys.stdout.buffer`, absent inside Textual).
 - `~/.local/bin/kk` points at the dev folder's script, so sessions run dev code as the user.
 - `guard.py`: 7 ways of parsing a command, rules in 5 places, kill checked 3 times. The lab already refuses most of what it blocks.
-- Docs repeat and disagree (Docker in the lab, the guard's rules, settings, when a dot is red). INVENTORY.md and SESSION are leftovers.
+- Docs repeat and disagree (Docker in the lab, the guard's rules, settings, when a dot is red).
 - 6.6k-line script: old migrations, unused functions, 6 ways to find a project's path.
 
 ## A first draft of "what each piece is" (to argue with, not approved)
