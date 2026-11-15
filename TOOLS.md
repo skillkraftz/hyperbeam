@@ -11,3 +11,4 @@ A tool lives in `tools/<name>/<name>` with `tools/<name>/test`. New ones come fr
 ## Tools
 - **decisions** - `hyperbeam tool decisions list|check|index` - reads docs/decisions/ (one file per decision): the implemented ones, a consistency check (status, supersedes, collapsed_into), the generated docs/DECISIONS.md index (Go)
 - **test-timing** - `hyperbeam tool test-timing "npx vitest run --maxWorkers=1" "npx vitest run"` - timing test runs by hand: prints wall time, average cores busy and exit code per command, so a suite stuck on 1 core of 20 shows at once (Go)
+- **demo** - `bash tools/demo/regen` - regenerates the README's pictures (docs/img/): a fake loop (two throwaway projects, a fake claude) run in the lab and drawn with pyte and Pillow; `demo --selftest` is its test, the full run needs the whole repo (`lab run --dir`)

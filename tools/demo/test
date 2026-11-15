@@ -1,0 +1,5 @@
+#!/bin/bash
+# demo's test: the renderer makes a GIF and a PNG from pyte screens (the full run needs the whole repo: see the header of demo).
+set -euo pipefail
+cd "$(dirname "$0")"
+./demo --selftest

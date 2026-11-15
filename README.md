@@ -1,21 +1,54 @@
 # hyperbeam
 
-hyperbeam is a personal "senior engineer" for many AI-assisted prototype projects on one Linux laptop. One hotkey opens a sidebar of every project in ~/projects; each opens as a tmux session with Claude Code, a shell and its services, ready to work at the laptop (and later from the phone over Tailscale).
+A personal "senior engineer" for many AI-assisted prototype projects on one Linux laptop (Ubuntu, GNOME/Wayland, kitty, tmux, Claude Code).
 
-**Why.** AI-assisted prototypes drift. Docs stop matching code, PRs pile up, decisions live in old chats, tests break live work, and tokens run out. hyperbeam keeps every project aligned to one set of rules (RULES.md), keeps each project's memory in its repo (CLAUDE.md, docs/DECISIONS.md), runs all agent testing in an isolated lab, shows problems with status dots, and turns the daily loop (prompt, PR, review, merge) into a few clicks.
+![The loop: sidebar, work, wait, report, close](docs/img/loop.gif)
 
-**Goals, in order.** Smooth work at the laptop; fewer tokens (Opus plans and Sonnet builds in one session; cheap scripts before Claude; repeated lab work becomes tools); a system that gets better the more it is used; then the phone; then a polish phase (refactor, README, demos).
+*A recording of the loop with two throwaway projects and a fake Claude (`tools/demo/`, made in the lab).*
 
-## Using it
-- **Hotkey** (Ctrl+Alt+H, runs `hyperbeam`): opens the sidebar window, the project menu on the left, the selected project's tmux session on the right. Over SSH or inside tmux, `hyperbeam` attaches to the menu in tmux instead.
-- **The manager** is the first row: a Claude on Opus to talk with about all your projects (a conversation, read-only on the projects). Its role ships with hyperbeam; its notes are in `~/manager`. After you agree a piece of work it sends it to a project as a worker: `hyperbeam work NAME FILE` (a fresh Claude in session `claude-NAME`, marked `»` on the row), `hyperbeam wait NAME` (returns with the path of its report), `hyperbeam close NAME`. hyperbeam never starts Claude work by itself. Project Claudes run on Sonnet (`opusplan` is a choice in Settings).
-- **Projects:** click a row to select it, double-click (or Enter) to open it: the session starts with Claude Code (it continues its last conversation), a shell and the services from its manifest (`projects/<name>.toml`). Stop on a project sends the right side back to the manager.
-- **Dots:** green = running, blue = Claude waits for you, cyan = Claude is working, red = rare and real (a service is down, secrets in unpushed commits, a stuck merge). Quieter things (uncommitted work, setup changed, stale docs) are notes, never red. A magenta branch = you have an open PR.
-- **Buttons:** Open, Stop, Done (wrap-up check, then stops the clean sessions and closes the sidebar; never a project whose Claude is working or waiting), Update (the selected project's `update`), Merge (only with an open PR: merges all of them oldest first, then updates the project), More (the Project screen: Install, Test in the lab, Version, Help, Copy context, Copy report, Edit manifest, Settings, Keys, Hide). The title line shows your 5-hour limit the way claude.ai does; `hyperbeam usage` has the weekly one.
-- **Same verbs everywhere:** `hyperbeam NAME update` (also `install`, `test`, `version`, `help`, `restart`) works for every project, and inside its session just `NAME update` or `hb update`. `hyperbeam new NAME --cli|--web` starts a project that already has them.
-- **`kk`** (`hyperbeam info`): the project's URLs and endpoints (services, ports, Tailscale, Docker, Supabase, open PRs).
-- **Keys inside tmux:** `M-h` back to the manager, `M-[` and `M-]` previous and next session, `M-y` copy the Claude conversation (or the pane's scrollback), `M-s` hide or show the sidebar, `M-arrows` select a pane, `M-z` zoom. Shift+Tab is Claude Code's plan mode.
-- **The lab:** all agent testing runs there, as the separate user `hblab`: `hyperbeam lab run --why "unit tests" -- npm test`. Set it up once with `sudo bash lab/setup.sh`; then `hyperbeam lab status`, `lab stop`, `lab log --today`.
-- **Install:** `bash install.sh` installs hyperbeam to `~/.local/lib/hyperbeam` (kept current by `hyperbeam update` and Merge) and links `hyperbeam`, `kk` and the tmux conf to it; you work on hyperbeam in `~/projects/hyperbeam` on branches like any other project.
+## The problem
+Prototypes built with AI pile up: a dozen projects, each with its own long Claude conversation. Long conversations drown in their own context, re-read it on every
+turn and eat the usage limit (12 hyperbeam sessions re-read about 874M cached tokens). Docs stop matching the code, decisions live in old chats, and a test run
+can break something live.
 
-Roadmap: IDEAS.md. How it fits together: docs/SYSTEM.md; details: docs/REFERENCE.md; why: docs/decisions/. The rules every project follows: RULES.md; how this repo works: CLAUDE.md.
+## How hyperbeam solves it
+- **A manager to plan with.** The first row of the sidebar is a Claude on Opus. You talk with it about what to work on, across all projects. It is read-only on the projects.
+- **A fresh worker per task.** After you say yes, the manager sends the piece of work to the project's own Claude as a worker (`hyperbeam work`), waits (`hyperbeam wait`),
+  reads the short report and closes the worker (`hyperbeam close`). The context never grows: each task starts clean. hyperbeam never starts Claude work by itself.
+- **A short report** per task: the task, Claude's final message, branch, commits, PR, and a link to the full transcript for when you need the long form.
+- **A session per project:** one tmux session with Claude Code, a shell, the services (started in order, on a fixed port) and logs. The sidebar shows status dots (running,
+  Claude working or waiting, PR open) and `»` on a project with a worker. The phone attaches to the same sessions over SSH (Tailscale).
+- **The lab.** All agent testing runs as a separate user (`hyperbeam lab run ...`), so tests and test servers can't touch your live sessions.
+- **The same verbs everywhere:** `install`, `update`, `test`, `version`, `help`, `restart`, for every project, plus **Merge** (merges a project's open PRs oldest first, then updates it).
+- **One set of rules** (RULES.md) every project follows, and memory in the repo (CLAUDE.md, `docs/decisions/`).
+
+![The sidebar](docs/img/sidebar.png)
+![Two workers running](docs/img/workers.png)
+
+## Install
+```
+git clone https://github.com/skillkraftz/hyperbeam ~/projects/hyperbeam
+cd ~/projects/hyperbeam && bash install.sh
+sudo bash lab/setup.sh     # once, for the lab
+```
+`install.sh` puts the app in `~/.local/lib/hyperbeam` (kept current by `hyperbeam update` and Merge) and links `hyperbeam`, `kk` and a tmux conf to it. You work on
+hyperbeam itself in `~/projects/hyperbeam`, on branches, like any project.
+
+## The commands that matter
+| | |
+|---|---|
+| `hyperbeam` (Ctrl+Alt+H) | the sidebar: click a row, double-click to open its session |
+| `hyperbeam work NAME FILE` / `wait NAME` / `close NAME` | the manager's loop: start a worker, wait for its report, end it |
+| `hyperbeam NAME update` (also `install`, `test`, `version`, `help`, `restart`) | the same verbs for every project |
+| `kk` (`hyperbeam info`) | a project's URLs: services, ports, Tailscale, open PRs |
+| `hyperbeam lab run --why TEXT -- COMMAND` | run anything test-like in the lab |
+| `hyperbeam new NAME --cli` or `--web` | a new project that already has the verbs |
+| `hyperbeam usage`, `hyperbeam list`, `hyperbeam phone` | limits, the project list, the phone link |
+
+![A worker's report](docs/img/report.png)
+
+## More
+Roadmap: [IDEAS.md](IDEAS.md) · the map: [docs/SYSTEM.md](docs/SYSTEM.md) · details: [docs/REFERENCE.md](docs/REFERENCE.md) · the why: [docs/decisions/](docs/decisions/) ·
+the rules: [RULES.md](RULES.md) · how this repo works: [CLAUDE.md](CLAUDE.md) · the sidebar's design: [docs/UI.md](docs/UI.md).
+
+Regenerate the pictures (in the lab): `bash tools/demo/regen`.
