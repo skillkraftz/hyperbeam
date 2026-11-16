@@ -73,7 +73,7 @@ class ProjectScreen(ModalScreen):
                     yield Static(clip(line, w), classes="pline", markup=False)          # cut with an ellipsis ourselves: a wrapped line would hide its tail in a 1-row Static
             with Container(id="pbuttons"):
                 for bid, label in [("update", "Update"), ("install", "Install"), ("test", "Test (lab)"), ("version", "Version"), ("help_verbs", "Help"),
-                                   ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy report"), ("info", "Info window"),
+                                   ("edit_manifest", "Edit manifest"), ("context", "Copy context"), ("report", "Copy last"), ("info", "Info window"),
                                    ("mark_onboarded", "Mark onboarded"), ("settings", "Settings"), ("keys", "Keys"), *([("hide", "Hide sidebar")] if os.environ.get("HB_SIDEBAR") else []),
                                    ("close", "Close")]:
                     b = Button(label, id=f"pb-{bid}")
@@ -233,7 +233,7 @@ class KeysScreen(ModalScreen):
         lines = ["Keys are shortcuts; every action also has a button.", "", "hyperbeam keys (no prefix)"]
         lines += [f"  {k}\n      {d}" for k, d in KEYS]
         lines += ["", "your tmux keys (prefix C-a)"] + [f"  {k}\n      {d}" for k, d in USER_KEYS]
-        lines += ["", "menu keys: o open, s stop, d done, u update, m merge PR, t settings, j project screen (More), c copy context, p copy report, h hide, r refresh, q quit"]
+        lines += ["", "menu keys: o open, s stop, d done, u update, m merge PR, t settings, j project screen (More), c copy context, p copy last, h hide, r refresh, q quit"]
         with Vertical():
             yield Static("Keys", id="ktitle")
             with VerticalScroll(id="ksheet"):
@@ -344,7 +344,7 @@ class Menu(App):
     #b-merge { background: $success 60%; text-style: bold; }
     """
     BINDINGS = [Binding("o", "open", "Open"), Binding("s", "stop", "Stop"), Binding("d", "done", "Done"), Binding("t", "settings", "Settings"), Binding("u", "update", "Update"), Binding("h", "hide", "Hide sidebar"),
-                Binding("c", "context", "Copy context"), Binding("p", "report", "Copy report"), Binding("m", "merge", "Merge PR"), Binding("i", "project", "Project"), Binding("j", "project", "Project"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
+                Binding("c", "context", "Copy context"), Binding("p", "report", "Copy last"), Binding("m", "merge", "Merge PR"), Binding("i", "project", "Project"), Binding("j", "project", "Project"), Binding("r", "refresh", "Refresh"), Binding("q", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
@@ -789,9 +789,9 @@ class Menu(App):
             remote = False if os.environ.get("HB_SIDEBAR") else client_is_remote(menu_client("client_pid") or "0")
             try:
                 text = report_text(name)
-                self.say_from_thread(f"{name}: report {deliver_text(text, name + '-report', remote)} - \"{first_line(text, 50)}\"")
+                self.say_from_thread(f"{name}: last message {deliver_text(text, name + '-last', remote)} - \"{first_line(text, 50)}\"")
             except Exception as e:
-                self.say_from_thread(f"{name}: no report: {e}")
+                self.say_from_thread(f"{name}: nothing to copy: {e}")
         self.run_worker(work, thread=True)
 
     def action_merge(self):
