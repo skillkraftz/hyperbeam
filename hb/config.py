@@ -8,7 +8,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, OptionList, Static, Tab, Tabs
+from textual.widgets import Button, OptionList, Static
 from textual.widgets.option_list import Option
 
 

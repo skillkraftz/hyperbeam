@@ -190,12 +190,12 @@ def cmd_shot_render(a):
     for name, port, branch, state, pr in fixtures:
         if state:
             subprocess.run([*uvrun, "open", name, "-d"], env=env, capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
-            pdata = data / "hyperbeam" / "projects" / f"{name}-{hashlib.sha1(str((root / name).resolve()).encode()).hexdigest()[:6]}"
+            pdata = data / "hyperbeam" / "projects" / project_dir_name(name, root / name)
             if state in ("working", "waiting"):
                 pdata.mkdir(parents=True, exist_ok=True)
                 (pdata / "claude").write_text("working\n" if state == "working" else "waiting finished responding\n")
         if pr:
-            pdata = data / "hyperbeam" / "projects" / f"{name}-{hashlib.sha1(str((root / name).resolve()).encode()).hexdigest()[:6]}"
+            pdata = data / "hyperbeam" / "projects" / project_dir_name(name, root / name)
             pdata.mkdir(parents=True, exist_ok=True)
             (pdata / "prs.json").write_text(json.dumps({"time": time.time(), "prs": [{"number": int(pr[0]), "title": pr[1], "url": "https://github.com/x/y/pull/" + pr[0], "branch": "feature"}], "error": ""}))
     (base / "task.md").write_text("# Add the week view\n")

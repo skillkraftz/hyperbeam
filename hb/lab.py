@@ -413,3 +413,219 @@ def cmd_tool(a):
     return cmd_lab(ns)
 
 
+
+
+def lab_ready():
+    """None if the lab works, else the reason it doesn't. States facts only: the lab's setup is the user's, no message tells anyone to run it."""
+    if os.environ.get("HB_LAB"):
+        return LAB_NESTED
+    try:
+        pwd.getpwnam(LAB_USER)
+    except KeyError:
+        return LAB_SETUP
+    if not os.path.ismount(LAB_HOME):
+        return f"The lab user exists but {LAB_HOME} is not mounted. {LAB_USERS_OWN}"
+    if subprocess.run(["sudo", "-n", "-u", LAB_USER, "true"], capture_output=True, stdin=subprocess.DEVNULL).returncode:
+        return f"`sudo -n -u {LAB_USER} true` failed from this process. If you are inside a lab run this is expected (no nesting); otherwise {LAB_USERS_OWN}"
+    return None
+
+
+def lab_sudo(*args):
+    return ["sudo", "-n", "-H", "-u", LAB_USER, *args]
+
+
+def lab_xvfb():
+    """Make sure the lab's virtual display (Xvfb on :99, run as hblab, no network) is up. False if Xvfb isn't installed."""
+    sock = Path("/tmp/.X11-unix/X99")
+    if sock.exists():
+        return True
+    if not shutil.which("Xvfb"):
+        return False
+    subprocess.run(lab_sudo("setsid", "-f", "sh", "-c", f"exec Xvfb {LAB_DISPLAY} -screen 0 1280x800x24 -nolisten tcp >{LAB_HOME}/xvfb.log 2>&1"),
+                   stdin=subprocess.DEVNULL, capture_output=True)
+    for _ in range(25):
+        if sock.exists():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+# podman and docker for lab runs (rootless podman, see docs/PODMAN.md). Ubuntu's AppArmor profile for pasta (podman's network helper) only lets it open
+# network namespaces under /tmp, so podman gets one runtime dir there, `/tmp/hblab-podman`, for all runs (podman records its runtime dir in its state, so a per-run dir breaks the second run). `docker` is a shim to a podman socket in that dir,
+# so `docker compose up` works unchanged and can never reach the user's real Docker.
+LAB_SHIM_PODMAN = """#!/bin/sh
+# hyperbeam-lab-shim v2: podman with a runtime dir under /tmp
+d=/tmp/hblab-podman
+mkdir -p -m 700 "$d"
+XDG_RUNTIME_DIR="$d" exec /usr/bin/podman "$@"
+"""
+LAB_SHIM_DOCKER = """#!/bin/sh
+# hyperbeam-lab-shim v2: docker through a podman socket
+d=/tmp/hblab-podman
+mkdir -p -m 700 "$d"
+if [ ! -S "$d/podman.sock" ]; then
+  (XDG_RUNTIME_DIR="$d" setsid /usr/bin/podman system service --time=0 "unix://$d/podman.sock" >/dev/null 2>&1 &)
+  i=0; while [ ! -S "$d/podman.sock" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done
+fi
+DOCKER_HOST="unix://$d/podman.sock" exec /usr/bin/docker "$@"
+"""
+
+
+def lab_ensure_shims():
+    """podman/docker shims in hblab's ~/.local/bin (first on PATH in a lab run); written once, only when podman is installed."""
+    if not shutil.which("podman"):
+        return
+    for name, body in (("podman", LAB_SHIM_PODMAN), ("docker", LAB_SHIM_DOCKER)):
+        f = f"{LAB_HOME}/.local/bin/{name}"
+        have = subprocess.run(lab_sudo("grep", "-qF", body.splitlines()[1], f), capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
+        if not have:
+            subprocess.run(lab_sudo("sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1" && chmod 755 "$1"', "_", f), input=body.encode(), capture_output=True)
+
+
+def cmd_lab(a):
+    """hyperbeam lab run|reset|status. The code goes in as a copy; everything runs as hblab (it can't signal the user's processes)."""
+    if a.action == "log":
+        return cmd_lab_log(a)
+    if a.action == "digest":
+        return cmd_lab_digest(a)
+    msg = lab_ready()
+    if msg:
+        print(msg)
+        return 2
+    if a.action == "status":
+        u = shutil.disk_usage(LAB_HOME)
+        img = Path("/var/lib/hyperbeam-lab.img")
+        print(f"lab: user {LAB_USER}, {LAB_HOME} mounted; disk {u.used / 2**30:.1f} of {u.total / 2**30:.1f} GB used"
+              + (f" (image file {img.stat().st_size / 2**30:.0f} GB)" if img.exists() else ""))
+        # /srv/hblab is hblab's (mode 750): list it as hblab, and say so instead of crashing if that fails
+        du = subprocess.run(lab_sudo("sh", "-c", f"cd {LAB_HOME} 2>/dev/null && du -sh projects/* cache/* 2>/dev/null"), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        rows = [l.split("\t") for l in du.stdout.splitlines() if "\t" in l]
+        print("synced projects: " + (", ".join(f"{n.split('/', 1)[1]} {sz}" for sz, n in rows if n.startswith("projects/")) or "none"))
+        print("caches: " + (", ".join(f"{n.split('/', 1)[1]} {sz}" for sz, n in rows if n.startswith("cache/")) or "none"))
+        print(f"virtual display {LAB_DISPLAY}: " + ("up" if Path("/tmp/.X11-unix/X99").exists() else "not running (starts with the next `lab run`)"))
+        runs = lab_runs()
+        print("active runs: " + ("none" if not runs else ""))
+        for r in runs:
+            print(f"  {r['project']:<16} {fmt_age(time.time() - r.get('start', time.time())):>8}  {r.get('why') or '(no why)'}  | {r.get('command', '')[:60]}  [{r['id']}]")
+        ps = subprocess.run(["ps", "-u", LAB_USER, "-o", "pid,etime,args"], capture_output=True, text=True).stdout.strip()
+        print("processes:\n" + (ps if len(ps.splitlines()) > 1 else "  none"))
+        return 0
+    if a.action == "stop":
+        name = a.project or lab_caller_project()
+        if not name:
+            print("hyperbeam lab stop: which project? Give a name (hyperbeam lab stop dotwork), or run it inside the project's folder.")
+            return 2
+        res = lab_py("stop", name)
+        if res is None:
+            print("hyperbeam lab stop: could not reach the lab")
+            return 1
+        print(f"lab stop {name}: " + (f"stopped {len(res['stopped'])} run(s) ({res['killed']} processes); other projects and the display were not touched" if res["stopped"] else "no active runs of this project"))
+        return 0
+    if a.action == "reset":
+        if not os.path.ismount(LAB_HOME):
+            print("refusing to wipe: the lab disk is not mounted")
+            return 1
+        mine = lab_caller_project()
+        others = [r for r in lab_runs() if r["project"] != mine]
+        if others and not a.force:
+            print("lab reset refused: other projects have runs going:\n" + "\n".join(
+                f"  {r['project']}  {fmt_age(time.time() - r.get('start', time.time()))}  {r.get('why') or '(no why)'}" for r in others) +
+                "\nReset would kill them. Stop only your own runs with `hyperbeam lab stop`. (The user can override with `lab reset --force`.)")
+            return 1
+        if a.force:                                          # the user only (the guard blocks agents): everything hblab runs, the display too
+            lab_py("killall")
+            subprocess.run(lab_sudo("rm", "-f", "/tmp/.X11-unix/X99", "/tmp/.X99-lock"), capture_output=True, stdin=subprocess.DEVNULL)
+        elif mine:
+            lab_py("stop", mine)
+        lab_py("clean")
+        if a.all:
+            subprocess.run(lab_sudo("sh", "-c", f"find {LAB_HOME} -mindepth 1 -maxdepth 1 ! -name lost+found ! -name runs ! -name tmux ! -name rt -exec rm -rf -- {{}} +"),
+                           capture_output=True, stdin=subprocess.DEVNULL)
+        print("lab reset: " + ("everything hblab ran was stopped (forced), " if a.force else f"your runs ({mine or 'none'}) stopped, other projects' runs and the display left alone, ")
+              + ("synced projects and caches wiped" if a.all else "leftover run files removed; synced projects and caches kept (--all wipes them too)"))
+        return 0
+    explicit = a.cmd[:1] == ["--"]
+    cmd = a.cmd[1:] if explicit else a.cmd
+    if not cmd:
+        print(LAB_RUN_USAGE)
+        return 2
+    # Options go before the command (or before `--`). argparse hands everything after the command to it, so a misplaced option would run as part of the
+    # command. After `--` only the two names no real command uses are refused; a single-argument shell line is never scanned.
+    stray = [c for c in cmd[1:] if (c.split("=")[0] in ("--why", "--fresh", "--collect") or (not explicit and c.split("=")[0] in ("--timeout", "--dir", "--name")))] if len(cmd) > 1 else []
+    if stray:
+        i = cmd.index(stray[0], 1)
+        took = 2 if stray[0] != "--fresh" and "=" not in stray[0] and i + 1 < len(cmd) else 1       # the option and its value
+        opt = shlex.join(cmd[i:i + took])
+        print(f"hyperbeam lab run: {stray[0].split('=')[0]} comes after the command, so it would be passed to the command. Put the options before it:\n\n"
+              f"  hyperbeam lab run {opt} -- {shlex.join(cmd[:i] + cmd[i + took:])}\n\n"
+              f"(if the command itself needs {stray[0].split('=')[0]}, give it as one quoted shell line: hyperbeam lab run -- {shlex.quote(' '.join(cmd))})", file=sys.stderr)
+        return 2
+    src = Path(a.dir or os.getcwd()).resolve()
+    if src in (Path("/"), Path.home()):
+        print(f"refusing to copy {src} into the lab: give the project or worktree directory")
+        return 2
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", a.name or lab_project_name(src))
+    dest = f"{LAB_HOME}/projects/{name}"
+    subprocess.run(lab_sudo("sh", "-c", 'mkdir -p -m700 "$1/rt" "$1/tmux" "$1/cache" && if [ -n "$3" ]; then rm -rf -- "$2"; fi; mkdir -p -m750 "$2"',
+                            "_", str(LAB_HOME), dest, "fresh" if a.fresh else ""), check=True, stdin=subprocess.DEVNULL)
+    if subprocess.run(lab_sudo("test", "-x", f"{LAB_TOOLS}/node_modules/.bin/pnpm"), stdin=subprocess.DEVNULL).returncode:      # once: pnpm for the lab
+        print("(lab: installing pnpm once into the lab disk...)", file=sys.stderr)
+        subprocess.run(lab_sudo("env", "-i", f"HOME={LAB_HOME}", "PATH=/usr/local/bin:/usr/bin:/bin", f"npm_config_cache={LAB_HOME}/cache/npm", "sh", "-c",
+                                f'mkdir -p {LAB_TOOLS} && npm install --silent --no-audit --no-fund --prefix {LAB_TOOLS} pnpm'), stdin=subprocess.DEVNULL, capture_output=True)
+    # One synced copy per project: rsync (as hblab) from the worktree or checkout. What the lab built there (node_modules, .venv, ...) is excluded from
+    # the sync, so it is neither copied from you nor deleted: only the first run installs. Secrets and personal files are never copied.
+    ex = [f"--exclude={x}" for x in LAB_SYNC_EXCLUDE]
+    sync = subprocess.run(["rsync", "-a", "--delete", "--include=.env.example", *ex, "-e", str(HERE / "lab/sudo-hblab"), f"{src}/", f"lab:{dest}/"],
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if sync.returncode:
+        print(f"lab: copying {src} failed:\n{sync.stderr.strip()[-400:]}", file=sys.stderr)
+        return 1
+    lab_ensure_shims()
+    if (TOOLS_SRC).is_dir():                   # tools/ goes in with every run: `hyperbeam tool NAME` (or $HB_TOOLS/NAME/NAME) works in the lab
+        subprocess.run(["rsync", "-a", "--delete", "-e", str(HERE / "lab/sudo-hblab"), f"{TOOLS_SRC}/", f"lab:{LAB_HOME}/tools/"], capture_output=True, stdin=subprocess.DEVNULL)
+    cache = f"{LAB_HOME}/cache"
+    rid = uuid.uuid4().hex[:8]
+    env = {"HOME": str(LAB_HOME), "USER": LAB_USER, "LOGNAME": LAB_USER, "PATH": f"{LAB_TOOLS}/node_modules/.bin:{LAB_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+           "TERM": os.environ.get("TERM", "xterm-256color"), "LANG": "C.UTF-8", "TMUX_TMPDIR": f"{LAB_HOME}/tmux/{rid}", "XDG_RUNTIME_DIR": f"{LAB_HOME}/rt/{rid}",
+           "HB_RUN_ID": rid, "HB_RUN_PROJECT": name, "HB_RUN_WHY": a.why or "", "HB_RUN_CWD": str(src), "HB_RUN_CMD": cmd[0] if len(cmd) == 1 else shlex.join(cmd),
+           "HB_LAB": "1", "HB_TOOLS": f"{LAB_HOME}/tools", "XDG_CACHE_HOME": cache, "npm_config_cache": f"{cache}/npm", "npm_config_store_dir": f"{cache}/pnpm-store",
+           "PNPM_HOME": f"{cache}/pnpm", "COREPACK_HOME": f"{cache}/corepack", "UV_CACHE_DIR": f"{cache}/uv", "PIP_CACHE_DIR": f"{cache}/pip",
+           "PLAYWRIGHT_BROWSERS_PATH": f"{cache}/playwright", "LAB_PORT_MIN": str(LAB_PORTS[0]), "LAB_PORT_MAX": str(LAB_PORTS[1]), "HB_LAB_PROJECT": name}
+    if lab_xvfb():
+        env["DISPLAY"] = LAB_DISPLAY
+    else:
+        print("(lab: no virtual display: install xvfb; GUI tests will fail to open)", file=sys.stderr)
+    if not a.why:
+        print("(lab: no --why; add a short reason, e.g. --why 'unit tests for the guard': it goes in the run log)", file=sys.stderr)
+    # Its own session (setsid): the process group is recorded in /srv/hblab/runs/<id>.json while the run is alive. Everything it starts keeps HB_RUN_ID
+    # in its environment, which is how `lab stop` finds grandchildren (browsers, dev servers) even if they leave the group.
+    script = ('mkdir -p -m700 "$XDG_RUNTIME_DIR" "$TMUX_TMPDIR" "' + str(LAB_HOME) + '/runs"; '
+              'python3 -c \'import json,os,time;i=os.environ["HB_RUN_ID"];json.dump(dict(id=i,project=os.environ["HB_RUN_PROJECT"],why=os.environ["HB_RUN_WHY"],'
+              'command=os.environ["HB_RUN_CMD"],cwd=os.environ["HB_RUN_CWD"],pgid=os.getpgrp(),start=time.time()),open("' + str(LAB_HOME) + '/runs/"+i+".json","w"))\'; '
+              'cd "$1" || exit 97; shift; t="$1"; shift; '
+              'if [ $# -eq 1 ]; then exec timeout -k 5 "$t" bash -c "$1"; else exec timeout -k 5 "$t" "$@"; fi')
+    t0, tail = time.time(), []
+    p = subprocess.Popen(lab_sudo("env", "-i", *[f"{k}={v}" for k, v in env.items()], "setsid", "-w", "bash", "-c", script, "_", dest, str(a.timeout), *cmd),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        for line in p.stdout:
+            if getattr(a, "say", None):                      # the menu: its stdout is Textual's, so the lines go to a callback
+                a.say(line.decode(errors="replace").rstrip("\n"))
+            elif not getattr(a, "quiet", False):
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+            tail = (tail + [line.decode(errors="replace").rstrip("\n")])[-20:]
+        rc = p.wait()
+    finally:                                      # also when you press Ctrl-C: what this run left behind is stopped, its record and dirs removed
+        lab_py("done", rid)
+    lab_log_run(name, src, cmd, a.why or "", time.time() - t0, rc, tail)
+    if getattr(a, "collect", None):                       # --collect PATH: bring what the run made back to ~/.cache/hyperbeam-shots/<time>/
+        path = a.collect if a.collect.startswith("/") else f"{dest}/{a.collect}"
+        got = cmd_lab_collect(name, path)
+        if got:
+            print(f"(lab: collected {got[1]} files from {path} to {home_rel(got[0])})", file=sys.stderr)
+    if rc == 124:
+        print(f"(lab: stopped after {a.timeout} s; raise it with --timeout)", file=sys.stderr)
+    return rc
