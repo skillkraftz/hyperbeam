@@ -14,7 +14,7 @@ can break something live.
 ## How hyperbeam solves it
 - **A manager to plan with.** The first row of the sidebar is a Claude on Opus. You talk with it about what to work on, across all projects. It is read-only on the projects.
 - **A fresh worker per task.** After you say yes, the manager sends the piece of work to the project's own Claude as a worker (`hyperbeam work`), waits (`hyperbeam wait`),
-  reads the short report and closes the worker (`hyperbeam close`). The context never grows: each task starts clean. hyperbeam never starts Claude work by itself.
+  reads the short report and closes the worker (`hyperbeam close`, which also removes its merged worktree; `hyperbeam tidy` lists and deletes merged branches, `--yes` to delete). The context never grows: each task starts clean. hyperbeam never starts Claude work by itself.
 - **A short report** per task: the task, Claude's final message, branch, commits, PR, and a link to the full transcript for when you need the long form. `hyperbeam reports` lists them with what each cost (tokens, calls, active minutes, lab seconds); `hyperbeam copy-last` copies Claude's last message.
 - **A session per project:** one tmux session with Claude Code, a shell, the services (started in order, on a fixed port) and logs. The sidebar shows status dots (running,
   Claude working or waiting, PR open) and `»` on a project with a worker. The phone attaches to the same sessions over SSH (Tailscale).

@@ -354,3 +354,82 @@ class Report(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Tidy(unittest.TestCase):
+    def setUp(self):
+        self.repo = Repo()
+        self.work = Path(tempfile.mkdtemp()) / "work"
+        self.work.mkdir()
+        self.saved = hb.WORK_ROOT
+        hb.WORK_ROOT = self.work
+        self.addCleanup(setattr, hb, "WORK_ROOT", self.saved)
+        self.repo.merge_pr(1)                                # pr1: merged, still a local and remote branch
+        self.repo.git("push", "-q", "origin", "pr1")
+        self.repo.git("checkout", "-qb", "open", "main")     # an unmerged branch
+        self.repo.write("o.txt", "o\n")
+        self.repo.commit("open")
+        self.repo.git("push", "-q", "origin", "open")
+        self.repo.git("checkout", "-q", "main")
+
+    def run_tidy(self, yes):
+        out = io.StringIO()
+        row = dict(name="r", path=self.repo.r, git=True, remote="x")
+        with redirect_stdout(out), mock.patch.object(hb, "scan", lambda: [row]):     # no NAME: all projects, and the empty dirs
+            hb.cmd_tidy(types.SimpleNamespace(name=None, yes=yes))
+        return out.getvalue()
+
+    def setup_known(self):
+        saved = hb.known_path
+        hb.known_path = lambda n: self.repo.r
+        self.addCleanup(setattr, hb, "known_path", saved)
+
+    def refs(self):
+        return self.repo.git("for-each-ref", "--format=%(refname:short)").split()
+
+    def test_lists_without_yes_and_deletes_only_merged_with_yes(self):
+        self.setup_known()
+        out = self.run_tidy(False)
+        self.assertIn("local branch pr1", out)
+        self.assertIn("origin/pr1", out)
+        self.assertIn("skipped open: not merged", out)
+        self.assertIn("pr1", self.refs())
+        self.run_tidy(True)
+        refs = self.refs()
+        self.assertNotIn("pr1", refs)
+        self.assertNotIn("origin/pr1", refs)
+        self.assertEqual(self.repo.git("ls-remote", "--heads", "origin", "pr1"), "")
+        self.assertIn("open", refs)
+        self.assertIn("origin/open", refs)
+        self.assertIn("main", refs)
+
+    def test_a_dirty_worktree_is_refused_and_a_clean_merged_one_removed(self):
+        self.setup_known()
+        self.repo.git("branch", "done", "main")
+        self.repo.git("branch", "dirty", "main")
+        clean, dirty = self.work / "chore" / "done", self.work / "dirty"
+        self.repo.git("worktree", "add", "-q", str(clean), "done")
+        self.repo.git("worktree", "add", "-q", str(dirty), "dirty")
+        (dirty / "x.txt").write_text("wip\n")
+        (self.work / "empty").mkdir()
+        out = self.run_tidy(True)
+        self.assertIn("uncommitted changes", out)
+        self.assertFalse(clean.exists())
+        self.assertFalse((self.work / "chore").exists())     # its emptied parent goes too
+        self.assertFalse((self.work / "empty").exists())
+        self.assertTrue(dirty.exists())
+        refs = self.repo.git("for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+        self.assertIn("dirty", refs)                         # still checked out
+        self.assertNotIn("done", refs)
+
+    def test_close_removes_the_merged_worktree_quietly(self):
+        self.setup_known()
+        self.repo.git("branch", "done", "main")
+        wt = self.work / "done"
+        self.repo.git("worktree", "add", "-q", str(wt), "done")
+        with mock.patch.object(hb, "session_exists", lambda s: True), mock.patch.object(hb, "project_dir", lambda n: self.work / "pd"), \
+                mock.patch.object(hb, "tmux", lambda *a, check=True: types.SimpleNamespace(stdout="HB_WORKER=1\n", returncode=0)), redirect_stdout(io.StringIO()) as out:
+            hb.cmd_close(types.SimpleNamespace(name="r"))
+        self.assertFalse(wt.exists())
+        self.assertNotIn("done", out.getvalue())
+        self.assertIn("pr1", self.refs())                    # close does not touch branches

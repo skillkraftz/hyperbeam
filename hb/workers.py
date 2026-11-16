@@ -153,6 +153,12 @@ def cmd_close(a):
         sys.exit(f"hyperbeam close: the session {wsess} is not a worker (no HB_WORKER); not touching it")
     tmux("kill-session", "-t", f"={wsess}", check=False)
     shutil.rmtree(project_dir(a.name) / "worker", ignore_errors=True)
+    try:                                                    # the worker's merged, clean worktrees go with it; quietly, never a reason to fail
+        path = known_path(a.name)
+        if (Path(path) / ".git").exists():
+            tidy_apply(path, tidy_plan(path, worktrees_only=True), lambda s: None)
+    except Exception:
+        pass
     print(f"{a.name}: worker closed (reports stay in {reports_dir(a.name)}/)")
     return 0
 
@@ -373,3 +379,135 @@ def onboarded_on(name, path):
         return ""
 
 
+
+
+# ---------- tidy: merged branches and worktrees (`hyperbeam tidy [NAME] [--yes]`, and `close` for the worktree part) ----------
+WORK_ROOT = Path.home() / ".cache" / "hyperbeam-work"       # where workers' git worktrees live
+
+
+def _g(path, *a):
+    r = subprocess.run(["git", "-C", str(path), *a], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def tidy_plan(path, worktrees_only=False):
+    """What can go in one repo: {"local": [...], "remote": [...], "worktrees": [(dir, branch)], "skipped": [(what, why)], "main": ref}.
+    Merged means an ancestor of origin/<default branch> (squash merges are not detected, so those stay). Nothing is deleted here."""
+    plan = dict(local=[], remote=[], worktrees=[], skipped=[], main=None)
+    _g(path, "fetch", "-q", "--prune", "origin")
+    rc, head, _ = _g(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    default = head.split("/", 1)[1] if rc == 0 and "/" in head else "main"
+    main = f"origin/{default}"
+    if _g(path, "rev-parse", "--verify", "-q", main)[0] != 0:
+        plan["skipped"].append((str(path), f"no {main}"))
+        return plan
+    plan["main"] = main
+    merged = lambda ref: _g(path, "merge-base", "--is-ancestor", ref, main)[0] == 0
+    current = _g(path, "symbolic-ref", "--short", "HEAD")[1]
+    root = WORK_ROOT.resolve()
+    taken = {}                                              # branch -> worktree dir, for the checked-out branches
+    removing = set()
+    block, d = {}, None
+    for line in _g(path, "worktree", "list", "--porcelain")[1].splitlines() + [""]:
+        if line.startswith("worktree "):
+            block = {"dir": Path(line[9:])}
+        elif line.startswith("branch "):
+            block["branch"] = line[7:].removeprefix("refs/heads/")
+        elif line == "detached":
+            block["detached"] = True
+        elif line == "" and block:
+            d = block["dir"]
+            b = block.get("branch")
+            if b:
+                taken[b] = d
+            if root in d.resolve().parents:
+                if not b:
+                    plan["skipped"].append((str(d), "worktree on a detached HEAD"))
+                elif _g(d, "status", "--porcelain")[1]:
+                    plan["skipped"].append((str(d), "worktree has uncommitted changes"))
+                elif not merged(b):
+                    plan["skipped"].append((str(d), f"branch {b} is not merged"))
+                else:
+                    plan["worktrees"].append((d, b))
+                    removing.add(b)
+            block = {}
+    if worktrees_only:
+        return plan
+    for b in _g(path, "for-each-ref", "--format=%(refname:short)", "refs/heads")[1].splitlines():
+        if b == default:
+            continue
+        if b == current:
+            plan["skipped"].append((b, "checked out"))
+        elif b in taken and b not in removing:
+            plan["skipped"].append((b, f"checked out in {taken[b]}"))
+        elif not merged(b):
+            plan["skipped"].append((b, "not merged"))
+        else:
+            plan["local"].append(b)
+    for r in _g(path, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin")[1].splitlines():
+        b = r.removeprefix("origin/")
+        if b in ("HEAD", "origin", default):
+            continue
+        if merged(r):
+            plan["remote"].append(b)
+        else:
+            plan["skipped"].append((r, "not merged"))
+    return plan
+
+
+def tidy_apply(path, plan, say):
+    for d, b in plan["worktrees"]:
+        r = _g(path, "worktree", "remove", str(d))          # never --force: git itself refuses a dirty one
+        say(f"  worktree {d}: " + ("removed" if r[0] == 0 else f"kept ({r[2]})"))
+        p = d.parent
+        while p != WORK_ROOT.resolve() and p != WORK_ROOT and WORK_ROOT in p.parents and p.is_dir() and not any(p.iterdir()):
+            p.rmdir()                                       # fix/ after fix/x
+            p = p.parent
+    _g(path, "worktree", "prune")
+    for b in plan["local"]:
+        r = _g(path, "branch", "-d", b)
+        say(f"  local {b}: " + ("deleted" if r[0] == 0 else f"kept ({r[2]})"))
+    for b in plan["remote"]:
+        r = _g(path, "push", "origin", "--delete", b)
+        say(f"  remote {b}: " + ("deleted" if r[0] == 0 else f"kept ({r[2]})"))
+
+
+def empty_work_dirs():
+    if not WORK_ROOT.is_dir():
+        return []
+    return sorted((p for p in WORK_ROOT.rglob("*") if p.is_dir() and not any(p.iterdir())), key=lambda p: -len(p.parts))
+
+
+def cmd_tidy(a):
+    """hyperbeam tidy [NAME] [--yes]: list (or with --yes delete) merged local and remote branches and clean merged worktrees under ~/.cache/hyperbeam-work."""
+    if a.name:
+        paths = [(a.name, known_path(a.name))]
+    else:
+        paths = [(r["name"], r["path"]) for r in scan() if r["git"] and r["remote"]]
+    for name, path in paths:
+        if not (Path(path) / ".git").exists():
+            if a.name:
+                sys.exit(f"hyperbeam tidy: {name} is not a git project")
+            continue
+        plan = tidy_plan(path)
+        if not (plan["local"] or plan["remote"] or plan["worktrees"] or plan["skipped"]):
+            continue
+        print(f"{name}:")
+        for d, b in plan["worktrees"]:
+            print(f"  worktree {d} (merged {b})")
+        for b in plan["local"]:
+            print(f"  local branch {b} (merged into {plan['main']})")
+        for b in plan["remote"]:
+            print(f"  remote branch origin/{b} (merged)")
+        for what, why in plan["skipped"]:
+            print(f"  skipped {what}: {why}")
+        if a.yes:
+            tidy_apply(path, plan, print)
+    empties = [] if a.name else empty_work_dirs()
+    for p in empties:
+        print(f"empty dir {p}")
+        if a.yes:
+            p.rmdir()
+    if not a.yes:
+        print("nothing deleted: add --yes to delete the lines above (not the skipped ones)")
+    return 0
