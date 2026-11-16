@@ -38,7 +38,7 @@ hyperbeam itself in `~/projects/hyperbeam`, on branches, like any project.
 | | |
 |---|---|
 | `hyperbeam` (Ctrl+Alt+H) | the sidebar: click a row, double-click to open its session |
-| `hyperbeam work NAME FILE` / `wait NAME` / `close NAME` | the manager's loop: start a worker, wait for its report, end it |
+| `hyperbeam work NAME FILE` / `wait NAME` / `send NAME FILE` / `close NAME` | the manager's loop: start a worker, wait for its report, send it review feedback, end it |
 | `hyperbeam NAME update` (also `install`, `test`, `version`, `help`, `restart`) | the same verbs for every project |
 | `kk` (`hyperbeam info`) | a project's URLs: services, ports, Tailscale, open PRs |
 | `hyperbeam lab run --why TEXT -- COMMAND` | run anything test-like in the lab |

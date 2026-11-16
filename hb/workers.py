@@ -23,6 +23,10 @@ def worker_prompt_text(prompt_file, findings):
     return top + (HERE / "WORKER.md").read_text().rstrip() + "\n\n---\n\n" + Path(prompt_file).read_text()
 
 
+WAIT_POLL = 2             # seconds between looks at the workers' state files
+BLOCKED_GRACE = 180       # a worker "needing input" this long is blocked: Claude Code blocks an unanswered prompt by itself after ~2 minutes and carries on
+
+
 def worker_state(name):
     """('working'|'finished'|'blocked'|'ended'|'none', detail, started.json) from the worker's hook state file and its session."""
     try:
@@ -87,16 +91,21 @@ def cmd_work(a):
 
 def cmd_wait(a):
     """hyperbeam wait NAME [NAME...] [--timeout S]: block until each worker's Claude has finished (the Stop hook's state), then print each report's path.
-    Exit 0 all finished, 1 timeout, 2 a worker is blocked (waiting for input) or its session ended."""
+    Exit 0 all finished, 1 timeout, 2 a worker is blocked (a question, or a prompt unanswered for BLOCKED_GRACE seconds) or its session ended."""
     deadline = time.time() + a.timeout if a.timeout else None
-    pending, code, seen = list(dict.fromkeys(a.names)), 0, {}
+    pending, code, seen, asking = list(dict.fromkeys(a.names)), 0, {}, {}
     for n in pending:
         if worker_state(n)[0] == "none":
             sys.exit(f"hyperbeam wait: {n} has no worker")
     while pending:
         for n in list(pending):
             st, detail, rec = worker_state(n)
-            rep = newest_report(n, rec.get("time", 0)) if st in ("finished", "ended", "blocked") else None
+            if st == "blocked" and detail.startswith("needs your input"):
+                if time.time() - asking.setdefault(n, time.time()) < BLOCKED_GRACE:
+                    continue                                # a prompt Claude Code may block by itself and move on from: keep waiting
+            else:
+                asking.pop(n, None)
+            rep = newest_report(n, rec.get("sent", rec.get("time", 0))) if st in ("finished", "ended", "blocked") else None
             if st == "working" or (st == "finished" and not rep and time.time() - seen.setdefault(n, time.time()) < 30):
                 continue                                    # the report is written just after the state: give it a moment
             pending.remove(n)
@@ -107,8 +116,32 @@ def cmd_wait(a):
             if deadline and time.time() > deadline:
                 print(f"hyperbeam wait: timeout; still working: {', '.join(pending)}", file=sys.stderr)
                 return 1
-            time.sleep(2)
+            time.sleep(WAIT_POLL)
     return code
+
+
+def cmd_send(a):
+    """hyperbeam send NAME FILE|-: paste the text (a file, or stdin for -) into the worker's Claude as one bracketed paste and Enter: the manager's review feedback.
+    Only while that Claude waits (state finished); never while it works or sits at a prompt, where the paste would answer it. `wait` works after it as usual."""
+    wsess = worker_sess(a.name)
+    st, detail, rec = worker_state(a.name)
+    if st == "none" or not session_exists(wsess):
+        sys.exit(f"hyperbeam send: {a.name} has no worker")
+    if st != "finished":
+        sys.exit(f"hyperbeam send: the worker of {a.name} is not waiting ({st}{': ' + detail if detail else ''}); `hyperbeam wait {a.name}` first")
+    text = sys.stdin.read() if a.file == "-" else Path(a.file).expanduser().read_text()
+    if not text.strip():
+        sys.exit("hyperbeam send: nothing to send")
+    pane = f"={wsess}:"
+    tmux("set-buffer", "-b", "hb-send", "--", text.strip())
+    tmux("paste-buffer", "-p", "-d", "-b", "hb-send", "-t", pane)
+    time.sleep(0.5)                                         # let Claude's input take the paste before Enter
+    tmux("send-keys", "-t", pane, "Enter")
+    rec["sent"] = time.time()                               # `wait` takes only reports written after this one
+    (worker_dir(a.name) / "started.json").write_text(json.dumps(rec))
+    (worker_dir(a.name) / "claude").write_text("working\n")  # until its hook says so, it is not finished
+    print(f"{a.name}: sent {len(text.strip())} characters; `hyperbeam wait {a.name}` waits for the answer")
+    return 0
 
 
 def cmd_close(a):
@@ -158,7 +191,10 @@ def cmd_worker_report(_):
         pass
     msg = msg or hook.get("last_assistant_message") or "(no final message found)"
     branch = git_out(path, "rev-parse", "--abbrev-ref", "HEAD") or "-"
-    commits = git_out(path, "log", "--oneline", "-n", "30", f"{rec['head']}..HEAD") if rec.get("head") else ""
+    if rec.get("time"):                                     # any branch: a worker in a git worktree commits on a branch the project folder is not on
+        commits = git_out(path, "log", "--all", "--source", f"--since=@{int(rec['time'])}", "-n", "30", "--format=%h %s [%S]").replace("refs/heads/", "").replace("refs/remotes/", "")
+    else:
+        commits = git_out(path, "log", "--oneline", "-n", "30", f"{rec['head']}..HEAD") if rec.get("head") else ""
     pr = next(iter(re.findall(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", msg)), "none")
     task = rec.get("task") or "worker task"
     slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:40] or "report"

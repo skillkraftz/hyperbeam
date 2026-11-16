@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -119,15 +121,83 @@ class Workers(unittest.TestCase):
             self.assertEqual(hb.cmd_wait(types.SimpleNamespace(names=["proj"], timeout=5)), 0)
         self.assertIn("2026-11-15-1200-x.md", out.getvalue())
 
-    def test_a_blocked_worker_ends_the_wait_with_status_2(self):
+    def wait(self, timeout=5):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = hb.cmd_wait(types.SimpleNamespace(names=["proj"], timeout=timeout))
+        return code, out.getvalue()
+
+    def worker(self, state):
         self.sessions.add("claude-proj")
         wd = hb.worker_dir("proj")
         (wd / "started.json").write_text(json.dumps({"time": 0}))
-        (wd / "claude").write_text("waiting needs your input or permission\n")
-        out = io.StringIO()
-        with redirect_stdout(out):
-            self.assertEqual(hb.cmd_wait(types.SimpleNamespace(names=["proj"], timeout=5)), 2)
-        self.assertIn("blocked", out.getvalue())
+        (wd / "claude").write_text(state)
+        for k, v in (("WAIT_POLL", 0.05), ("BLOCKED_GRACE", 0.3)):
+            self.addCleanup(setattr, hb, k, getattr(hb, k))
+            setattr(hb, k, v)
+        return wd
+
+    def test_a_worker_with_a_question_ends_the_wait_at_once_with_status_2(self):
+        self.worker("waiting asks you a question\n")
+        code, out = self.wait()
+        self.assertEqual(code, 2)
+        self.assertIn("blocked", out)
+
+    def test_a_needs_input_state_is_waited_through_and_a_stuck_one_is_blocked_after_the_limit(self):
+        wd = self.worker("waiting needs your input or permission\n")
+        t = time.time()
+        code, out = self.wait()
+        self.assertEqual(code, 2)
+        self.assertGreaterEqual(time.time() - t, 0.3)
+        self.assertIn("blocked", out)
+        wd = self.worker("waiting needs your input or permission\n")        # Claude Code blocks the prompt itself and carries on, then finishes
+        rd = hb.reports_dir("proj")
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / "r.md").write_text("# r\n")
+        threading.Timer(0.1, lambda: (wd / "claude").write_text("waiting finished responding\n")).start()
+        code, out = self.wait()
+        self.assertEqual(code, 0)
+        self.assertIn("r.md", out)
+
+    def test_the_hooks_put_the_state_back_to_working_and_an_idle_notice_keeps_finished(self):
+        events = {e for e, _, st in hb.HOOK_CMDS if st == "working"}
+        self.assertTrue({"PostToolUse", "PostToolUseFailure", "PermissionDenied", "UserPromptSubmit"} <= events)
+        state = Path(tempfile.mkdtemp())
+        env = dict(os.environ, HB_PROJECT="proj", HB_STATE=str(state))
+        env.pop("HB_WORKER", None)
+        (state / "claude").write_text("waiting finished responding\n")
+        run = lambda cmd, inp: subprocess.run(["sh", "-c", cmd], env=env, input=inp, text=True, check=True)
+        note = hb.hook_command("waiting needs your input or permission", notification=True)
+        run(note, '{"notification_type": "idle_prompt"}')
+        self.assertEqual((state / "claude").read_text().strip(), "waiting finished responding")
+        run(note, '{"notification_type": "permission_prompt"}')
+        self.assertEqual((state / "claude").read_text().strip(), "waiting needs your input or permission")
+        run(hb.hook_command("working"), "{}")
+        self.assertEqual((state / "claude").read_text().strip(), "working")
+
+    def test_send_refuses_while_the_worker_works_or_sits_at_a_prompt_and_pastes_when_it_waits(self):
+        f = self.tmp / "fb.md"
+        f.write_text("change X, same PR\n")
+        a = types.SimpleNamespace(name="proj", file=str(f))
+        wd = self.worker("working\n")
+        for st in ("working\n", "waiting needs your input or permission\n"):
+            (wd / "claude").write_text(st)
+            with self.assertRaises(SystemExit):
+                hb.cmd_send(a)
+        self.assertEqual([c for c in self.calls if c[0] in ("paste-buffer", "send-keys")], [])
+        (wd / "claude").write_text("waiting finished responding\n")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(hb.cmd_send(a), 0)
+        kinds = [c[0] for c in self.calls]
+        self.assertEqual(kinds[kinds.index("set-buffer"):][:3], ["set-buffer", "paste-buffer", "send-keys"])
+        self.assertIn("change X, same PR", [c for c in self.calls if c[0] == "set-buffer"][0])
+        self.assertIn("-p", [c for c in self.calls if c[0] == "paste-buffer"][0])
+        self.assertEqual(hb.worker_state("proj")[0], "working")
+        self.assertIn("sent", json.loads((wd / "started.json").read_text()))
+
+    def test_send_reads_stdin_for_a_dash_and_refuses_without_a_worker(self):
+        with self.assertRaises(SystemExit):
+            hb.cmd_send(types.SimpleNamespace(name="proj", file="-"))
 
     def test_the_sidebar_row_marks_a_running_worker(self):
         row = dict(name="proj", recent=True, branch="main", worker=True)
@@ -172,6 +242,26 @@ class Report(unittest.TestCase):
         text = f.read_text()
         for want in ("# Fix the Thing!", "Done. Branch fix-thing", "branch: fix-thing", "PR: https://github.com/me/proj/pull/7", "Fix the thing", str(self.transcript)):
             self.assertIn(want, text)
+
+    def test_commits_made_in_a_worktree_branch_are_listed(self):
+        (self.state / "started.json").write_text(json.dumps({"time": time.time() - 60, "head": self.repo.git("rev-parse", "HEAD"), "task": "T", "path": str(self.repo.r)}))
+        self.repo.git("checkout", "-q", "main")                     # the project folder stays on main; the worker commits elsewhere
+        wt = self.repo.d / "wt"
+        self.repo.git("worktree", "add", "-q", "-b", "wt-branch", str(wt), "main")
+        (wt / "w.txt").write_text("w\n")
+        for c in (["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "From the worktree"]):
+            subprocess.run(["git", *c], cwd=wt, check=True, capture_output=True)
+        saved = dict(os.environ)
+        os.environ.update(self.env(True))
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        import sys
+        old = sys.stdin
+        sys.stdin = io.StringIO("{}")
+        self.addCleanup(setattr, sys, "stdin", old)
+        hb.cmd_worker_report(None)
+        text = next(self.reports.glob("*.md")).read_text()
+        self.assertIn("From the worktree [wt-branch]", text)
+        self.assertNotIn("none\n", text.split("## Commits since the worker started")[1][:10])
 
     def test_the_stop_hook_writes_state_for_everyone_and_calls_the_report_only_for_workers(self):
         cmd = hb.hook_command("waiting finished responding", stop=True)
