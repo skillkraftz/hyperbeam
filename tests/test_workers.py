@@ -345,7 +345,7 @@ class Report(unittest.TestCase):
     def test_the_stop_hook_writes_state_for_everyone_and_calls_the_report_only_for_workers(self):
         cmd = hb.hook_command("waiting finished responding", stop=True)
         self.assertIn("_worker-report", cmd)
-        self.assertIn('[ -z "$HB_WORKER" ] ||', cmd)
+        self.assertIn('[ -n "$HB_WORKER" ] &&', cmd)
         subprocess.run(["sh", "-c", cmd], env=self.env(False), check=True)          # no HB_WORKER: no report (and no uv start)
         self.assertEqual((self.state / "claude").read_text().strip(), "waiting finished responding")
         self.assertFalse(self.reports.exists())
