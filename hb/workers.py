@@ -376,40 +376,6 @@ def cmd_reports(a):
     return 0
 
 
-def drift_notes(name, path):
-    """A quiet note when the run-defining files changed since the project was onboarded. Projects with a manifest but no fingerprint get a
-    baseline now, without a note; a manifest written since the fingerprint counts as onboarding done (new fingerprint, no note). Never red."""
-    man = MANIFESTS / f"{name}.toml"
-    if not man.is_file() or not Path(path).is_dir():
-        return []
-    f = fingerprint_file(name, path)
-    try:
-        old = json.loads(f.read_text())
-    except (OSError, ValueError):
-        take_fingerprint(name, path)
-        return []
-    if man.stat().st_mtime > old.get("manifest_mtime", 0) + 0.5:
-        take_fingerprint(name, path)
-        return []
-    now = fingerprint(path)
-    changed = []
-    for fn in sorted(set(now) | set(old.get("parts", {}))):
-        a, b = old.get("parts", {}).get(fn), now.get(fn)
-        if a != b:
-            what = sorted(k for k in set(a or {}) | set(b or {}) if (a or {}).get(k) != (b or {}).get(k)) if a and b else ["added" if b else "removed"]
-            changed.append(f"{fn} ({', '.join(what)})")
-    return [f"setup changed since onboarding: {'; '.join(changed)} (send ONBOARDING.md to update)"] if changed else []
-
-
-def onboarded_on(name, path):
-    try:
-        return json.loads(fingerprint_file(name, path).read_text()).get("date", "")
-    except (OSError, ValueError):
-        return ""
-
-
-
-
 # ---------- tidy: merged branches and worktrees (`hyperbeam tidy [NAME] [--yes]`, and `close` for the worktree part) ----------
 WORK_ROOT = Path.home() / ".cache" / "hyperbeam-work"       # where workers' git worktrees live
 

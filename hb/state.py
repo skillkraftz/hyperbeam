@@ -65,10 +65,15 @@ def known_path(name):
     return p
 
 
+def project_dir_name(name, path):
+    """The folder name of a project's data: NAME-<hash of the absolute path>, so two same-named projects in different folders stay apart."""
+    return f"{name}-{hashlib.sha1(str(Path(path).resolve()).encode()).hexdigest()[:6]}"
+
+
 def project_dir(name, path=None, create=True):
-    """Everything hyperbeam keeps for one project. The hash of the absolute path keeps two same-named projects in different folders apart."""
+    """Everything hyperbeam keeps for one project."""
     p = Path(path) if path else known_path(name)
-    d = DATA_DIR / "projects" / f"{name}-{hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:6]}"
+    d = DATA_DIR / "projects" / project_dir_name(name, p)
     if create:
         d.mkdir(parents=True, exist_ok=True)
     return d

@@ -717,7 +717,7 @@ def default_layout(sess, path, envargs):
 
 def restore_layout(sess, path, lay, envargs):
     """Recreate the saved windows and panes (cwds, layouts, active window and pane). Returns [(pane id, role, cwd)]."""
-    plan, active_pane, active_win = [], [], None
+    plan, active_win = [], None
     for i, w in enumerate(lay["windows"]):
         cwds = [p["cwd"] if Path(p["cwd"]).is_dir() else str(path) for p in w["panes"]]
         if i == 0:
