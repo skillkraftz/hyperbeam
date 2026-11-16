@@ -11,28 +11,22 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - Compact local context, next step (the CLAUDE.md trim is done, PR #27): trim the other projects' CLAUDE.md the same way (dotwork 13 KB); generated per-project `.hyperbeam/MAP.md` (file map, recent changes, open PR) so a session reads one file.
 - Merge-time docs gate (stale docs: ask Claude to update / merge anyway), "Mark docs reviewed" snooze for the stale-docs note, a Promote prompt that rewrites a settled prototype's README for an end user.
 - Docker in the lab: works for single containers and host-network compose (docs/PODMAN.md); compose's own networks need `sudo loginctl enable-linger hblab` (untested) when a project needs them.
-- **Work loop, step 2:** the start choice is gone (decision cut-review-start-choice): Open continues the last conversation. Left: the end of the day (system up to date, project presentable, else that is the last work of the day).
-- A "presentable" check at the end of the loop (README matches behaviour, screenshots current, no stale items) and how it feeds the day's close.
-- When a Claude session starts and ends beyond token cost: tie it to the work loop instead of conversation size.
-- README and screenshots rebuilt from the implemented decisions and the Done list (the condensing tool the decision records are meant for).
 - Exporting the parts: the machine keeps every record; a reference-carrying summary is what Claude reads when it needs context.
 
 ## Done
+- ~~Work loop step 1 (START.md), the review loop (counter, Review button, review pass, review records), the offers at Merge and Done~~ Cut (decisions cut-review-start-choice, cut-merge-and-done-extras): the manager plans and sends reviews as worker tasks.
+- ~~Daily lab digest offering tool proposals at Done~~ Cut (decision cut-merge-and-done-extras); the digest itself stays (`hyperbeam lab digest`).
+- ~~Plan mode for every prompt hyperbeam injects~~ Cut (decision sonnet-default-and-manager-workers): workers never use plan mode, planning is the manager's.
 - ~~No automatic prompts: a failed service is a red dot and a note; no popup, no RECOVER.md, no Onboard/Fix buttons~~ Done (decision no-automatic-prompts).
 - ~~Cut the review counter, the start choice, Previous Claude, `hyperbeam review|audit|back`~~ Done (decision cut-review-start-choice): the manager asks for reviews and audits as worker tasks.
 - ~~Cut what follows a Merge (Fresh/Review/Keep) and Done's digest, review and wrap-up offers~~ Done (decision cut-merge-and-done-extras): the manager does that job.
 - ~~Sonnet as the default model; manager workers (`work`, `wait`, `close`, reports)~~ Done (PR #57, decision sonnet-default-and-manager-workers).
 - ~~Lab refuses nesting itself, the guard stops guessing; `hyperbeam shot --dir`~~ Done (PR #53, decision lab-refuses-nesting, which collapses lab-setup-is-the-users).
-- ~~Work loop step 1: a fresh plan session (START.md) / review / continue when Claude starts, and after a finished Merge run~~ Done (PR #52, decision work-loop-start-and-end).
-- ~~Every project in the review loop (count from onboarding), a Review button in the Project screen~~ Done (PR #51, decision review-every-project).
-- ~~Review loop: Copy report, a PR badge, a Merge button.~~ Done (PR #20).
 - ~~Project screen and drift detection.~~ Done (PR #22), kept simple: the polish phase will redesign the sidebar.
 - ~~README-staleness check.~~ Done (PR #24): commands, paths and age against the run setup. Later: version numbers and ports mentioned in the docs.
 - ~~Wrap-up notes into .hyperbeam/notes.~~ Done (PR #24).
-- ~~Daily lab digest -> tool proposals at Done; TOOLS.md; flaky tests.~~ Done (PR #23). Later: tools the digest suggests for non-lab work, a weekly view.
 - ~~Usage window~~ Done (PR #28, exact numbers in PR #30): the 5-hour and weekly limits as claude.ai shows them, a note for huge conversations. Later: ask Claude to write a short hand-off when a conversation is huge, so the fresh one starts with it.
 - ~~`hyperbeam new`~~ Done (PR #30: `--cli`, `--web`). Next for verbs: `hyperbeam NAME version` in the sidebar title, `status` and `logs` verbs, per-project `[commands]` suggested by Align, a `new` verb that scaffolds a project with the verbs already in place.
-- ~~Plan mode for every prompt hyperbeam injects (Opus plans, Sonnet builds)~~ Done (PR #31, decision injected-prompts-start-in-plan-mode); the review now swaps in a fresh plan-mode Claude (PR #43, decision review-fresh-claude).
 - ~~Merge: oldest first, one click, stops only at a real problem~~ Done (PRs #32, #36, #38, #44; decision merge-flow): files-in-common check, conflicts handed to Claude to rebase, the installed copy always updates, the working branch is never switched.
 - ~~Tests run in parallel by default; Align times the suite~~ Done (PR #34, decision tests-run-in-parallel-by-default).
 - ~~Tools in Go, a daily tool check, `test-timing`~~ Done (PR #35, decision tools-go-for-real-work-a).
@@ -43,5 +37,5 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - ~~Sidebar core: Stop returns the right side to the hyperbeam session, hyperbeam row always first, width kept on resize, closed right split reopens~~ Done (PR #45, decision manager-session-is-home).
 - ~~Lab nesting and setup guard: no lab inside the lab, setup scripts and sudo are the user's, error messages state facts~~ Done (PR #46, decision lab-setup-is-the-users).
 - ~~Lab digest ranks by total time (count x duration) so frequent work bubbles up~~ Done (PR #47, decision digest-ranks-by-total-time).
-- ~~Review pass after N merged PRs, review records~~ Done (PRs #42, #43, #44; decisions review-pass, review-fresh-claude).
 - ~~README with recordings of the loop~~ Done (task 9 of the 2026-11-15 audit): README rewritten for the manager/worker flow; `tools/demo` regenerates `docs/img/` (loop.gif and PNGs, fake projects and fake claude, in the lab, drawn with pyte and Pillow instead of asciinema/agg).
+- ~~Docs match the code (audit 2026-11-16, tasks 1, 8, 9)~~ Done: worker, Merge and IDEAS wording corrected; README lists the commands that matter and the project loop.
