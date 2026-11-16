@@ -83,7 +83,7 @@ def cmd_work(a):
     envargs = project_envargs(name, man, path, {"HB_WORKER": "1", "HB_STATE": str(wd), "HB_REPORTS": str(reports_dir(name))})
     pane = new_pane(["new-session", "-d", "-s", wsess, "-n", "claude", "-x", "200", "-y", "50", "-c", str(path), *envargs])
     tmux("set-option", "-t", f"={wsess}", "detach-on-destroy", "off", check=False)
-    send_line(pane, f'{claude_base()} "$(cat {shlex.quote(str(prompt))})"')
+    send_line(pane, f'{claude_base()}{worker_flags()} "$(cat {shlex.quote(str(prompt))})"')
     print(f"{name}: worker started in the tmux session {wsess} ({len(findings)} start-check problems added to its prompt)."
           f" `hyperbeam wait {name}` waits for it; the report goes to {reports_dir(name)}/")
     return 0

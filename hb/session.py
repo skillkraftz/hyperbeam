@@ -154,6 +154,17 @@ def claude_base(plan=False):
     return f"claude --model {cfg_get('claude_model')} --effort {cfg_get('claude_effort')}{mode}"
 
 
+def worker_flags():
+    """What a worker's Claude does without: MCP servers, plugins (each one enabled in the user's settings is switched off) and skills. They are about 18k tokens of
+    start context that every call re-reads, and workers use none of them. Bash, Read, Edit, Write, Glob, Grep and the hooks stay."""
+    try:
+        plugins = json.loads((Path.home() / ".claude" / "settings.json").read_text()).get("enabledPlugins", {})
+    except (OSError, ValueError):
+        plugins = {}
+    off = json.dumps({"enabledPlugins": {k: False for k in plugins}}, separators=(",", ":"))
+    return f" --strict-mcp-config --mcp-config {shlex.quote(json.dumps({"mcpServers": {}}, separators=(",", ":")))} --disable-slash-commands --settings {shlex.quote(off)}"
+
+
 def claude_cmd(prompt_file=None, cont=False, add_dir=False):
     """Plain `claude`, or claude with an initial prompt read from a file. cont: `claude --continue` (the most recent conversation in this
     directory; it takes a prompt too), falling back to a fresh claude if there is none. The prompt comes first: --add-dir takes a list."""
