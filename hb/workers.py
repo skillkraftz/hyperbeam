@@ -76,6 +76,7 @@ def cmd_work(a):
         start_session(name, man, print, path=path, restore=load_layout(name), findings=findings, notes=notes)
         touch_opened(name)
     wd = worker_dir(name)
+    (wd / "session_id").unlink(missing_ok=True)
     (wd / "claude").write_text("working\n")             # a stale state of an earlier worker must not look like "finished"
     task = next((l.lstrip("# ").strip() for l in pf.read_text().splitlines() if l.strip()), "worker task")
     (wd / "started.json").write_text(json.dumps({"time": time.time(), "head": git_out(path, "rev-parse", "HEAD"), "refs": git_refs(path), "task": task, "prompt": str(pf), "path": str(path)}))
@@ -199,6 +200,28 @@ def section(text, title):
     return m.group(1).strip() if m else ""
 
 
+def worker_is_session(hook):
+    """False only when the hook's session_id is known and differs from the one the worker's first prompt recorded ($HB_STATE/session_id)."""
+    sid = hook.get("session_id")
+    try:
+        mine = (Path(os.environ.get("HB_STATE", "")) / "session_id").read_text().strip()
+    except OSError:
+        return True
+    return not (sid and mine and sid != mine)
+
+
+def cmd_worker_prompt(_):
+    """The UserPromptSubmit hook of a worker: the first prompt records the Claude's session_id; later ones (also from a nested claude) change nothing."""
+    try:
+        sid = json.loads(sys.stdin.read() or "{}").get("session_id")
+    except ValueError:
+        sid = None
+    f = Path(os.environ.get("HB_STATE", "")) / "session_id"
+    if sid and not f.exists() and f.parent.is_dir():
+        f.write_text(sid)
+    return 0
+
+
 def cmd_worker_report(_):
     """The Stop hook of a worker (HB_WORKER=1): <HB_REPORTS>/<date-time>-<slug>.md with the task, Claude's final message, branch, commits on the branches the
     worker created or moved, the PR URL and the transcript path. One report per worker run: a later Stop (after `send`) rewrites it, keeping the earlier final
@@ -210,6 +233,12 @@ def cmd_worker_report(_):
     d = os.environ.get("HB_REPORTS")
     if not d:
         return 0
+    if not worker_is_session(hook):                          # a nested `claude -p` of the worker: not the worker finishing
+        return 0
+    try:
+        (Path(os.environ.get("HB_STATE", "")) / "claude").write_text("waiting finished responding\n")
+    except OSError:
+        pass
     sf = Path(os.environ.get("HB_STATE", "")) / "started.json"
     try:
         rec = json.loads(sf.read_text())

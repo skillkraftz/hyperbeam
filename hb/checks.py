@@ -172,12 +172,14 @@ HOOK_CMDS = [
 GUARD_MATCHER = "Bash"
 
 
-def hook_command(state, stop=False, notification=False):
+def hook_command(state, stop=False, notification=False, prompt=False):
     """Writes the state the menu and `wait` read. At Stop in a worker session (HB_WORKER=1) the report is written too (`_worker-report`, reads the hook input).
     The Notification hook leaves an idle notice alone (`idle_prompt`: Claude only sat waiting after Stop; the state stays "finished")."""
     idle = " && ! grep -q idle_prompt" if notification else ""
-    report = f' && {{ [ -z "$HB_WORKER" ] || {SELF} _worker-report; }}' if stop else ""
-    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ]{idle} && echo "{state}" > "$HB_STATE/claude"{report}; exit 0'
+    if stop:                    # a worker's Stop goes through `_worker-report`: it checks the session first (a nested `claude -p` inherits HB_WORKER), then writes state and report
+        return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ] && {{ [ -n "$HB_WORKER" ] && {SELF} _worker-report || echo "{state}" > "$HB_STATE/claude"; }}; exit 0'
+    rec = f'; [ -z "$HB_WORKER" ] || {SELF} _worker-prompt' if prompt else ""     # the first prompt of a worker records its Claude's session id
+    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ]{idle} && {{ echo "{state}" > "$HB_STATE/claude"{rec}; }}; exit 0'
 
 
 def guard_command():
@@ -201,7 +203,7 @@ def install_hooks(settings=None):
     if f.exists() and not bak.exists():
         bak.write_text(f.read_text())
     hooks = data.setdefault("hooks", {})
-    want = [(e, m, hook_command(st, stop=e == "Stop", notification=e == "Notification")) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
+    want = [(e, m, hook_command(st, stop=e == "Stop", notification=e == "Notification", prompt=e == "UserPromptSubmit")) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
     kind = lambda c: "guard" if "hyperbeam-guard" in c else "prs" if "hyperbeam-prs" in c else "state"
     claimed = set()
     for event, matcher, cmd in want:

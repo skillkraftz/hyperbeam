@@ -257,6 +257,7 @@ def main():
     td.set_defaults(f=cmd_tidy)
     sub.add_parser("status", help="running sessions and the state of their workers").set_defaults(f=cmd_status)
     sub.add_parser("_worker-report").set_defaults(f=cmd_worker_report)
+    sub.add_parser("_worker-prompt").set_defaults(f=cmd_worker_prompt)
     rf = sub.add_parser("refresh-prs", help="fetch a project's open PRs now so the sidebar's Merge button is right at once; run it after gh pr create (with the number) and after a merge; default project $HB_PROJECT")
     rf.add_argument("project", nargs="?")
     rf.add_argument("numbers", nargs="*", help="PR numbers just opened (looked up directly: GitHub's list lags a few seconds)")

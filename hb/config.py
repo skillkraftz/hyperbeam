@@ -124,7 +124,8 @@ def run(*a):
 
 
 def tmux(*a, check=True):
-    return subprocess.run(["tmux", *a], capture_output=True, text=True, check=check)
+    sock = os.environ.get("HB_TMUX_SOCKET")      # tests: an isolated tmux server (`tmux -L`)
+    return subprocess.run(["tmux", *(["-L", sock] if sock else []), *a], capture_output=True, text=True, check=check)
 
 
 def sanitize(name):
