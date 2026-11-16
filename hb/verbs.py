@@ -447,7 +447,7 @@ def cmd_usage(a):
 
 # ---------- `NAME VERB` inside a project's session: shims on the session PATH, and `hb VERB` for the current project ----------
 SHIM_MARK = "# hyperbeam shim"
-RESERVED = {"hb", "hyperbeam", "kk", "update", "scan", "open", "stop", "info", "list", "phone", "context", "report", "verify", "shot", "usage", "lab", "tool", "new",
+RESERVED = {"hb", "hyperbeam", "kk", "update", "scan", "open", "stop", "info", "list", "phone", "context", "report", "reports", "copy-last", "verify", "shot", "usage", "lab", "tool", "new",
             "align-facts", "try", "sidebar", "test", "install", "version", "help", "restart"}
 
 

@@ -242,18 +242,18 @@ def cmd_refresh_prs(a):
     return 0
 
 
-def cmd_report(a):
+def cmd_copy_last(a):
     name = a.project or os.environ.get("HB_PROJECT")
     if not name:
-        sys.exit("hyperbeam report: no project (run it in a project session, or give a name)")
+        sys.exit("hyperbeam copy-last: no project (run it in a project session, or give a name)")
     try:
         text = report_text(name)
     except RuntimeError as e:
-        sys.exit(f"hyperbeam report: {e}")
+        sys.exit(f"hyperbeam copy-last: {e}")
     if a.print:
         print(text, end="")
         return 0
-    print(f"{name}: {deliver_text(text, name + '-report', is_remote())} - \"{first_line(text)}\"")
+    print(f"{name}: {deliver_text(text, name + '-last', is_remote())} - \"{first_line(text)}\"")
     return 0
 
 

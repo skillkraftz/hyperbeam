@@ -9,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -238,14 +239,79 @@ class Report(unittest.TestCase):
         self.addCleanup(setattr, sys, "stdin", old)
         hb.cmd_worker_report(None)
         (f,) = list(self.reports.glob("*.md"))
-        self.assertRegex(f.name, r"^\d{4}-\d\d-\d\d-\d{4}-fix-the-thing\.md$")
+        self.assertRegex(f.name, r"^\d{4}-\d\d-\d\d-\d{6}-fix-the-thing\.md$")
         text = f.read_text()
         for want in ("# Fix the Thing!", "Done. Branch fix-thing", "branch: fix-thing", "PR: https://github.com/me/proj/pull/7", "Fix the thing", str(self.transcript)):
             self.assertIn(want, text)
 
+    def stop(self, stdin="{}"):
+        saved = dict(os.environ)
+        os.environ.update(self.env(True))
+        import sys
+        old = sys.stdin
+        sys.stdin = io.StringIO(stdin)
+        try:
+            hb.cmd_worker_report(None)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+            sys.stdin = old
+
+    def start(self, **extra):
+        self.repo.git("checkout", "-q", "main")
+        rec = {"time": time.time() - 60, "head": self.repo.git("rev-parse", "HEAD"), "refs": hb.git_refs(self.repo.r), "task": "T", "path": str(self.repo.r), **extra}
+        (self.state / "started.json").write_text(json.dumps(rec))
+        return rec
+
+    def test_two_stops_make_one_report_and_a_send_round_keeps_the_earlier_message(self):
+        self.start()
+        self.stop(json.dumps({"last_assistant_message": "first answer"}))
+        self.stop(json.dumps({"last_assistant_message": "first answer, again"}))
+        (f,) = list(self.reports.glob("*.md"))
+        self.assertNotIn("Earlier rounds", f.read_text())
+        rec = json.loads((self.state / "started.json").read_text())
+        rec["sent"] = time.time() + 1                               # `send` happened
+        (self.state / "started.json").write_text(json.dumps(rec))
+        self.stop(json.dumps({"last_assistant_message": "second answer"}))
+        (f,) = list(self.reports.glob("*.md"))
+        text = f.read_text()
+        self.assertEqual(hb.section(text, "Claude's final message"), "second answer")
+        self.assertEqual(hb.section(text, "Earlier rounds"), "first answer, again")
+
+    def test_a_commit_on_an_unrelated_branch_from_before_the_start_is_not_listed(self):
+        self.start()                                                # fix-thing (with its commit) existed at the start
+        self.repo.git("checkout", "-qb", "mine")
+        self.repo.write("m.txt", "m\n")
+        self.repo.commit("My change")
+        self.stop()
+        c = hb.section(next(self.reports.glob("*.md")).read_text(), "Commits since the worker started")
+        self.assertIn("My change [mine]", c)
+        self.assertNotIn("Fix the thing", c)
+
+    def test_reports_prints_the_numbers_of_a_report_and_its_transcript(self):
+        t0 = "2026-11-16T10:00:00+00:00"
+        recs = [{"type": "user", "timestamp": t0, "message": {"role": "user", "content": "go"}}]
+        for i, (ts, mid) in enumerate([("2026-11-16T10:01:00+00:00", "a"), ("2026-11-16T10:03:00+00:00", "a"), ("2026-11-16T10:05:00+00:00", "b"), ("2026-11-16T11:00:00+00:00", "c")]):
+            recs.append({"type": "assistant", "timestamp": ts, "message": {"id": mid, "role": "assistant", "content": [], "usage": {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000, "output_tokens": 5}}})
+        self.transcript.write_text("\n".join(json.dumps(r) for r in recs))
+        data = Path(tempfile.mkdtemp())
+        rd = data / "projects" / "proj-abc123" / "reports"
+        rd.mkdir(parents=True)
+        (rd / "r.md").write_text("# Refactor the thing\n\n- project: proj\n- started: 2026-11-16 10:00:00\n- finished: 2026-11-16 10:06:00\n- branch: b\n- PR: https://github.com/me/proj/pull/9\n"
+                                 f"- transcript (the long form): {self.transcript}\n\n## Claude's final message\n\nok\n\n## Commits since the worker started\n\nabc one [b]\ndef two [b]\n")
+        (data / "lab-runs.jsonl").write_text(json.dumps({"time": "2026-11-16T10:02:00", "project": "proj", "command": "x", "seconds": 12.0, "exit": 0}) + "\n"
+                                             + json.dumps({"time": "2026-11-16T12:02:00", "project": "proj", "command": "x", "seconds": 99.0, "exit": 0}) + "\n")
+        out = io.StringIO()
+        with mock.patch.object(hb, "DATA_DIR", data), redirect_stdout(out):
+            hb.cmd_reports(types.SimpleNamespace(names=[], since=None, since_refactor=False))
+        text = out.getvalue()
+        self.assertIn("#9", text)
+        # 3 calls (a, b, c): in+cc 3*110, cache 3*1000, out 15; active: 10:00..10:05 = 5 min (the hour gap is dropped), lab 12 s
+        self.assertRegex(text, r"\s2\s+330\s+3000\s+15\s+3\s+5\s+12\n")
+        self.assertRegex(text.splitlines()[-1], r"^total\s+1 reports.*\s2\s+330\s+3000\s+15\s+3\s+5\s+12$")
+
     def test_commits_made_in_a_worktree_branch_are_listed(self):
-        (self.state / "started.json").write_text(json.dumps({"time": time.time() - 60, "head": self.repo.git("rev-parse", "HEAD"), "task": "T", "path": str(self.repo.r)}))
-        self.repo.git("checkout", "-q", "main")                     # the project folder stays on main; the worker commits elsewhere
+        self.start()
         wt = self.repo.d / "wt"
         self.repo.git("worktree", "add", "-q", "-b", "wt-branch", str(wt), "main")
         (wt / "w.txt").write_text("w\n")
