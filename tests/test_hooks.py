@@ -35,7 +35,7 @@ class InstallHooks(unittest.TestCase):
         self.old_style_settings()
         self.assertTrue(hb.install_hooks(str(self.f)))
         hooks = json.loads(self.f.read_text())["hooks"]
-        self.assertEqual({e: len(g) for e, g in hooks.items()}, {"Stop": 1, "Notification": 1, "UserPromptSubmit": 1, "PreToolUse": 2, "PostToolUse": 3})
+        self.assertEqual({e: len(g) for e, g in hooks.items()}, {"Stop": 1, "Notification": 1, "UserPromptSubmit": 1, "PreToolUse": 2, "PostToolUse": 3, "PostToolUseFailure": 1, "PermissionDenied": 1})
         self.assertIn("echo someone-elses-hook", self.commands("PostToolUse"))
         self.assertEqual(json.loads(self.f.read_text())["theme"], "dark")             # nothing else is touched
 
@@ -49,7 +49,7 @@ class InstallHooks(unittest.TestCase):
     def test_from_nothing_it_installs_one_of_each(self):
         hb.install_hooks(str(self.f))
         hooks = json.loads(self.f.read_text())["hooks"]
-        self.assertEqual({e: len(g) for e, g in hooks.items()}, {"Stop": 1, "Notification": 1, "UserPromptSubmit": 1, "PreToolUse": 2, "PostToolUse": 2})
+        self.assertEqual({e: len(g) for e, g in hooks.items()}, {"Stop": 1, "Notification": 1, "UserPromptSubmit": 1, "PreToolUse": 2, "PostToolUse": 2, "PostToolUseFailure": 1, "PermissionDenied": 1})
 
     def test_the_pr_hook_points_at_the_script_next_to_the_app(self):
         hb.install_hooks(str(self.f))

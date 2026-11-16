@@ -165,15 +165,19 @@ HOOK_CMDS = [
     ("Notification", "", "waiting needs your input or permission"),
     ("PreToolUse", "AskUserQuestion|ExitPlanMode", "waiting asks you a question"),
     ("PostToolUse", "", "working"),
+    ("PostToolUseFailure", "", "working"),               # Claude carries on after a prompt it blocked by itself (unattended)
+    ("PermissionDenied", "", "working"),
     ("UserPromptSubmit", "", "working"),
 ]
 GUARD_MATCHER = "Bash"
 
 
-def hook_command(state, stop=False):
-    """Writes the state the menu and `wait` read. At Stop in a worker session (HB_WORKER=1) the report is written too (`_worker-report`, reads the hook input)."""
+def hook_command(state, stop=False, notification=False):
+    """Writes the state the menu and `wait` read. At Stop in a worker session (HB_WORKER=1) the report is written too (`_worker-report`, reads the hook input).
+    The Notification hook leaves an idle notice alone (`idle_prompt`: Claude only sat waiting after Stop; the state stays "finished")."""
+    idle = " && ! grep -q idle_prompt" if notification else ""
     report = f' && {{ [ -z "$HB_WORKER" ] || {SELF} _worker-report; }}' if stop else ""
-    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ] && echo "{state}" > "$HB_STATE/claude"{report}; exit 0'
+    return f'[ -n "$HB_PROJECT" ] && [ -d "$HB_STATE" ]{idle} && echo "{state}" > "$HB_STATE/claude"{report}; exit 0'
 
 
 def guard_command():
@@ -197,7 +201,7 @@ def install_hooks(settings=None):
     if f.exists() and not bak.exists():
         bak.write_text(f.read_text())
     hooks = data.setdefault("hooks", {})
-    want = [(e, m, hook_command(st, stop=e == "Stop")) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
+    want = [(e, m, hook_command(st, stop=e == "Stop", notification=e == "Notification")) for e, m, st in HOOK_CMDS] + [("PreToolUse", GUARD_MATCHER, guard_command()), ("PostToolUse", "Bash", prs_command())]
     kind = lambda c: "guard" if "hyperbeam-guard" in c else "prs" if "hyperbeam-prs" in c else "state"
     claimed = set()
     for event, matcher, cmd in want:
