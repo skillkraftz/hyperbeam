@@ -1,9 +1,11 @@
 ---
 id: 2026-11-16-worker-reports-and-reports-command
 status: implemented
-topic: workers
+topic: work-loop
 prs: []
 ---
+
+# One report per worker run, and `hyperbeam reports`
 
 ## Decision
 A worker run has one report: its name has seconds and is kept in `started.json`, so later Stops (after `send`) rewrite it and the earlier final messages move to an "Earlier rounds" section. Commits are those on branches the worker created or moved (refs recorded at start, compared at Stop). `hyperbeam reports` lists the reports with tokens, calls, active minutes and lab seconds, and a total. The old `hyperbeam report` is now `hyperbeam copy-last` (button "Copy last").
