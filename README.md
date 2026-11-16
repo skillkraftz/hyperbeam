@@ -22,6 +22,11 @@ can break something live.
 - **The same verbs everywhere:** `install`, `update`, `test`, `version`, `help`, `restart`, for every project, plus **Merge** (merges a project's open PRs oldest first, then updates it).
 - **One set of rules** (RULES.md) every project follows, and memory in the repo (CLAUDE.md, `docs/decisions/`).
 
+## The project loop
+For a project you want in shape, the manager runs one worker task at a time, reading each report and PR (and sending feedback with `send`) before the next:
+align + audit (one PR plus the audit in the report) → fixes for the biggest problems, one PR each → re-audit (read-only) → refactor and cleanup → README with pictures.
+**The usage rule:** before each task the manager reads the 5-hour limit (`hyperbeam usage`): under 50% it builds and fixes; from 50% only refactor, docs and README.
+
 ![The sidebar](docs/img/sidebar.png)
 ![Two workers running](docs/img/workers.png)
 
@@ -39,6 +44,9 @@ hyperbeam itself in `~/projects/hyperbeam`, on branches, like any project.
 |---|---|
 | `hyperbeam` (Ctrl+Alt+H) | the sidebar: click a row, double-click to open its session |
 | `hyperbeam work NAME FILE` / `wait NAME` / `send NAME FILE` / `close NAME` | the manager's loop: start a worker, wait for its report, send it review feedback, end it |
+| `hyperbeam status` / `reports [NAME]` | which sessions and workers exist and what they are doing / the reports with their cost |
+| `hyperbeam tidy [NAME] [--yes]` | list (and with `--yes` delete) merged branches and worktrees |
+| `hyperbeam copy-last [NAME]` | copy Claude's last message to the clipboard |
 | `hyperbeam NAME update` (also `install`, `test`, `version`, `help`, `restart`) | the same verbs for every project |
 | `kk` (`hyperbeam info`) | a project's URLs: services, ports, Tailscale, open PRs |
 | `hyperbeam lab run --why TEXT -- COMMAND` | run anything test-like in the lab |

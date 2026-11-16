@@ -7,7 +7,7 @@ Hotkey -> a sidebar (a Textual menu) of every project in ~/projects -> one tmux 
 
 ## Decisions (the short list)
 - Claude Code is the default agent, on `sonnet`, one session per project. Planning happens in the manager conversation (the first row); `opusplan` stays a choice in Settings.
-- **Workers:** the manager, after the user said yes, starts a worker in a project (`hyperbeam work NAME PROMPT_FILE`: tmux session `claude-NAME`, a fresh Claude, no services), waits (`hyperbeam wait NAME`), reads the report, sends review feedback (`hyperbeam send NAME FILE`), ends it (`hyperbeam close NAME`). Workers always use a git worktree. hyperbeam never starts Claude work by itself.
+- **Workers:** the manager, after the user said yes, starts a worker in a project (`hyperbeam work NAME PROMPT_FILE`: starts the user's session NAME with its services if it is not running, then the worker session `claude-NAME`, a fresh Claude with no services of its own), waits (`hyperbeam wait NAME`), reads the report, sends review feedback (`hyperbeam send NAME FILE`), ends it (`hyperbeam close NAME`). Workers always commit in a git worktree. hyperbeam never starts Claude work by itself.
 - Manifests (`projects/<name>.toml`, in this repo, not in the projects) say how a project starts. Each project has a fixed port, set through tmux session env vars. No direnv.
 - `kk` (`hyperbeam info`) lists a project's URLs; status dots show what needs attention.
 - ~/.config/tmux/tmux.conf is the user's; hyperbeam adds one line, `source-file -q ~/.config/tmux/hyperbeam.conf`, a link to this repo's `hyperbeam.conf` (tmux keys and hooks).
