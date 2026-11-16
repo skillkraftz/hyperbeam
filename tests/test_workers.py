@@ -96,6 +96,19 @@ class Workers(unittest.TestCase):
             hb.cmd_close(types.SimpleNamespace(name="proj"))
         self.assertFalse([a for a in self.calls if a[0] == "kill-session"])
 
+    def test_a_workers_claude_command_drops_mcp_plugins_and_skills_and_the_users_does_not(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".claude").mkdir()
+        (home / ".claude" / "settings.json").write_text(json.dumps({"enabledPlugins": {"vercel@x": True, "stripe@x": True}}))
+        with mock.patch.object(hb.Path, "home", return_value=home):
+            flags = hb.worker_flags()
+        for want in ("--strict-mcp-config", "--mcp-config", "--disable-slash-commands", "vercel@x", "stripe@x"):
+            self.assertIn(want, flags)
+        self.assertEqual(json.loads(__import__("shlex").split(flags.split("--settings ")[1])[0])["enabledPlugins"], {"vercel@x": False, "stripe@x": False})
+        for cmd in (hb.claude_base(), hb.claude_cmd(), hb.claude_cmd(cont=True)):
+            self.assertNotIn("--strict-mcp-config", cmd)
+            self.assertNotIn("--settings", cmd)
+
     def test_the_worker_prompt_is_worker_md_the_problems_then_the_task_and_never_plan_mode(self):
         text = hb.worker_prompt_text(self.prompt, ["merge in progress"])
         self.assertTrue(text.startswith("The start check found problems"))
