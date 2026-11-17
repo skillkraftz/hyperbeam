@@ -789,6 +789,7 @@ def start_session(name, man, say=print, path=None, restore=None, findings=(), no
     path = manifest_path(man) if man else Path(path)
     if not path.is_dir():
         raise RuntimeError(f"{path} does not exist")
+    trust_folder(path)
     envargs = project_envargs(name, man, path)
     plan = None
     if restore:

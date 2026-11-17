@@ -144,6 +144,35 @@ def find_claude_pane(sess):
             or next((r[0] for r in rows if r[2] == "work"), None) or (rows[0][0] if rows else None))
 
 
+def claude_json_path():
+    """The file Claude Code keeps its per-folder trust in: $CLAUDE_CONFIG_DIR/.claude.json if that is set, else ~/.claude.json. Workers and project sessions
+    use the same one (hyperbeam sets no config dir of its own)."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(d).expanduser() / ".claude.json" if d else Path.home() / ".claude.json"
+
+
+def trust_folder(path):
+    """Set projects["<abs path>"].hasTrustDialogAccepted = true in Claude's config, so a Claude started there (a new project's first session or worker) does not stop at
+    "Do you trust the files in this folder?". Only that key, only when it is not already true; written via a temp file + rename with the file's mode. Missing or
+    unreadable file, or any error: skip quietly (never breaks work/open). Callers pass folders hyperbeam manages only. Returns True if it wrote."""
+    try:
+        f = claude_json_path()
+        key = str(Path(path).expanduser().resolve())
+        data = json.loads(f.read_text())
+        if not isinstance(data, dict) or not isinstance(data.get("projects", {}), dict):
+            return False
+        if data.get("projects", {}).get(key, {}).get("hasTrustDialogAccepted") is True:
+            return False
+        data.setdefault("projects", {}).setdefault(key, {})["hasTrustDialogAccepted"] = True
+        tmp = f.with_name(f".{f.name}.hb-{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.chmod(tmp, f.stat().st_mode & 0o7777)
+        os.replace(tmp, f)
+        return True
+    except Exception:
+        return False
+
+
 def claude_base(plan=False):
     """Every Claude hyperbeam starts uses the configured model, effort and permissions. plan: it starts in plan mode (injected prompts), but only with the
     opusplan model (plans_first); with permissions "skip" bypass is then only allowed, so approving the plan can switch to it (both flags together would
