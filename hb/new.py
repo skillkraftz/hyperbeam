@@ -70,6 +70,7 @@ def cmd_new(a):
     for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"]):
         subprocess.run(cmd, cwd=path, check=True, capture_output=True)
     ensure_link(name, path)
+    trust_folder(path)
     subprocess.run(["git", "-c", "user.name=" + (git_out(path, "config", "user.name") or "hyperbeam"), "-c", "user.email=" + (git_out(path, "config", "user.email") or "noreply@hyperbeam.invalid"),
                     "commit", "-q", "-m", f"Initial commit (hyperbeam new --{kind}): version, help, update and install built in"], cwd=path, check=True, capture_output=True)
     man = f'path = "{home_rel(path)}"\n' + (f"port = {port}\n\n[[service]]\nname = \"dev\"\ncmd = \"npm run dev\"\n" if kind == "web" else "")

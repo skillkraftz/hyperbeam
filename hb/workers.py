@@ -72,6 +72,7 @@ def cmd_work(a):
     if not path.is_dir():
         sys.exit(f"hyperbeam work: {path} does not exist")
     findings, notes = start_check(name, path)
+    trust_folder(path)
     if not session_exists(sess):
         start_session(name, man, print, path=path, restore=load_layout(name), findings=findings, notes=notes)
         touch_opened(name)
