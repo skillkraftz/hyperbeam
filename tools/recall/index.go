@@ -3,7 +3,9 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -31,7 +33,8 @@ type parsed struct {
 	fi    fileInfo
 	units []unit
 	off   int64
-	appnd bool // units are to be added after the file's existing ones
+	tail  string // hash of the bytes just before off (a Claude Code file): tells a file that grew from one that was rewritten
+	appnd bool   // units are to be added after the file's existing ones
 	err   error
 }
 
@@ -112,15 +115,19 @@ func projectName(dir string) string {
 
 func reindex(db *sql.DB, full bool) (stats, error) {
 	var st stats
-	old := map[string][3]int64{}
-	rows, err := db.Query(`SELECT path, size, mtime, off FROM files`)
+	type oldFile struct {
+		size, mtime, off int64
+		tail             string
+	}
+	old := map[string]oldFile{}
+	rows, err := db.Query(`SELECT path, size, mtime, off, coalesce(tail,'') FROM files`)
 	if err != nil {
 		return st, err
 	}
 	for rows.Next() {
 		var p string
-		var v [3]int64
-		rows.Scan(&p, &v[0], &v[1], &v[2])
+		var v oldFile
+		rows.Scan(&p, &v.size, &v.mtime, &v.off, &v.tail)
 		old[p] = v
 	}
 	rows.Close()
@@ -131,7 +138,7 @@ func reindex(db *sql.DB, full bool) (stats, error) {
 	for _, f := range found {
 		seen[f.path] = true
 		o, ok := old[f.path]
-		if !full && ok && o[0] == f.size && o[1] == f.mtime {
+		if !full && ok && o.size == f.size && o.mtime == f.mtime {
 			st.same++
 			continue
 		}
@@ -153,8 +160,8 @@ func reindex(db *sql.DB, full bool) (stats, error) {
 	for _, f := range todo {
 		o, ok := old[f.path]
 		start := int64(0)
-		if !full && ok && f.kind == "code" && f.size > o[0] && o[2] > 0 {
-			start = o[2]
+		if !full && ok && f.kind == "code" && f.size > o.size && o.off > 0 && o.tail != "" && o.tail == tailHash(f.path, o.off) {
+			start = o.off // grew, and the bytes before the old end are the ones read last time
 		}
 		wg.Add(1)
 		go func(f fileInfo, start int64) {
@@ -199,7 +206,7 @@ func reindex(db *sql.DB, full bool) (stats, error) {
 			}
 			st.units++
 		}
-		tx.Exec(`INSERT OR REPLACE INTO files(path,size,mtime,off) VALUES(?,?,?,?)`, r.fi.path, r.fi.size, r.fi.mtime, r.off)
+		tx.Exec(`INSERT OR REPLACE INTO files(path,size,mtime,off,tail) VALUES(?,?,?,?,?)`, r.fi.path, r.fi.size, r.fi.mtime, r.off, r.tail)
 		st.changed++
 	}
 	return st, tx.Commit()
@@ -217,6 +224,9 @@ func parseFile(f fileInfo, start int64) parsed {
 	switch f.kind {
 	case "code":
 		p.units, p.off, err = parseClaude(f, start)
+		if err == nil {
+			p.tail = tailHash(f.path, p.off)
+		}
 	case "steno":
 		p.units, err = parseSteno(f)
 	case "notes":
@@ -226,6 +236,25 @@ func parseFile(f fileInfo, start int64) parsed {
 	}
 	p.err = err
 	return p
+}
+
+// tailHash: a hash of the (up to 4 KB of) bytes that end at off; "" if the file is shorter or unreadable.
+func tailHash(path string, off int64) string {
+	fh, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer fh.Close()
+	n := int64(4096)
+	if off < n {
+		n = off
+	}
+	buf := make([]byte, n)
+	if _, err := fh.ReadAt(buf, off-n); err != nil {
+		return ""
+	}
+	h := sha1.Sum(buf)
+	return hex.EncodeToString(h[:])
 }
 
 func clip(s string, n int) string {
@@ -289,7 +318,7 @@ func parseClaude(f fileInfo, start int64) ([]unit, int64, error) {
 				role := c.Type
 				text := extract(c.Message.Content, &role)
 				if strings.TrimSpace(text) != "" {
-					out = append(out, unit{grp: f.path, source: "code", project: f.project, session: sess[:min(8, len(sess))], role: role, ts: parseTime(c.Timestamp), text: mask(clip(text, maxText))})
+					out = append(out, unit{grp: f.path, source: "code", project: f.project, session: sess[:min(8, len(sess))], role: role, ts: parseTime(c.Timestamp), text: clip(mask(text), maxText)})
 				}
 			}
 		}
@@ -426,7 +455,7 @@ func parseNotes(f fileInfo) ([]unit, error) {
 	var cur []string
 	flush := func() {
 		if t := strings.TrimSpace(strings.Join(cur, "\n")); t != "" {
-			out = append(out, unit{grp: f.path, source: "notes", project: f.project, session: base, title: title, role: "note", ts: ts, text: mask(clip(t, maxText))})
+			out = append(out, unit{grp: f.path, source: "notes", project: f.project, session: base, title: mask(title), role: "note", ts: ts, text: clip(mask(t), maxText)})
 		}
 		cur = nil
 	}
@@ -522,7 +551,7 @@ func parseWeb(f fileInfo) ([]unit, error) {
 			if ts == 0 {
 				ts = parseTime(c.CreatedAt)
 			}
-			out = append(out, unit{grp: f.path + "#" + c.UUID, source: "web", project: "claude.ai", session: c.UUID, title: title, role: role, ts: ts, text: mask(clip(text, maxText))})
+			out = append(out, unit{grp: f.path + "#" + c.UUID, source: "web", project: "claude.ai", session: c.UUID, title: mask(title), role: role, ts: ts, text: clip(mask(text), maxText)})
 		}
 	}
 	return out, nil

@@ -2,7 +2,7 @@
 id: 2026-11-18-update-runs-own-update
 status: implemented
 topic: verbs
-prs: []
+prs: [75]
 ---
 
 # `NAME update` runs the project's own update and measures from the last recorded commit

@@ -55,6 +55,22 @@ class Trust(unittest.TestCase):
         self.assertFalse(hb.trust_folder(self.proj))
         self.assertEqual(self.f.read_text(), "{not json")
 
+    def test_a_symlinked_config_stays_a_symlink(self):
+        real = self.d / "dotfiles" / "claude.json"
+        real.parent.mkdir()
+        real.write_text(json.dumps({"projects": {}}))
+        self.f.symlink_to(real)
+        self.assertTrue(hb.trust_folder(self.proj))
+        self.assertTrue(self.f.is_symlink())
+        self.assertIs(json.loads(real.read_text())["projects"][str(self.proj.resolve())]["hasTrustDialogAccepted"], True)
+
+    def test_a_failed_write_leaves_no_temp_file_and_the_original(self):
+        self.f.write_text(json.dumps({"projects": {}}))
+        with mock.patch.object(hb.os, "replace", side_effect=OSError("no")):
+            self.assertFalse(hb.trust_folder(self.proj))
+        self.assertEqual(self.read(), {"projects": {}})
+        self.assertEqual([p.name for p in self.d.iterdir() if p.name.startswith(".claude.json.")], [])
+
     def test_home_file_is_used_without_a_config_dir(self):
         with mock.patch.dict(os.environ):
             os.environ.pop("CLAUDE_CONFIG_DIR")

@@ -54,11 +54,14 @@ func openDB() (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	_, err = db.Exec(`
-CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, off INTEGER);
+CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, off INTEGER, tail TEXT);
 CREATE TABLE IF NOT EXISTS units(id INTEGER PRIMARY KEY, file TEXT, grp TEXT, seq INTEGER, source TEXT, project TEXT, session TEXT, title TEXT, role TEXT, ts INTEGER);
 CREATE INDEX IF NOT EXISTS units_file ON units(file);
 CREATE INDEX IF NOT EXISTS units_grp ON units(grp, seq);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, tokenize='porter unicode61');`)
+	if err == nil {
+		db.Exec(`ALTER TABLE files ADD COLUMN tail TEXT`) // a database made before the column existed; fails harmlessly when it is there
+	}
 	return db, err
 }
 

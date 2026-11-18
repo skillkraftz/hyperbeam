@@ -132,9 +132,7 @@ def verb_update(name, path, say, since=None):
         say(f"{base} is already up to date")
     else:
         say(f"{base}: {old[:7]} -> {new[:7]} ({len(changed)} file{'s' * (len(changed) != 1)} changed)")
-    own, own_src = verb_command(name, path, "update")
-    if own and not own_src.startswith(("manifest", "package.json", "Makefile")):
-        own = None
+    own, own_src = verb_command(name, path, "update")     # None unless the project provides it (manifest, package.json, Makefile)
     if changed and own:
         say(f"update: {own}   [{own_src}]")
         if run_cmd_stream(own, path, say):
