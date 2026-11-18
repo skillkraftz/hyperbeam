@@ -1,0 +1,105 @@
+#!/bin/bash
+# recall's test: fixtures of each source (Claude Code jsonl with tool_use/tool_result, a claude.ai export as loose json and as zip, steno + clip, manager notes);
+# index, incremental re-index (append, change, delete), search + filters, show context, secret masking, auto-index before a search.
+set -euo pipefail
+t="$(cd "$(dirname "$0")" && pwd)/recall"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export TZ=UTC RECALL_DB="$tmp/db/recall.db" RECALL_CLAUDE="$tmp/claude" RECALL_STENO="$tmp/steno" RECALL_MANAGER="$tmp/mgr"
+fail() { echo "FAIL: $*"; exit 1; }
+has() { grep -qF -- "$2" <<<"$1" || fail "expected '$2' in: $1"; }
+hasnt() { ! grep -qF -- "$2" <<<"$1" || fail "did not expect '$2' in: $1"; }
+
+mkdir -p "$tmp/claude/-home-andy-projects-widget" "$tmp/claude/-home-andy--cache-hyperbeam-work-fix" "$tmp/steno/clips" "$tmp/mgr/projects" "$tmp/mgr/inbox/export"
+SK="sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"
+LONG=$(printf 'Ab1%.0s' $(seq 1 15))
+J="$tmp/claude/-home-andy-projects-widget/aaaaaaaa-1111.jsonl"
+cat > "$J" <<EOF
+{"type":"permission-mode","mode":"default"}
+{"type":"user","sessionId":"aaaaaaaa-1111","timestamp":"2026-11-10T09:00:00.000Z","message":{"role":"user","content":"We should use a gearbox for the zebra feature"}}
+{"type":"assistant","timestamp":"2026-11-10T09:00:05.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secretthought"},{"type":"text","text":"Reading the config for the zebra feature."},{"type":"tool_use","name":"Bash","input":{"command":"cat .env"}}]}}
+{"type":"user","timestamp":"2026-11-10T09:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"short result mentioning pelican"}]}}
+{"type":"user","timestamp":"2026-11-10T09:00:07.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"y","content":"$(printf 'bulkyoutput %.0s' $(seq 1 400))"}]}}
+{"type":"user","isMeta":true,"timestamp":"2026-11-10T09:00:08.000Z","message":{"role":"user","content":"metamessage hidden"}}
+{"type":"assistant","timestamp":"2026-11-10T09:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"My key is $SK and also $LONG done. export API_TOKEN=hunter2hunter2"}]}}
+EOF
+echo '{"type":"user","timestamp":"2026-11-12T10:00:00.000Z","message":{"role":"user","content":"worker session talks about the quokka"}}' > "$tmp/claude/-home-andy--cache-hyperbeam-work-fix/bbbbbbbb-2222.jsonl"
+
+cat > "$tmp/steno/steno-2026-11-12.txt" <<EOF
+start: 2026-11-12 09:04:17 · live · unknown · audio/x.opus
+[09:04:17] alright so i bought a new drill today
+[09:04:23] and um
+[09:04:24] the drill is a cordless one
+EOF
+cat > "$tmp/steno/clips/clip-2026-11-09-083630.txt" <<EOF
+# 20261109_083630 · recorded 2026-11-09 08:36 · 00:00:05
+source: /data/phone/x.mp4
+
+[00:00:00 → 00:00:03 | 08:36:30] This is a test about the ostrich.
+EOF
+cat > "$tmp/mgr/now.md" <<EOF
+# Now
+intro line about the heron
+## Decisions
+We chose the walrus approach.
+EOF
+echo "# Widget
+The widget uses a lemur." > "$tmp/mgr/projects/widget.md"
+EXPORT='[{"uuid":"c1","name":"Garden planning","created_at":"2026-10-01T12:00:00Z","chat_messages":[{"uuid":"m1","sender":"human","text":"How do I grow tomatoes?","created_at":"2026-10-01T12:00:00Z","content":[{"type":"text","text":"How do I grow tomatoes?"}]},{"uuid":"m2","sender":"assistant","text":"","created_at":"2026-10-01T12:00:09Z","content":[{"type":"text","text":"Tomatoes like sun and a trellis."}]}]},{"uuid":"c2","name":"Other","created_at":"2026-10-02T12:00:00Z","chat_messages":[{"uuid":"m3","sender":"human","text":"unrelated flamingo","created_at":"2026-10-02T12:00:00Z"}]}]'
+echo "$EXPORT" > "$tmp/mgr/inbox/export/conversations.json"
+
+out=$("$t" index); has "$out" "indexed 7 files"
+S() { "$t" search "$@" 2>/dev/null; }
+
+# search + sources
+has "$(S zebra)" "widget"; has "$(S zebra)" "user"
+has "$(S 'gearbox zebra' --source code)" "[gearbox]"
+has "$(S drill --source steno)" "2026-11-12 09:04"; has "$(S drill --source steno)" "steno-2026-11-12"
+has "$(S ostrich --source steno)" "2026-11-09 08:36"
+has "$(S walrus --source notes)" "now.md / Decisions"; has "$(S heron --source notes)" "now.md"
+has "$(S lemur --source notes)" "widget"
+has "$(S tomatoes --source web)" "Garden planning"; has "$(S trellis --source web)" "assistant"
+has "$(S flamingo --source web)" "Other"; has "$(S flamingo --source web)" "2026-10-02"
+# tool bodies, thinking, meta
+hasnt "$(S pelican)" "pelican"; has "$(S pelican --role tool)" "pelican"
+has "$(S bulkyoutput --role tool)" "no matches"
+has "$(S secretthought)" "no matches"; has "$(S metamessage)" "no matches"
+has "$(S Bash --source code)" "[Bash]"                      # tool names are kept
+# filters
+has "$(S quokka --project hyperbeam-work)" "quokka"; has "$(S quokka --project widget)" "no matches"
+has "$(S zebra --since 2026-11-11)" "no matches"; has "$(S zebra --since 2026-11-10)" "zebra"
+has "$(S tomatoes --source code)" "no matches"
+[ "$(S the --limit 2 | grep -c '^#')" -le 2 ] || fail "limit"
+# odd queries do not break FTS syntax
+S 'what is "this (that' >/dev/null; S "C++ -x" >/dev/null; has "$(S 'zebra OR quokka')" "quokka"
+
+# show: context from the same session only
+id=$(S "gearbox" --source code | grep -o '^#[0-9]*' | head -1 | tr -d '#')
+sh=$("$t" show "$id" --context 2); has "$sh" "gearbox"; has "$sh" "Reading the config"; has "$sh" "[Bash]"; hasnt "$sh" "quokka"; hasnt "$sh" "heron"
+[ "$("$t" show "$id" --context 0 | grep -c '^[▶ ] #')" = 1 ] || fail "show --context 0"
+id=$(S "trellis" --source web | grep -o '^#[0-9]*' | head -1 | tr -d '#')
+sh=$("$t" show "$id"); has "$sh" "grow tomatoes"; hasnt "$sh" "flamingo"      # another conversation stays out
+
+# secrets: neither stored nor printed
+has "$(S 'My key')" "[secret]"
+all="$(S 'My key')$(S done)$("$t" show "$(S 'My key' | grep -o '^#[0-9]*' | head -1 | tr -d '#')")"
+hasnt "$all" "$SK"; hasnt "$all" "$LONG"; hasnt "$all" "hunter2hunter2"
+
+# incremental: nothing changed -> nothing read; append -> only new lines; changed/removed files follow
+out=$("$t" index); has "$out" "indexed 0 files (7 unchanged"
+echo '{"type":"assistant","timestamp":"2026-11-10T09:05:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"appended giraffe line"}]}}' >> "$J"
+out=$("$t" index); has "$out" "indexed 1 files"; has "$out" "1 units"
+has "$(S giraffe)" "giraffe"; has "$(S zebra)" "zebra"
+echo "more words about the capybara" >> "$tmp/mgr/now.md"
+"$t" index >/dev/null; has "$(S capybara --source notes)" "now.md"
+rm "$tmp/mgr/projects/widget.md"
+out=$("$t" index); has "$out" "1 removed"; has "$(S lemur)" "no matches"
+# auto-index before a search
+echo "# Later
+the narwhal chapter" >> "$tmp/mgr/now.md"
+has "$(S narwhal)" "narwhal"
+# full re-index gives the same count
+n1=$("$t" stats | grep -c units); "$t" index --full >/dev/null; [ "$("$t" stats | grep -c units)" = "$n1" ] || fail "full reindex"
+has "$("$t" stats)" "code"
+out=$("$t" show 99999 2>&1 || true); has "$out" "no unit"
+echo "PASS recall"

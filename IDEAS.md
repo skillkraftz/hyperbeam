@@ -39,3 +39,4 @@ One line each. A PR that finishes an item moves it to Done (PR number, decision 
 - ~~Lab digest ranks by total time (count x duration) so frequent work bubbles up~~ Done (PR #47, decision digest-ranks-by-total-time).
 - ~~README with recordings of the loop~~ Done (task 9 of the 2026-11-15 audit): README rewritten for the manager/worker flow; `tools/demo` regenerates `docs/img/` (loop.gif and PNGs, fake projects and fake claude, in the lab, drawn with pyte and Pillow instead of asciinema/agg).
 - ~~Docs match the code (audit 2026-11-16, tasks 1, 8, 9)~~ Done: worker, Merge and IDEAS wording corrected; README lists the commands that matter and the project loop.
+- ~~Search over everything said and done with Claude~~ Done (PR pending, decision 2026-11-18-recall-search-tool): `hyperbeam tool recall search|show|index|stats`.

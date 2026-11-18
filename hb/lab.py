@@ -409,6 +409,8 @@ def cmd_tool(a):
     if err:
         print(f"hyperbeam tool {a.name}: {err}  (hyperbeam tool --test {a.name})")
         return 1
+    if (TOOLS_SRC / a.name / "host").exists():     # a tool that reads the user's own data (recall) runs as the user, read-only and offline by design
+        return subprocess.run([str(TOOLS_SRC / a.name / a.name), *a.args]).returncode
     ns = types.SimpleNamespace(action="run", dir=a.dir, name=None, why=f"tool {a.name}", fresh=False, timeout=a.timeout, cmd=["--", f"{LAB_HOME}/tools/{a.name}/{a.name}", *a.args])
     return cmd_lab(ns)
 

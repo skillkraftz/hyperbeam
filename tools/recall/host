@@ -1,0 +1,1 @@
+Runs as the user, not in the lab: it reads the user's own transcripts and notes (the lab user cannot). Tests still run in the lab.
