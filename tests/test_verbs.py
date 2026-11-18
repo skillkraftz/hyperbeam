@@ -46,12 +46,11 @@ class TestVerb(unittest.TestCase):
         self.assertEqual(lines, ["lab is not set up"])
 
 
-class UpdateSince(unittest.TestCase):
-    """verb_update after something else (Merge) already pulled."""
-
+class UpdateBase(unittest.TestCase):
     def setUp(self):
-        self.saved = {k: getattr(hb, k) for k in ("restart_services", "verb_command", "run_cmd_stream", "load_manifests")}
+        self.saved = {k: getattr(hb, k) for k in ("restart_services", "verb_command", "run_cmd_stream", "load_manifests", "DATA_DIR")}
         self.addCleanup(lambda: [setattr(hb, k, v) for k, v in self.saved.items()])
+        hb.DATA_DIR = Path(tempfile.mkdtemp())
         self.repo = Repo()
         self.repo.write("uv.lock", "1\n")
         self.repo.commit("lock")
@@ -70,6 +69,10 @@ class UpdateSince(unittest.TestCase):
         rc = hb.verb_update("proj", self.repo.r, lines.append, since=before)
         return rc, lines
 
+
+class UpdateSince(UpdateBase):
+    """verb_update after something else (Merge) already pulled."""
+
     def test_lockfile_changed_installs_and_restarts(self):
         rc, lines = self.merge_then_update(["uv.lock"])
         self.assertEqual((rc, self.installs, self.restarts), (0, ["uv sync"], ["proj"]))
@@ -86,6 +89,47 @@ class UpdateSince(unittest.TestCase):
         self.assertEqual(hb.verb_update("proj", self.repo.r, lines.append, since=head), 0)
         self.assertEqual((self.installs, self.restarts), ([], []))
         self.assertTrue(any("nothing changed" in l for l in lines), lines)
+
+
+class UpdateOwn(UpdateBase):
+    """The project's own update verb."""
+
+    def setUp(self):
+        super().setUp()
+        self.own = "make update"
+        hb.verb_command = lambda n, p, v: ((self.own, "Makefile target update") if v == "update" and self.own else ("uv sync", "default"))
+
+    def update(self, since=None):
+        lines = []
+        return hb.verb_update("proj", self.repo.r, lines.append, since=since), lines
+
+    def test_code_only_change_runs_own_update(self):
+        rc, lines = self.merge_then_update(["app.py"])
+        self.assertEqual((rc, self.installs, self.restarts), (0, ["make update"], ["proj"]))
+
+    def test_manual_pull_still_runs_it_once(self):
+        self.update()                                          # records the commit
+        self.installs.clear()
+        self.repo.merge_pr(6, ["app.py"])
+        self.repo.git("pull", "-q", "--ff-only")               # someone pulled first
+        rc, lines = self.update()
+        self.assertEqual((rc, self.installs), (0, ["make update"]))
+        self.installs.clear()
+        self.assertEqual(self.update()[0], 0)
+        self.assertEqual(self.installs, [])                    # nothing changed since the record
+
+    def test_no_own_update_keeps_old_behaviour(self):
+        self.own = None
+        rc, lines = self.merge_then_update(["app.py"])
+        self.assertEqual(self.installs, [])
+        self.assertIn("no lockfile changed: nothing to install", lines)
+
+    def test_failing_own_update(self):
+        hb.run_cmd_stream = lambda cmd, cwd, say: 3
+        rc, lines = self.merge_then_update(["app.py"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("own update failed" in l for l in lines), lines)
+        self.assertEqual(self.restarts, [])
 
 
 class KkLink(unittest.TestCase):

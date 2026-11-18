@@ -79,10 +79,30 @@ def restart_services(name, say):
     return n
 
 
+def _recorded_commit(name, path):
+    """The commit hyperbeam last updated or installed this project at, or None."""
+    try:
+        c = (project_dir(name, path, create=False) / "updated-commit").read_text().strip()
+    except OSError:
+        return None
+    return c if c and git_out(path, "cat-file", "-t", c) == "commit" else None
+
+
+def _record_commit(name, path):
+    """After a successful update or install: remember the commit the checkout is at."""
+    try:
+        head = git_out(path, "rev-parse", "HEAD")
+        if head:
+            (project_dir(name, path) / "updated-commit").write_text(head + "\n")
+    except OSError:
+        pass
+
+
 def verb_update(name, path, say, since=None):
     """Pull the project's default branch and bring it up to date: refuse on uncommitted tracked changes; fetch; check out the default branch;
-    `pull --ff-only`; install only if a lockfile or manifest changed; restart the services of a running session. `since`: the commit the checkout was at
-    before something else (Merge) already pulled; the changes are measured from it. Says what it did. -> exit code."""
+    `pull --ff-only`; changes are measured from the commit hyperbeam last updated/installed (recorded per project), else `since` (the commit before
+    Merge pulled), else the HEAD before this pull. If the project has its own `update` (manifest, package.json, Makefile) it runs when anything changed;
+    otherwise install runs only if a lockfile changed. Restarts the services of a running session. Says what it did. -> exit code."""
     path = Path(path)
     if name == "hyperbeam":
         return run_cmd_stream(f"{SELF} update --yes", path, say)
@@ -95,7 +115,7 @@ def verb_update(name, path, say, since=None):
         return 1
     git_fetch(path)
     base = default_branch(path)
-    before_branch, old = branch_of(path), since or git_out(path, "rev-parse", "HEAD")
+    before_branch, old = branch_of(path), _recorded_commit(name, path) or since or git_out(path, "rev-parse", "HEAD")
     if before_branch != base:
         co = subprocess.run(["git", "-C", str(path), "checkout", "-q", base], capture_output=True, text=True)
         if co.returncode:
@@ -112,9 +132,17 @@ def verb_update(name, path, say, since=None):
         say(f"{base} is already up to date")
     else:
         say(f"{base}: {old[:7]} -> {new[:7]} ({len(changed)} file{'s' * (len(changed) != 1)} changed)")
-    if changed and not any(Path(f).name in LOCKFILES for f in changed):
+    own, own_src = verb_command(name, path, "update")
+    if own and not own_src.startswith(("manifest", "package.json", "Makefile")):
+        own = None
+    if changed and own:
+        say(f"update: {own}   [{own_src}]")
+        if run_cmd_stream(own, path, say):
+            say(f"the project's own update failed: {own}")
+            return 1
+    elif changed and not any(Path(f).name in LOCKFILES for f in changed):
         say("no lockfile changed: nothing to install")
-    if any(Path(f).name in LOCKFILES for f in changed):
+    elif changed:
         cmd, src = verb_command(name, path, "install")
         if cmd:
             say(f"dependencies changed: {cmd}")
@@ -126,6 +154,7 @@ def verb_update(name, path, say, since=None):
             say("no running service windows to restart")
     else:
         say("nothing changed: nothing installed, no services restarted")
+    _record_commit(name, path)
     return 0
 
 
@@ -156,7 +185,7 @@ def verb_help(name, path, say):
     say(f"{name}: hyperbeam {name} VERB   (hyperbeam {name} alone opens it)")
     for v in VERBS:
         cmd, src = verb_command(name, path, v)
-        what = {"update": "pull the default branch, install if dependencies changed, restart services",
+        what = {"update": "pull the default branch, install if dependencies changed (or run its own update), restart services",
                 "version": "version, git describe, last commit", "help": "this list",
                 "restart": "re-run the project's services in its session"}.get(v)
         say(f"  {v:<8} {cmd if cmd else (what or 'unavailable')}   [{src}]")
@@ -198,7 +227,10 @@ def run_verb(name, verb, path=None, say=print, since=None):
         say(f"test ok (full output: {log})" if rc == 0 else f"test FAILED (exit {rc}); full output: {log}; hyperbeam lab log has the run")
         return rc
     say(f"{verb}: {cmd}   [{src}]")
-    return run_cmd_stream(cmd, path, say)
+    rc = run_cmd_stream(cmd, path, say)
+    if verb == "install" and rc == 0 and (path / ".git").exists():
+        _record_commit(name, path)
+    return rc
 
 
 def cmd_project_verb(name, verb):
