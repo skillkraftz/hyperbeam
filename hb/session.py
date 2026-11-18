@@ -155,8 +155,9 @@ def trust_folder(path):
     """Set projects["<abs path>"].hasTrustDialogAccepted = true in Claude's config, so a Claude started there (a new project's first session or worker) does not stop at
     "Do you trust the files in this folder?". Only that key, only when it is not already true; written via a temp file + rename with the file's mode. Missing or
     unreadable file, or any error: skip quietly (never breaks work/open). Callers pass folders hyperbeam manages only. Returns True if it wrote."""
+    tmp = None
     try:
-        f = claude_json_path()
+        f = claude_json_path().resolve()               # a symlinked config stays a symlink: the rename replaces the target
         key = str(Path(path).expanduser().resolve())
         data = json.loads(f.read_text())
         if not isinstance(data, dict) or not isinstance(data.get("projects", {}), dict):
@@ -165,11 +166,18 @@ def trust_folder(path):
             return False
         data.setdefault("projects", {}).setdefault(key, {})["hasTrustDialogAccepted"] = True
         tmp = f.with_name(f".{f.name}.hb-{os.getpid()}")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.chmod(tmp, f.stat().st_mode & 0o7777)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)     # the file holds account data: never readable by others, not even briefly
+        with os.fdopen(fd, "w") as w:
+            w.write(json.dumps(data, indent=2, ensure_ascii=False))
+            os.fchmod(w.fileno(), f.stat().st_mode & 0o7777)
         os.replace(tmp, f)
         return True
     except Exception:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         return False
 
 

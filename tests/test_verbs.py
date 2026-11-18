@@ -57,7 +57,7 @@ class UpdateBase(unittest.TestCase):
         self.repo.git("push", "-q", "origin", "main")
         self.restarts, self.installs = [], []
         hb.restart_services = lambda n, say: (self.restarts.append(n), 1)[1]
-        hb.verb_command = lambda n, p, v: ("uv sync", "default")
+        hb.verb_command = lambda n, p, v: (None, "hyperbeam") if v == "update" else ("uv sync", "default")    # as the real one: no own update unless the project has one
         hb.run_cmd_stream = lambda cmd, cwd, say: (self.installs.append(cmd), 0)[1]
 
     def merge_then_update(self, files):
@@ -97,7 +97,7 @@ class UpdateOwn(UpdateBase):
     def setUp(self):
         super().setUp()
         self.own = "make update"
-        hb.verb_command = lambda n, p, v: ((self.own, "Makefile target update") if v == "update" and self.own else ("uv sync", "default"))
+        hb.verb_command = lambda n, p, v: ((self.own, "Makefile target update") if self.own else (None, "hyperbeam")) if v == "update" else ("uv sync", "default")
 
     def update(self, since=None):
         lines = []
@@ -117,6 +117,29 @@ class UpdateOwn(UpdateBase):
         self.installs.clear()
         self.assertEqual(self.update()[0], 0)
         self.assertEqual(self.installs, [])                    # nothing changed since the record
+
+    def record_file(self):
+        return hb.project_dir("proj", self.repo.r) / "updated-commit"
+
+    def test_a_recorded_commit_that_no_longer_exists_is_ignored(self):
+        self.record_file().write_text("0123456789abcdef0123456789abcdef01234567\n")
+        self.assertIsNone(hb._recorded_commit("proj", self.repo.r))
+        rc, lines = self.merge_then_update(["app.py"])          # measured from `since` instead
+        self.assertEqual((rc, self.installs), (0, ["make update"]))
+
+    def test_rewritten_remote_history_is_reported_and_not_recorded(self):
+        self.update()
+        recorded = self.record_file().read_text()
+        self.repo.git("reset", "-q", "--hard", "HEAD~1")        # force-push a history that no longer contains the recorded commit
+        self.repo.write("other.py", "x\n")
+        self.repo.commit("rewritten")
+        self.repo.git("push", "-qf", "origin", "main")
+        self.repo.git("reset", "-q", "--hard", recorded.strip())
+        self.installs.clear()
+        rc, lines = self.update()
+        self.assertEqual((rc, self.installs), (1, []))
+        self.assertTrue(any("pull failed" in l for l in lines), lines)
+        self.assertEqual(self.record_file().read_text(), recorded)
 
     def test_no_own_update_keeps_old_behaviour(self):
         self.own = None

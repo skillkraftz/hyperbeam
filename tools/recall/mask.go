@@ -11,6 +11,7 @@ var (
 	reKV    = regexp.MustCompile(`(?i)\b([A-Za-z0-9_]*(?:api[_-]?key|token|secret|passw(?:or)?d|private[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*)["']?[^\s"',;]{6,}`)
 	reBear  = regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}`)
 	reLong  = regexp.MustCompile(`[A-Za-z0-9_+=-]{32,}`)
+	rePEM   = regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`)
 	reHex40 = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
@@ -18,6 +19,7 @@ func mask(s string) string {
 	if len(s) < 8 {
 		return s
 	}
+	s = rePEM.ReplaceAllString(s, "[secret]")
 	s = reKnown.ReplaceAllString(s, "[secret]")
 	s = reBear.ReplaceAllString(s, "${1}[secret]")
 	s = reKV.ReplaceAllString(s, "${1}[secret]")

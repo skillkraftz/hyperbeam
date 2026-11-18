@@ -94,6 +94,18 @@ echo "more words about the capybara" >> "$tmp/mgr/now.md"
 "$t" index >/dev/null; has "$(S capybara --source notes)" "now.md"
 rm "$tmp/mgr/projects/widget.md"
 out=$("$t" index); has "$out" "1 removed"; has "$(S lemur)" "no matches"
+# a Claude Code file rewritten to something longer is read again from the start, not from the old offset
+{ printf '%s' '{"type":"user","timestamp":"2026-11-10T09:00:00.000Z","message":{"role":"user","content":"rewritten history about the okapi '; printf 'pad %.0s' $(seq 1 2500); printf '"}}\n'; } > "$J"
+out=$("$t" index); has "$out" "indexed 1 files"
+has "$(S okapi)" "okapi"; has "$(S zebra)" "no matches"; has "$(S giraffe)" "no matches"
+# a private key block and a secret cut by the length limit are masked
+PEMF="$tmp/mgr/key.md"; printf '# Key\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAxyz123abcDEF456ghi/jklMNO789pqrSTUvwx+yz0\nzzzTOPSECRETBLOCKzzz\n-----END RSA PRIVATE KEY-----\nafter the key: wombat\n' > "$PEMF"
+out=$("$t" show "$(S wombat | grep -o '^#[0-9]*' | head -1 | tr -d '#')" --context 2); hasnt "$out" "TOPSECRETBLOCK"; hasnt "$out" "MIIEow"
+{ printf 'filler %.0s' $(seq 1 2855); printf 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789 tail marmot\n'; } > "$tmp/mgr/cut.md"
+"$t" index >/dev/null; all="$(S marmot --role note)$(S filler --role note)$("$t" show "$(S filler --role note | grep -o '^#[0-9]*' | head -1 | tr -d '#')")"; hasnt "$all" "sk-ant-api03-abcdefghij"
+# a database made before the tail column existed is upgraded and still works
+O="$tmp/old/recall.db"; mkdir -p "$tmp/old"; python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('CREATE TABLE files(path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, off INTEGER)'); c.execute(\"INSERT INTO files VALUES('$J', 5, 5, 5)\"); c.commit()" "$O"
+out=$(RECALL_DB="$O" "$t" index) || fail "old database: $out"; has "$out" "indexed"; has "$(RECALL_DB="$O" "$t" search okapi 2>/dev/null)" "okapi"
 # auto-index before a search
 echo "# Later
 the narwhal chapter" >> "$tmp/mgr/now.md"
