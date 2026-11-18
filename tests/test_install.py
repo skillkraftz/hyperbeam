@@ -165,6 +165,22 @@ class GoToolBuild(unittest.TestCase):
             hb.TOOLS_SRC = saved
 
 
+    def test_a_host_tool_runs_as_the_user_not_in_the_lab(self):
+        tools = Path(tempfile.mkdtemp())
+        (tools / "h").mkdir()
+        (tools / "h/h").write_text("#!/bin/sh\necho host-ran $1 > \"$2\"\n")
+        (tools / "h/h").chmod(0o755)
+        (tools / "h/host").write_text("runs as the user\n")
+        out = tools / "out.txt"
+        saved = hb.TOOLS_SRC
+        hb.TOOLS_SRC = tools
+        try:
+            rc = hb.cmd_tool(types.SimpleNamespace(list=False, test=False, name="h", args=["x", str(out)], dir=None, timeout=5))
+        finally:
+            hb.TOOLS_SRC = saved
+        self.assertEqual((rc, out.read_text().strip()), (0, "host-ran x"))
+
+
 class NewScaffold(unittest.TestCase):
     def test_new_project_gets_decision_records(self):
         home = Path(tempfile.mkdtemp())
