@@ -114,4 +114,11 @@ has "$(S narwhal)" "narwhal"
 n1=$("$t" stats | grep -c units); "$t" index --full >/dev/null; [ "$("$t" stats | grep -c units)" = "$n1" ] || fail "full reindex"
 has "$("$t" stats)" "code"
 out=$("$t" show 99999 2>&1 || true); has "$out" "no unit"
+# the same export as a zip next to the unpacked one: indexed once (by conversation id), also after the zip is removed again
+hits() { S trellis --source web | grep -c "Garden planning" || true; }
+[ "$(hits)" = 1 ] || fail "web before zip: $(hits)"
+python3 -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],'w'); z.write(sys.argv[2],'conversations.json'); z.close()" "$tmp/mgr/inbox/data-export.zip" "$tmp/mgr/inbox/export/conversations.json"
+"$t" index >/dev/null; [ "$(hits)" = 1 ] || fail "web duplicated with zip: $(hits)"
+"$t" index --full >/dev/null; [ "$(hits)" = 1 ] || fail "web duplicated after full: $(hits)"
+rm "$tmp/mgr/inbox/export/conversations.json"; "$t" index >/dev/null; [ "$(hits)" = 1 ] || fail "web lost after json removed: $(hits)"
 echo "PASS recall"

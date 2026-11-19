@@ -180,6 +180,20 @@ class GoToolBuild(unittest.TestCase):
             hb.TOOLS_SRC = saved
         self.assertEqual((rc, out.read_text().strip()), (0, "host-ran x"))
 
+    def test_tool_dir_uses_that_folders_tools(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "tools/h").mkdir(parents=True)
+        (d / "tools/h/h").write_text("#!/bin/sh\necho dir-tool > \"$1\"\n")
+        (d / "tools/h/h").chmod(0o755)
+        (d / "tools/h/host").write_text("host\n")
+        out = d / "out.txt"
+        saved = hb.TOOLS_SRC
+        try:
+            rc = hb.cmd_tool(types.SimpleNamespace(list=False, test=False, name="h", args=[str(out)], dir=str(d), timeout=5))
+            self.assertEqual((rc, out.read_text().strip(), hb.TOOLS_SRC), (0, "dir-tool", d.resolve() / "tools"))
+        finally:
+            hb.TOOLS_SRC = saved
+
 
 class NewScaffold(unittest.TestCase):
     def test_new_project_gets_decision_records(self):

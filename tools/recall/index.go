@@ -135,10 +135,17 @@ func reindex(db *sql.DB, full bool) (stats, error) {
 	found := discover()
 	seen := map[string]bool{}
 	var todo []fileInfo
+	isWeb := func(p string) bool { return strings.HasSuffix(p, ".zip") || filepath.Base(p) == "conversations.json" }
+	webGone := false // a removed export may have been the copy that won the dedupe below: the others are read again
+	for p := range old {
+		if !seenPath(found, p) && isWeb(p) {
+			webGone = true
+		}
+	}
 	for _, f := range found {
 		seen[f.path] = true
 		o, ok := old[f.path]
-		if !full && ok && o.size == f.size && o.mtime == f.mtime {
+		if !full && !(webGone && f.kind == "web") && ok && o.size == f.size && o.mtime == f.mtime {
 			st.same++
 			continue
 		}
@@ -209,7 +216,24 @@ func reindex(db *sql.DB, full bool) (stats, error) {
 		tx.Exec(`INSERT OR REPLACE INTO files(path,size,mtime,off,tail) VALUES(?,?,?,?,?)`, r.fi.path, r.fi.size, r.fi.mtime, r.off, r.tail)
 		st.changed++
 	}
+	// The same claude.ai export can sit in the inbox twice (the zip and its unpacked conversations.json): one copy per conversation id stays, the first path.
+	dupe := `source='web' AND file != (SELECT min(file) FROM units u2 WHERE u2.source='web' AND u2.session=units.session)`
+	tx.Exec(`DELETE FROM fts WHERE rowid IN (SELECT id FROM units WHERE ` + dupe + `)`)
+	if res, err := tx.Exec(`DELETE FROM units WHERE ` + dupe); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			st.units -= int(n)
+		}
+	}
 	return st, tx.Commit()
+}
+
+func seenPath(found []fileInfo, p string) bool {
+	for _, f := range found {
+		if f.path == p {
+			return true
+		}
+	}
+	return false
 }
 
 func dropFile(tx *sql.Tx, p string) {
