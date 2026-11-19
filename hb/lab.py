@@ -388,6 +388,9 @@ def cmd_tool(a):
     if os.environ.get("HB_LAB"):
         print(LAB_NESTED)
         return 2
+    global TOOLS_SRC
+    if a.dir and (Path(a.dir).expanduser() / "tools").is_dir():     # --dir X: X's tools (a branch's), not the installed copy's
+        TOOLS_SRC = Path(a.dir).expanduser().resolve() / "tools"
     if a.test:
         res = run_tool_tests([a.name] if a.name else None)
         try:                                       # a passing test clears that tool's red finding
